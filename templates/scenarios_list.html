@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+{% block title %}Сценарии мониторинга{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Сценарии мониторинга</h1>
+  <a href="{{ url_for('scenario_new_form') }}" class="btn btn-primary">
+    ＋ Новый сценарий
+  </a>
+</div>
+
+{# ── Flash-сообщения ── #}
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for category, msg in messages %}
+    <div class="alert alert-{{ category }}">{{ msg }}</div>
+  {% endfor %}
+{% endwith %}
+
+<div class="card">
+  <div class="card-header">
+    <strong>Все сценарии</strong>
+    <span class="badge badge-primary ml-2">{{ scenarios | length }}</span>
+  </div>
+  <div class="card-body p-0">
+    {% if scenarios %}
+    <table class="table mb-0">
+      <thead class="thead-light">
+        <tr>
+          <th>Название</th>
+          <th>Ключевые слова</th>
+          <th>Ответ бота</th>
+          <th style="text-align:center">Обращение</th>
+          <th style="text-align:center">Статус</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for sc in scenarios %}
+        <tr {% if not sc.is_active %}style="opacity:.5"{% endif %}>
+          <td>
+            <a href="{{ url_for('scenario_edit_form', scenario_id=sc.id) }}">
+              {{ sc.title }}
+            </a>
+          </td>
+          <td>
+            {% for kw in sc.keywords_list[:5] %}
+              <span class="badge badge-light border">{{ kw }}</span>
+            {% endfor %}
+            {% if sc.keywords_list | length > 5 %}
+              <span class="text-muted small">+{{ sc.keywords_list | length - 5 }}</span>
+            {% endif %}
+          </td>
+          <td class="text-muted small" style="max-width:300px">
+            {{ sc.response_text[:80] }}{% if sc.response_text | length > 80 %}…{% endif %}
+          </td>
+          <td style="text-align:center">
+            {% if sc.suggest_appeal %}
+              <span class="text-success" title="Бот предложит подать обращение">✓</span>
+            {% else %}
+              <span class="text-muted">—</span>
+            {% endif %}
+          </td>
+          <td style="text-align:center">
+            {% if sc.is_active %}
+              <span class="badge badge-success">Активен</span>
+            {% else %}
+              <span class="badge badge-secondary">Выключен</span>
+            {% endif %}
+          </td>
+          <td>
+            <div class="d-flex gap-2" style="justify-content:flex-end">
+              <a href="{{ url_for('scenario_edit_form', scenario_id=sc.id) }}"
+                 class="btn btn-sm btn-secondary">Изменить</a>
+              <form method="POST"
+                    action="{{ url_for('scenario_delete', scenario_id=sc.id) }}"
+                    onsubmit="return confirm('Удалить сценарий «{{ sc.title }}»?\nПривязки к чатам тоже будут удалены.')">
+                <button type="submit" class="btn btn-sm btn-outline-danger">Удалить</button>
+              </form>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="p-3 text-muted text-center py-5">
+      <p class="mb-3">Пока нет ни одного сценария.</p>
+      <a href="{{ url_for('scenario_new_form') }}" class="btn btn-primary">
+        Создать первый сценарий
+      </a>
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+<div class="text-muted small" style="margin-top:12px">
+  Сценарий срабатывает, когда в домовом чате встречается одно из ключевых слов.
+  Привязка сценариев к конкретным чатам — в карточке чата раздела
+  <a href="{{ url_for('house_chats_list') }}">«Домовые чаты»</a>.
+</div>
+{% endblock %}

@@ -1,0 +1,220 @@
+{% extends "base.html" %}
+{% block title %}{{ hc.address }} — домовой чат{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <a href="{{ url_for('house_chats_list') }}" class="text-muted">← Домовые чаты</a>
+    <h1 class="mt-1">{{ hc.address }}</h1>
+  </div>
+  <div>
+    <span class="badge badge-{% if hc.messenger == 'max' %}primary{% else %}info{% endif %} badge-lg">
+      {{ hc.messenger | upper }}
+    </span>
+    <span class="badge badge-{% if hc.is_active %}success{% else %}secondary{% endif %} badge-lg ml-1">
+      {% if hc.is_active %}Активен{% else %}Отключён{% endif %}
+    </span>
+  </div>
+</div>
+
+{# ── Flash-сообщения ── #}
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for category, msg in messages %}
+    <div class="alert alert-{{ category }}">{{ msg }}</div>
+  {% endfor %}
+{% endwith %}
+
+{# ── Мета-информация ── #}
+<div class="card mb-4">
+  <div class="card-body">
+    <dl class="row mb-0">
+      <dt class="col-sm-3">Chat ID</dt>
+      <dd class="col-sm-9"><code>{{ hc.chat_id }}</code></dd>
+      <dt class="col-sm-3">Подключён</dt>
+      <dd class="col-sm-9">{{ (hc.connected_at or '—')[:16] }}</dd>
+      {% if hc.disconnected_at %}
+      <dt class="col-sm-3">Отключён</dt>
+      <dd class="col-sm-9 text-danger">{{ hc.disconnected_at[:16] }}</dd>
+      {% endif %}
+    </dl>
+  </div>
+</div>
+
+<div class="row">
+
+  {# ── Левая колонка: сценарии ── #}
+  <div class="col-md-7">
+    <div class="card mb-4">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <strong>Сценарии мониторинга</strong>
+        <span class="badge badge-primary">{{ linked_scenarios | length }}</span>
+      </div>
+      <div class="card-body p-0">
+        {% if linked_scenarios %}
+        <table class="table mb-0">
+          <thead class="thead-light">
+            <tr>
+              <th>Название</th>
+              <th>Ключевые слова</th>
+              <th>Обращение</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for sc in linked_scenarios %}
+            <tr>
+              <td>{{ sc.title }}</td>
+              <td>
+                {% for kw in sc.keywords_list %}
+                  <span class="badge badge-light border">{{ kw }}</span>
+                {% endfor %}
+              </td>
+              <td class="text-center">
+                {% if sc.suggest_appeal %}
+                  <span class="text-success" title="Бот предложит подать обращение">✓</span>
+                {% else %}
+                  <span class="text-muted">—</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if user.role == 'admin' %}
+                <form method="POST"
+                      action="{{ url_for('house_chat_unlink_scenario',
+                                         house_chat_id=hc.id,
+                                         scenario_id=sc.id) }}"
+                      onsubmit="return confirm('Отвязать сценарий?')">
+                  <button type="submit" class="btn btn-sm btn-outline-secondary">
+                    Отвязать
+                  </button>
+                </form>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <div class="p-3 text-muted">Нет привязанных сценариев.</div>
+        {% endif %}
+      </div>
+
+      {# ── Форма привязки сценария ── #}
+      {% if user.role == 'admin' and unlinked_scenarios %}
+      <div class="card-footer">
+        <form method="POST"
+              action="{{ url_for('house_chat_link_scenario', house_chat_id=hc.id) }}"
+              class="form-inline">
+          <select name="scenario_id" class="form-control form-control-sm mr-2" required>
+            <option value="">— Выберите сценарий —</option>
+            {% for sc in unlinked_scenarios %}
+            <option value="{{ sc.id }}">{{ sc.title }}</option>
+            {% endfor %}
+          </select>
+          <button type="submit" class="btn btn-sm btn-success">Привязать</button>
+        </form>
+      </div>
+      {% elif user.role == 'admin' and not unlinked_scenarios and linked_scenarios %}
+      <div class="card-footer text-muted small">
+        Все активные сценарии уже привязаны.
+      </div>
+      {% endif %}
+    </div>
+
+    {# ── Текст ответа для каждого сценария ── #}
+    {% if linked_scenarios %}
+    <div class="card mb-4">
+      <div class="card-header"><strong>Тексты ответов</strong></div>
+      <div class="card-body">
+        {% for sc in linked_scenarios %}
+        <div class="mb-3">
+          <div class="text-muted small mb-1">{{ sc.title }}</div>
+          <div class="p-2 bg-light rounded border">{{ sc.response_text }}</div>
+        </div>
+        {% if not loop.last %}<hr>{% endif %}
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+  </div>
+
+  {# ── Правая колонка: исключения ── #}
+  <div class="col-md-5">
+    <div class="card">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <strong>Исключения</strong>
+        <span class="badge badge-secondary" title="Бот не реагирует на этих пользователей">
+          {{ exclusions | length }}
+        </span>
+      </div>
+      <div class="card-body p-0">
+        {% if exclusions %}
+        <table class="table table-sm mb-0">
+          <thead class="thead-light">
+            <tr>
+              <th>User ID</th>
+              <th>Мессенджер</th>
+              <th>Причина</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for ex in exclusions %}
+            <tr>
+              <td><code>{{ ex.user_id }}</code></td>
+              <td>{{ ex.messenger | upper }}</td>
+              <td class="text-muted small">{{ ex.reason or '—' }}</td>
+              <td>
+                {% if user.role == 'admin' %}
+                <form method="POST"
+                      action="{{ url_for('house_chat_remove_exclusion',
+                                         house_chat_id=hc.id,
+                                         exclusion_id=ex.id) }}"
+                      onsubmit="return confirm('Удалить исключение?')">
+                  <button type="submit" class="btn btn-sm btn-outline-danger">✕</button>
+                </form>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <div class="p-3 text-muted small">
+          Нет исключений. Бот реагирует на всех участников чата.
+        </div>
+        {% endif %}
+      </div>
+
+      {# ── Форма добавления исключения ── #}
+      {% if user.role == 'admin' %}
+      <div class="card-footer">
+        <form method="POST"
+              action="{{ url_for('house_chat_add_exclusion', house_chat_id=hc.id) }}">
+          <div class="form-group mb-2">
+            <label class="small mb-1">Мессенджер</label>
+            <select name="messenger" class="form-control form-control-sm">
+              <option value="max">MAX</option>
+              <option value="telegram">Telegram</option>
+            </select>
+          </div>
+          <div class="form-group mb-2">
+            <label class="small mb-1">User ID</label>
+            <input type="text" name="user_id" class="form-control form-control-sm"
+                   placeholder="123456789" required>
+          </div>
+          <div class="form-group mb-2">
+            <label class="small mb-1">Причина <span class="text-muted">(опц.)</span></label>
+            <input type="text" name="reason" class="form-control form-control-sm"
+                   placeholder="Сотрудник УК">
+          </div>
+          <button type="submit" class="btn btn-sm btn-warning w-100">
+            Добавить в исключения
+          </button>
+        </form>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+</div>
+{% endblock %}

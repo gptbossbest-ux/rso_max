@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+{% block title %}Записи на приём{% endblock %}
+
+{% block head %}
+<style>
+    .filters-bar { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+    .filter-group { display: flex; flex-direction: column; gap: 6px; }
+    .filter-group label { font-size: 9px; color: var(--muted); letter-spacing: 0.12em; text-transform: uppercase; }
+    .filter-group select, .filter-group input[type="date"] {
+        background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+        padding: 7px 10px; font-family: 'JetBrains Mono', monospace; font-size: 11px;
+        color: var(--text); outline: none; transition: border-color 0.2s; min-width: 160px;
+    }
+    .filter-group select:focus, .filter-group input:focus { border-color: var(--accent); }
+    .filter-group select option { background: var(--surface); }
+    .filter-actions { display: flex; gap: 8px; align-items: flex-end; }
+    .btn-filter { padding: 8px 16px; background: linear-gradient(135deg, var(--accent), var(--accent2)); border: none; border-radius: 6px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #000; font-weight: 600; cursor: pointer; transition: opacity 0.15s; }
+    .btn-filter:hover { opacity: 0.88; }
+    .btn-reset { padding: 8px 12px; background: transparent; border: 1px solid var(--border); border-radius: 6px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); cursor: pointer; text-decoration: none; transition: all 0.15s; }
+    .btn-reset:hover { color: var(--error); border-color: var(--error); }
+
+    .table-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+    .table-header { padding: 14px 20px; border-bottom: 1px solid var(--border); }
+    .table-count { font-size: 11px; color: var(--muted); }
+    .table-wrap .table { margin-bottom: 0; }
+
+    .theme-cell { color: var(--muted); font-size: 11px; max-width: 200px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .date-cell { color: var(--muted); font-size: 11px; white-space: nowrap; }
+
+    .actions-cell { display: flex; gap: 6px; flex-wrap: wrap; }
+    .btn-visited { background: rgba(0,229,160,0.15); color: var(--success); }
+    .btn-noshow  { background: rgba(255,77,109,0.15); color: var(--error); }
+    .btn-cancel  { background: var(--surface2); color: var(--muted); border: 1px solid var(--border); }
+
+    .cancel-form { display: inline-flex; gap: 6px; align-items: center; }
+    .cancel-form input[type="text"] { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--text); outline: none; width: 140px; }
+    .cancel-form input:focus { border-color: var(--error); }
+
+    .empty { text-align: center; padding: 60px; color: var(--muted); font-size: 13px; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Записи на приём</h1>
+</div>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+        <div class="alert alert-{{ category }}">{{ message }}</div>
+    {% endfor %}
+{% endwith %}
+
+<form method="GET" action="{{ url_for('appointments_list') }}">
+    <div class="filters-bar">
+        <div class="filter-group">
+            <label>Филиал</label>
+            <select name="branch_id">
+                <option value="">Все филиалы</option>
+                {% for b in branches %}
+                <option value="{{ b.id }}" {{ 'selected' if current_filters.branch_id == b.id|string }}>{{ b.name }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="filter-group">
+            <label>Дата</label>
+            <input type="date" name="date" value="{{ current_filters.date or '' }}">
+        </div>
+        <div class="filter-group">
+            <label>Статус</label>
+            <select name="status">
+                <option value="">Все статусы</option>
+                {% for key, label in statuses.items() %}
+                <option value="{{ key }}" {{ 'selected' if current_filters.status == key }}>{{ label }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="filter-actions">
+            <button type="submit" class="btn-filter">Применить</button>
+            <a href="{{ url_for('appointments_list') }}" class="btn-reset">Сбросить</a>
+        </div>
+    </div>
+</form>
+
+<div class="table-wrap">
+    <div class="table-header">
+        <span class="table-count">Найдено: {{ appointments|length }}</span>
+    </div>
+    {% if appointments %}
+    <table class="table">
+        <thead>
+            <tr>
+                <th>Дата</th>
+                <th>Время</th>
+                <th>Филиал</th>
+                <th>Лицевой счёт</th>
+                <th>Тема</th>
+                <th>Статус</th>
+                <th>Действия</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for a in appointments %}
+            <tr>
+                <td class="date-cell">{{ a.slot_date }}</td>
+                <td class="date-cell">{{ a.slot_time }}</td>
+                <td>{{ a.branch_name }}</td>
+                <td>{{ a.ls }}</td>
+                <td><div class="theme-cell">{{ a.theme or '—' }}</div></td>
+                <td><span class="badge badge-{{ a.status_color }}">{{ a.status_label }}</span></td>
+                <td>
+                    {% if a.status == 'active' %}
+                    <div class="actions-cell">
+                        <form method="POST" action="{{ url_for('appointment_mark', appointment_id=a.id) }}" style="display:inline;">
+                            <input type="hidden" name="status" value="visited">
+                            <button type="submit" class="btn btn-sm btn-visited">✓ Явка</button>
+                        </form>
+                        <form method="POST" action="{{ url_for('appointment_mark', appointment_id=a.id) }}" style="display:inline;">
+                            <input type="hidden" name="status" value="no_show">
+                            <button type="submit" class="btn btn-sm btn-noshow">✗ Неявка</button>
+                        </form>
+                        <form method="POST" action="{{ url_for('appointment_cancel', appointment_id=a.id) }}" class="cancel-form"
+                              onsubmit="return confirm('Отменить запись и уведомить клиента?')">
+                            <input type="text" name="reason" placeholder="Причина отмены" required>
+                            <button type="submit" class="btn btn-sm btn-cancel">Отменить</button>
+                        </form>
+                    </div>
+                    {% else %}
+                    <span class="text-muted small">
+                        {% if a.cancel_reason %}Причина: {{ a.cancel_reason }}{% else %}—{% endif %}
+                    </span>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <div class="empty">Записей не найдено</div>
+    {% endif %}
+</div>
+{% endblock %}

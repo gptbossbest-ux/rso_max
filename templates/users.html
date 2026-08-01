@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+{% block title %}Пользователи{% endblock %}
+
+{% block head %}
+<style>
+    .create-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .inline-form { display: flex; align-items: center; gap: 8px; }
+    .inline-form input, .inline-form select { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text); outline: none; }
+    .inline-form input { width: 130px; }
+    .inline-form select { width: 110px; }
+    .inline-form input:focus, .inline-form select:focus { border-color: var(--accent); }
+    .actions-cell { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .you-badge { font-size: 9px; color: var(--muted); background: var(--surface2); padding: 2px 6px; border-radius: 4px; margin-left: 6px; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Пользователи</h1>
+</div>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+        <div class="alert alert-{{ category }}">{{ message }}</div>
+    {% endfor %}
+{% endwith %}
+
+<div class="card">
+    <div class="card-header"><strong>Добавить пользователя</strong></div>
+    <div class="card-body">
+        <form method="POST" action="{{ url_for('user_create') }}">
+            <div class="create-grid">
+                <div class="form-group">
+                    <label>Логин</label>
+                    <input type="text" name="username" class="form-control" placeholder="ivanov" required>
+                </div>
+                <div class="form-group">
+                    <label>Пароль</label>
+                    <input type="password" name="password" class="form-control" placeholder="минимум 6 символов" required>
+                </div>
+                <div class="form-group">
+                    <label>Имя</label>
+                    <input type="text" name="name" class="form-control" placeholder="Иванов Иван" required>
+                </div>
+                <div class="form-group">
+                    <label>Роль</label>
+                    <select name="role" class="form-control">
+                        <option value="operator">Оператор</option>
+                        <option value="admin">Администратор</option>
+                    </select>
+                </div>
+            </div>
+            <button type="submit" class="btn btn-primary" style="margin-top:14px">+ Создать пользователя</button>
+        </form>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">
+        <strong>Список пользователей</strong>
+        <span class="badge badge-primary">{{ users|length }}</span>
+    </div>
+    <div class="card-body p-0">
+        <table class="table">
+            <thead>
+                <tr>
+                    <th>Логин</th>
+                    <th>Имя</th>
+                    <th>Роль</th>
+                    <th>Действия</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for u in users %}
+                <tr>
+                    <td>
+                        {{ u['username'] }}
+                        {% if u['username'] == user.username %}
+                            <span class="you-badge">вы</span>
+                        {% endif %}
+                    </td>
+                    <td>{{ u['name'] }}</td>
+                    <td>
+                        <span class="badge {{ 'badge-primary' if u['role'] == 'admin' else 'badge-info' }}">
+                            {{ 'Администратор' if u['role'] == 'admin' else 'Оператор' }}
+                        </span>
+                    </td>
+                    <td>
+                        <div class="actions-cell">
+                            <form method="POST" action="{{ url_for('user_password', user_id=u['id']) }}" class="inline-form">
+                                <input type="password" name="password" placeholder="Новый пароль">
+                                <button type="submit" class="btn btn-sm btn-success">Сменить пароль</button>
+                            </form>
+
+                            {% if u['id'] != 1 %}
+                            <form method="POST" action="{{ url_for('user_role', user_id=u['id']) }}" class="inline-form">
+                                <select name="role">
+                                    <option value="operator" {% if u['role'] == 'operator' %}selected{% endif %}>Оператор</option>
+                                    <option value="admin" {% if u['role'] == 'admin' %}selected{% endif %}>Администратор</option>
+                                </select>
+                                <button type="submit" class="btn btn-sm btn-success">Сохранить</button>
+                            </form>
+
+                            <form method="POST" action="{{ url_for('user_delete', user_id=u['id']) }}"
+                                  onsubmit="return confirm('Удалить пользователя {{ u['username'] }}?')">
+                                <button type="submit" class="btn btn-sm btn-danger">Удалить</button>
+                            </form>
+                            {% endif %}
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}

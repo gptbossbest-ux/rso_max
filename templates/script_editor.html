@@ -1,0 +1,239 @@
+{% extends "base.html" %}
+{% block title %}{{ script.title }} — редактор скрипта{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <a href="{{ url_for('scripts_list') }}" class="text-muted">← FAQ-скрипты</a>
+    <h1 class="mt-1">{{ script.title }}</h1>
+  </div>
+  <form method="POST"
+        action="{{ url_for('script_delete', script_id=script.id) }}"
+        onsubmit="return confirm('Удалить скрипт «{{ script.title }}» со всеми узлами и переходами?')">
+    <button type="submit" class="btn btn-outline-danger">Удалить скрипт</button>
+  </form>
+</div>
+
+{# ── Flash-сообщения ── #}
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for category, msg in messages %}
+    <div class="alert alert-{{ category }}">{{ msg }}</div>
+  {% endfor %}
+{% endwith %}
+
+{# ── Настройки скрипта ── #}
+<div class="card mb-4">
+  <div class="card-header"><strong>Настройки скрипта</strong></div>
+  <div class="card-body">
+    <form method="POST" action="{{ url_for('script_update', script_id=script.id) }}"
+          class="form-inline" style="gap:14px">
+      <div style="flex:1;min-width:220px">
+        <input type="text" name="title" class="form-control"
+               value="{{ script.title }}" required>
+      </div>
+      <div style="width:110px">
+        <input type="number" name="sort_order" class="form-control"
+               value="{{ script.sort_order }}" title="Порядок сортировки в боте">
+      </div>
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin:0">
+        <input type="checkbox" name="is_active" {% if script.is_active %}checked{% endif %}>
+        <span class="small">Активен</span>
+      </label>
+      <button type="submit" class="btn btn-success">Сохранить</button>
+    </form>
+  </div>
+</div>
+
+<div class="row">
+
+  {# ══ ЛЕВАЯ ЧАСТЬ — узлы ══ #}
+  <div class="col-md-6">
+    <div class="card">
+      <div class="card-header">
+        <strong>Узлы</strong>
+        <span class="badge badge-primary ml-2">{{ nodes | length }}</span>
+      </div>
+      <div class="card-body p-0">
+        <table class="table table-sm mb-0">
+          <thead class="thead-light">
+            <tr>
+              <th style="width:44px">ID</th>
+              <th>Текст узла</th>
+              <th style="width:90px;text-align:center">Тип</th>
+              <th style="width:120px"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for n in nodes %}
+            <tr>
+              <td>
+                <code>{{ n.id }}</code>
+                {% if n.id == root_id %}
+                  <span title="Стартовый узел — с него бот начинает показ">🏁</span>
+                {% endif %}
+              </td>
+              <td colspan="2" style="padding:6px 12px">
+                <form method="POST"
+                      action="{{ url_for('script_node_update', script_id=script.id, node_id=n.id) }}"
+                      class="d-flex gap-2" style="align-items:center">
+                  <input type="text" name="title" class="form-control form-control-sm"
+                         value="{{ n.title }}" required style="flex:1">
+                  <label style="display:flex;align-items:center;gap:4px;cursor:pointer;margin:0;white-space:nowrap"
+                         title="Конечный узел: бот покажет «В главное меню»">
+                    <input type="checkbox" name="is_terminal" {% if n.is_terminal %}checked{% endif %}>
+                    <span class="small">финал</span>
+                  </label>
+                  <button type="submit" class="btn btn-sm btn-secondary" title="Сохранить узел">💾</button>
+                </form>
+              </td>
+              <td style="text-align:right">
+                <form method="POST"
+                      action="{{ url_for('script_node_delete', script_id=script.id, node_id=n.id) }}"
+                      onsubmit="return confirm('Удалить узел {{ n.id }} «{{ n.title[:40] }}»?{% if from_counts.get(n.id) or to_counts.get(n.id) %}\nВместе с ним будут удалены переходы: исходящих {{ from_counts.get(n.id, 0) }}, входящих {{ to_counts.get(n.id, 0) }}.{% endif %}')">
+                  <button type="submit" class="btn btn-sm btn-outline-danger">✕</button>
+                </form>
+              </td>
+            </tr>
+            {% endfor %}
+
+            {# ── Строка добавления узла ── #}
+            <tr style="background:rgba(0,200,255,0.04)">
+              <td><span class="text-muted">＋</span></td>
+              <td colspan="3" style="padding:6px 12px">
+                <form method="POST"
+                      action="{{ url_for('script_node_add', script_id=script.id) }}"
+                      class="d-flex gap-2" style="align-items:center">
+                  <input type="text" name="title" class="form-control form-control-sm"
+                         placeholder="Текст нового узла" required style="flex:1">
+                  <label style="display:flex;align-items:center;gap:4px;cursor:pointer;margin:0;white-space:nowrap">
+                    <input type="checkbox" name="is_terminal">
+                    <span class="small">финал</span>
+                  </label>
+                  <button type="submit" class="btn btn-sm btn-success">Добавить</button>
+                </form>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      {% if not nodes %}
+      <div class="card-footer text-muted small">
+        Начните с добавления узлов: первый узел без входящих переходов
+        станет стартовым (🏁).
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  {# ══ ПРАВАЯ ЧАСТЬ — переходы ══ #}
+  <div class="col-md-6">
+    <div class="card">
+      <div class="card-header">
+        <strong>Переходы</strong>
+        <span class="badge badge-primary ml-2">{{ edges | length }}</span>
+      </div>
+      <div class="card-body p-0">
+        <table class="table table-sm mb-0">
+          <thead class="thead-light">
+            <tr>
+              <th>Из узла</th>
+              <th>Текст кнопки</th>
+              <th>В узел</th>
+              <th style="width:50px"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for e in edges %}
+            <tr>
+              <td class="small">
+                <code>{{ e.from_node_id }}</code>
+                {{ nodes_by_id[e.from_node_id].title[:25] if e.from_node_id in nodes_by_id else '?' }}
+              </td>
+              <td><span class="badge badge-light border">{{ e.label }}</span></td>
+              <td class="small">
+                <code>{{ e.to_node_id }}</code>
+                {{ nodes_by_id[e.to_node_id].title[:25] if e.to_node_id in nodes_by_id else '?' }}
+              </td>
+              <td style="text-align:right">
+                <form method="POST"
+                      action="{{ url_for('script_edge_delete', script_id=script.id, edge_id=e.id) }}"
+                      onsubmit="return confirm('Удалить переход «{{ e.label }}»?')">
+                  <button type="submit" class="btn btn-sm btn-outline-danger">✕</button>
+                </form>
+              </td>
+            </tr>
+            {% endfor %}
+            {% if not edges %}
+            <tr><td colspan="4" class="text-muted text-center p-3">Переходов пока нет.</td></tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+
+      {# ── Форма добавления перехода ── #}
+      {% if nodes | length >= 2 %}
+      <div class="card-footer">
+        <form method="POST"
+              action="{{ url_for('script_edge_add', script_id=script.id) }}"
+              onsubmit="return checkLoop(this)">
+          <div class="d-flex gap-2 flex-wrap" style="align-items:center">
+            <select name="from_node_id" class="form-control form-control-sm"
+                    style="flex:1;min-width:130px" required>
+              <option value="">— Из узла —</option>
+              {% for n in nodes %}
+              <option value="{{ n.id }}">{{ n.id }}: {{ n.title[:35] }}</option>
+              {% endfor %}
+            </select>
+            <input type="text" name="label" class="form-control form-control-sm"
+                   style="flex:1;min-width:120px"
+                   placeholder="Текст кнопки" maxlength="64" required>
+            <select name="to_node_id" class="form-control form-control-sm"
+                    style="flex:1;min-width:130px" required>
+              <option value="">— В узел —</option>
+              {% for n in nodes %}
+              <option value="{{ n.id }}">{{ n.id }}: {{ n.title[:35] }}</option>
+              {% endfor %}
+            </select>
+            <button type="submit" class="btn btn-sm btn-success">Добавить</button>
+          </div>
+          <div class="text-muted small" style="margin-top:6px">
+            Проверка циклов выполняется автоматически — переход, замыкающий цикл, будет отклонён.
+          </div>
+        </form>
+      </div>
+      {% elif nodes %}
+      <div class="card-footer text-muted small">
+        Для перехода нужно минимум два узла.
+      </div>
+      {% endif %}
+    </div>
+
+    {# ── Подсказка ── #}
+    <div class="card">
+      <div class="card-header"><strong>Как работает скрипт в боте</strong></div>
+      <div class="card-body text-muted small" style="line-height:1.7">
+        <p class="mb-2">🏁 Бот начинает со стартового узла — узла без входящих переходов.</p>
+        <p class="mb-2">Текст узла показывается сообщением, исходящие переходы — кнопками под ним.</p>
+        <p class="mb-0">Узел с пометкой «финал» завершает диалог кнопкой «В главное меню».</p>
+      </div>
+    </div>
+  </div>
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  // Клиентское предупреждение о петле (from == to).
+  // Серверная DFS-проверка циклов всё равно выполняется — это только UX.
+  function checkLoop(form) {
+    const from = form.from_node_id.value;
+    const to   = form.to_node_id.value;
+    if (from && to && from === to) {
+      alert('Петля недопустима: переход из узла в самого себя.');
+      return false;
+    }
+    return true;
+  }
+</script>
+{% endblock %}

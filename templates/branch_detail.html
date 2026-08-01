@@ -1,0 +1,168 @@
+{% extends "base.html" %}
+{% block title %}{{ branch.name }}{% endblock %}
+
+{% block head %}
+<style>
+    .back-link { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); text-decoration: none; font-size: 11px; margin-bottom: 24px; transition: color .15s; }
+    .back-link:hover { color: var(--accent); }
+
+    .field { margin-bottom: 14px; }
+    .checkbox-field { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
+    .checkbox-field label { font-size: 11px; color: var(--text); text-transform: none; letter-spacing: 0; }
+
+    .form-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 12px; }
+    .form-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+    .empty-inline { color: var(--muted); font-size: 11px; font-style: italic; padding: 12px 0; }
+</style>
+{% endblock %}
+
+{% block content %}
+<a href="{{ url_for('branches_page') }}" class="back-link">← Все филиалы</a>
+<div class="page-header">
+    <h1>{{ branch.name }}</h1>
+</div>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+        <div class="alert alert-{{ category }}">{{ message }}</div>
+    {% endfor %}
+{% endwith %}
+
+<div class="card">
+    <div class="card-header"><strong>Данные филиала</strong></div>
+    <div class="card-body">
+        <form method="POST" action="{{ url_for('branch_update', branch_id=branch.id) }}">
+            <div class="form-grid-2">
+                <div class="form-group">
+                    <label>Название</label>
+                    <input type="text" name="name" class="form-control" value="{{ branch.name }}" required>
+                </div>
+                <div class="form-group">
+                    <label>Адрес</label>
+                    <input type="text" name="address" class="form-control" value="{{ branch.address }}" required>
+                </div>
+            </div>
+            <div class="checkbox-field">
+                <input type="checkbox" name="is_active" id="is_active" {{ 'checked' if branch.is_active }}>
+                <label for="is_active">Филиал активен (доступен для записи)</label>
+            </div>
+            <button type="submit" class="btn btn-primary">Сохранить</button>
+        </form>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header"><strong>Расписание приёма</strong></div>
+    <div class="card-body">
+        {% if schedules %}
+        <table class="table" style="margin-bottom:20px">
+            <thead>
+                <tr>
+                    <th>День недели</th>
+                    <th>Время</th>
+                    <th>Слот</th>
+                    <th>Вместимость</th>
+                    <th>Горизонт записи</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for s in schedules %}
+                <tr>
+                    <td>{{ weekdays[s.weekday] }}</td>
+                    <td>{{ s.time_from }} – {{ s.time_to }}</td>
+                    <td>{{ s.slot_duration_min }} мин</td>
+                    <td>{{ s.capacity }} чел.</td>
+                    <td>{{ s.booking_horizon_days }} дн.</td>
+                    <td>
+                        <form method="POST" action="{{ url_for('schedule_delete', branch_id=branch.id, schedule_id=s.id) }}"
+                              onsubmit="return confirm('Удалить это расписание?')">
+                            <button type="submit" class="btn btn-sm btn-outline-danger">Удалить</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty-inline">Расписание ещё не настроено</div>
+        {% endif %}
+
+        <form method="POST" action="{{ url_for('schedule_create', branch_id=branch.id) }}">
+            <div class="form-grid">
+                <div class="form-group">
+                    <label>День недели</label>
+                    <select name="weekday" class="form-control">
+                        {% for num, label in weekdays.items() %}
+                        <option value="{{ num }}">{{ label }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Начало приёма</label>
+                    <input type="time" name="time_from" class="form-control" value="09:00" required>
+                </div>
+                <div class="form-group">
+                    <label>Окончание приёма</label>
+                    <input type="time" name="time_to" class="form-control" value="18:00" required>
+                </div>
+                <div class="form-group">
+                    <label>Длина слота (мин)</label>
+                    <input type="number" name="slot_duration_min" class="form-control" value="30" min="5" required>
+                </div>
+                <div class="form-group">
+                    <label>Вместимость слота</label>
+                    <input type="number" name="capacity" class="form-control" value="1" min="1" required>
+                </div>
+                <div class="form-group">
+                    <label>Горизонт записи (дней)</label>
+                    <input type="number" name="booking_horizon_days" class="form-control" value="14" min="1" required>
+                </div>
+            </div>
+            <button type="submit" class="btn btn-primary">+ Добавить расписание</button>
+        </form>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header"><strong>Исключения (дни когда филиал не работает)</strong></div>
+    <div class="card-body">
+        {% if exceptions %}
+        <table class="table" style="margin-bottom:20px">
+            <thead><tr><th>Дата</th><th>Причина</th><th></th></tr></thead>
+            <tbody>
+                {% for e in exceptions %}
+                <tr>
+                    <td>{{ e.date }}</td>
+                    <td>{{ e.reason or '—' }}</td>
+                    <td>
+                        <form method="POST" action="{{ url_for('exception_delete', branch_id=branch.id, date=e.date) }}"
+                              onsubmit="return confirm('Убрать исключение на эту дату?')">
+                            <button type="submit" class="btn btn-sm btn-outline-danger">Удалить</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty-inline">Исключений нет</div>
+        {% endif %}
+
+        <form method="POST" action="{{ url_for('exception_create', branch_id=branch.id) }}">
+            <div class="form-grid-2">
+                <div class="form-group">
+                    <label>Дата</label>
+                    <input type="date" name="date" class="form-control" required>
+                </div>
+                <div class="form-group">
+                    <label>Причина (опционально)</label>
+                    <input type="text" name="reason" class="form-control" placeholder="Праздничный день">
+                </div>
+            </div>
+            <button type="submit" class="btn btn-primary">+ Добавить исключение</button>
+        </form>
+    </div>
+</div>
+{% endblock %}

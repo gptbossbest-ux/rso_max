@@ -1,0 +1,238 @@
+{% extends "base.html" %}
+{% block title %}{{ appeal.ticket_no }}{% endblock %}
+
+{% block head %}
+<style>
+    .back-link { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); text-decoration: none; font-size: 11px; margin-bottom: 24px; transition: color 0.15s; }
+    .back-link:hover { color: var(--accent); }
+
+    .badge-pending { background: rgba(167,139,250,0.15); color: var(--pending); border: 1px solid rgba(167,139,250,0.3); }
+    .badge-muted   { background: rgba(107,119,133,0.15); color: var(--muted); border: 1px solid var(--border); }
+    .badge-high    { background: rgba(255,77,109,0.15); color: var(--error); border: 1px solid rgba(255,77,109,0.3); }
+    .badge-normal  { background: rgba(107,119,133,0.12); color: var(--muted); border: 1px solid var(--border); }
+
+    .info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    .info-item label { font-size: 9px; color: var(--muted); letter-spacing: 0.12em; text-transform: uppercase; display: block; margin-bottom: 6px; }
+    .info-item .value { font-size: 13px; color: var(--text); }
+
+    .appeal-body { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 16px; font-size: 13px; line-height: 1.7; white-space: pre-wrap; color: var(--text); }
+
+    .responses-list { display: flex; flex-direction: column; gap: 12px; }
+    .response-item { display: flex; gap: 14px; }
+    .response-avatar { width: 32px; height: 32px; border-radius: 50%; background: linear-gradient(135deg, var(--accent2), var(--accent)); display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; color: #000; flex-shrink: 0; margin-top: 2px; }
+    .response-bubble { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+    .response-meta { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+    .response-author { font-size: 11px; font-weight: 600; color: var(--accent); }
+    .response-time { font-size: 10px; color: var(--muted); }
+    .response-body { font-size: 12px; line-height: 1.6; color: var(--text); }
+    .no-responses { font-size: 12px; color: var(--muted); font-style: italic; }
+
+    .sla-row { display: flex; gap: 24px; flex-wrap: wrap; }
+    .sla-item { font-size: 11px; }
+    .sla-item .sla-label { color: var(--muted); margin-right: 6px; }
+    .sla-ok   { color: var(--success); }
+    .sla-warn { color: var(--warning); }
+    .sla-none { color: var(--muted); }
+
+    .actions-grid { display: flex; flex-direction: column; gap: 16px; }
+    .action-group { display: flex; gap: 10px; flex-wrap: wrap; }
+
+    .btn-primary  { background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #000; }
+    .btn-warning  { background: linear-gradient(135deg, #ffb700, #ff8c00); color: #000; }
+    .btn-success  { background: linear-gradient(135deg, var(--success), #00a870); color: #000; }
+    .btn-ghost    { background: var(--surface2); color: var(--muted); border: 1px solid var(--border); }
+
+    .form-field label { display: block; font-size: 9px; color: var(--muted); letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 8px; }
+    .form-field textarea { width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text); outline: none; resize: vertical; min-height: 90px; transition: border-color 0.2s; }
+    .form-field textarea:focus { border-color: var(--accent); }
+    .form-field input[type="text"] { width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text); outline: none; transition: border-color 0.2s; }
+    .form-field input:focus { border-color: var(--accent); }
+
+    .force-close-section { border-top: 1px solid var(--border); padding-top: 16px; margin-top: 16px; }
+    .force-close-title { font-size: 10px; color: var(--muted); margin-bottom: 10px; letter-spacing: 0.08em; }
+
+    .pending-notice { background: rgba(167,139,250,0.08); border: 1px solid rgba(167,139,250,0.3); border-radius: 8px; padding: 14px 16px; font-size: 12px; color: var(--pending); margin-bottom: 16px; }
+</style>
+{% endblock %}
+
+{% block content %}
+<a href="{{ url_for('appeals_list') }}" class="back-link">← Все обращения</a>
+
+<div class="page-header">
+    <h1>{{ appeal.ticket_no }}</h1>
+    <div class="d-flex gap-2">
+        <span class="badge badge-{{ appeal.status_color }}">{{ appeal.status_label }}</span>
+        <span class="badge badge-{{ 'high' if appeal.priority == 'high' else 'normal' }}">
+            {{ '🚨 Высокий приоритет' if appeal.priority == 'high' else 'Обычный' }}
+        </span>
+    </div>
+</div>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+        <div class="alert alert-{{ category }}">{{ message }}</div>
+    {% endfor %}
+{% endwith %}
+
+<div class="card">
+    <div class="card-header"><strong>Информация о заявителе</strong></div>
+    <div class="card-body">
+        <div class="info-grid">
+            <div class="info-item">
+                <label>ФИО</label>
+                <div class="value">{{ fio }}</div>
+            </div>
+            <div class="info-item">
+                <label>Лицевой счёт</label>
+                <div class="value">{{ appeal.ls or '—' }}</div>
+            </div>
+            <div class="info-item">
+                <label>Адрес</label>
+                <div class="value">{{ address }}</div>
+            </div>
+            <div class="info-item">
+                <label>Канал</label>
+                <div class="value">{{ appeal.channel_label }}</div>
+            </div>
+            <div class="info-item">
+                <label>Категория</label>
+                <div class="value">{{ appeal.category_label }}</div>
+            </div>
+            <div class="info-item">
+                <label>Дата подачи</label>
+                <div class="value">{{ appeal.created_at[:16] if appeal.created_at else '—' }}</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header"><strong>SLA</strong></div>
+    <div class="card-body">
+        <div class="sla-row">
+            <div class="sla-item">
+                <span class="sla-label">Первый ответ:</span>
+                {% if appeal.first_response_at %}
+                    <span class="sla-ok">{{ appeal.first_response_at[:16] }}</span>
+                {% else %}
+                    <span class="sla-warn">⏳ Ожидается</span>
+                {% endif %}
+            </div>
+            <div class="sla-item">
+                <span class="sla-label">Закрыта:</span>
+                {% if appeal.closed_at %}
+                    <span class="sla-ok">{{ appeal.closed_at[:16] }}</span>
+                {% else %}
+                    <span class="sla-none">—</span>
+                {% endif %}
+            </div>
+            <div class="sla-item">
+                <span class="sla-label">Обновлена:</span>
+                <span>{{ appeal.updated_at[:16] if appeal.updated_at else '—' }}</span>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header"><strong>Текст обращения</strong></div>
+    <div class="card-body">
+        <div class="appeal-body">{{ appeal.body or '—' }}</div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header"><strong>История ответов</strong> <span class="badge badge-primary">{{ responses|length }}</span></div>
+    <div class="card-body">
+        {% if responses %}
+            <div class="responses-list">
+                {% for r in responses %}
+                <div class="response-item">
+                    <div class="response-avatar">
+                        {{ (r.operator_name or 'О')[0] }}
+                    </div>
+                    <div class="response-bubble">
+                        <div class="response-meta">
+                            <span class="response-author">
+                                {{ r.operator_name or 'Оператор' }}
+                            </span>
+                            <span class="response-time">{{ r.sent_at[:16] if r.sent_at else '' }}</span>
+                        </div>
+                        <div class="response-body">{{ r.body }}</div>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+        {% else %}
+            <div class="no-responses">Ответов пока нет</div>
+        {% endif %}
+    </div>
+</div>
+
+{% if appeal.status not in ('closed', 'resolved') %}
+<div class="card">
+    <div class="card-header"><strong>Действия</strong></div>
+    <div class="card-body">
+
+        {% if appeal.status == 'pending_confirmation' %}
+        <div class="pending-notice">
+            ⏳ Ожидается подтверждение закрытия от клиента в {{ appeal.channel_label }}
+        </div>
+        {% endif %}
+
+        <div class="actions-grid">
+            <div class="action-group">
+                {% if appeal.status == 'new' %}
+                <form method="POST" action="{{ url_for('appeal_status', appeal_id=appeal.id) }}">
+                    <input type="hidden" name="status" value="in_work">
+                    <button type="submit" class="btn btn-warning">▶ Взять в работу</button>
+                </form>
+                {% endif %}
+
+                {% if appeal.status == 'in_work' %}
+                <form method="POST" action="{{ url_for('appeal_status', appeal_id=appeal.id) }}">
+                    <input type="hidden" name="status" value="pending_confirmation">
+                    <button type="submit" class="btn btn-success">✔ Отправить на подтверждение клиенту</button>
+                </form>
+                {% endif %}
+
+                {% if appeal.status in ('in_work', 'pending_confirmation') %}
+                <form method="POST" action="{{ url_for('appeal_status', appeal_id=appeal.id) }}">
+                    <input type="hidden" name="status" value="resolved">
+                    <button type="submit" class="btn btn-ghost">Пометить решённым</button>
+                </form>
+                {% endif %}
+            </div>
+
+            {% if appeal.status in ('in_work', 'pending_confirmation') %}
+            <form method="POST" action="{{ url_for('appeal_respond', appeal_id=appeal.id) }}">
+                <div class="form-field" style="margin-bottom:12px;">
+                    <label>Ответ клиенту (отправляется в {{ appeal.channel_label }})</label>
+                    <textarea name="body" placeholder="Текст ответа..."></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary">📨 Отправить ответ клиенту</button>
+            </form>
+            {% endif %}
+
+            {% if appeal.status == 'pending_confirmation' %}
+            <div class="force-close-section">
+                <div class="force-close-title">ПРИНУДИТЕЛЬНОЕ ЗАКРЫТИЕ (клиент не ответил)</div>
+                <form method="POST" action="{{ url_for('appeal_status', appeal_id=appeal.id) }}">
+                    <input type="hidden" name="status" value="closed">
+                    <div class="form-field" style="margin-bottom:12px;">
+                        <label>Комментарий (обязателен)</label>
+                        <input type="text" name="force_comment"
+                               placeholder="Причина принудительного закрытия">
+                    </div>
+                    <button type="submit" class="btn btn-danger"
+                            onclick="return confirm('Закрыть принудительно?')">
+                        🔒 Закрыть принудительно
+                    </button>
+                </form>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Архив{% endblock %}
+
+{% block head %}
+<style>
+    .preview { color: var(--muted); font-size: 11px; max-width: 260px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Архив обращений</h1>
+</div>
+
+<div class="alert alert-info">
+    🗃 Архив содержит обращения из предыдущей версии портала (appeals_legacy). Только просмотр, последние 200 записей.
+</div>
+
+<div class="card">
+    <div class="card-body p-0">
+        {% if legacy %}
+        <table class="table">
+            <thead>
+                <tr><th>ID</th><th>ЛС</th><th>Текст</th><th>Статус</th><th>Дата</th></tr>
+            </thead>
+            <tbody>
+                {% for r in legacy %}
+                <tr>
+                    <td>#{{ r.id }}</td>
+                    <td>{{ r.ls or '—' }}</td>
+                    <td><div class="preview">{{ r.text or '—' }}</div></td>
+                    <td>{{ r.status or '—' }}</td>
+                    <td class="text-muted small">{{ (r.created_at or '')[:16] }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="p-3 text-muted text-center py-5">Архив пуст</div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

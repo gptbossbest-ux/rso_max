@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+{% block title %}Загрузка данных{% endblock %}
+
+{% block head %}
+<style>
+    .dropzone {
+        border: 2px dashed var(--border);
+        border-radius: 10px;
+        padding: 48px 24px;
+        text-align: center;
+        cursor: pointer;
+        transition: all 0.2s;
+        margin-bottom: 20px;
+        position: relative;
+    }
+    .dropzone:hover, .dropzone.drag-over { border-color: var(--accent); background: rgba(0,200,255,0.05); }
+    .dropzone input[type="file"] { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
+    .dropzone-icon { font-size: 36px; margin-bottom: 12px; }
+    .dropzone-text { font-size: 13px; color: var(--text); margin-bottom: 6px; }
+    .dropzone-hint { font-size: 11px; color: var(--muted); }
+    .dropzone-filename { font-size: 12px; color: var(--accent); margin-top: 10px; font-weight: 600; }
+
+    .btn-upload {
+        width: 100%;
+        padding: 14px;
+        background: linear-gradient(135deg, var(--accent), var(--accent2));
+        border: none;
+        border-radius: 8px;
+        font-family: 'Unbounded', sans-serif;
+        font-size: 12px;
+        font-weight: 700;
+        color: #000;
+        cursor: pointer;
+        letter-spacing: 0.05em;
+        transition: opacity 0.15s;
+    }
+    .btn-upload:hover { opacity: 0.9; }
+    .btn-upload:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .sheet-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 10px; background: rgba(0,200,255,0.1); color: var(--accent); margin-bottom: 4px; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Загрузка данных</h1>
+</div>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+        <div class="alert alert-{{ category }}">{{ message }}</div>
+    {% endfor %}
+{% endwith %}
+
+<div class="alert alert-warning">
+    <strong style="display:block;margin-bottom:4px">⚠️ Важно перед загрузкой</strong>
+    Загрузка обновит лицевые счета и счётчики. Уже переданные показания и обращения сохранятся. Начальные показания добавятся только для новых счётчиков.
+</div>
+
+<div class="card">
+    <div class="card-header"><strong>Загрузить файл Excel</strong></div>
+    <div class="card-body">
+        <form method="POST" enctype="multipart/form-data" id="uploadForm">
+            <div class="dropzone" id="dropzone">
+                <input type="file" name="file" id="fileInput" accept=".xlsx" onchange="onFileSelected(this)">
+                <div class="dropzone-icon">📂</div>
+                <div class="dropzone-text">Перетащите файл или нажмите для выбора</div>
+                <div class="dropzone-hint">Формат: .xlsx</div>
+                <div class="dropzone-filename" id="filename"></div>
+            </div>
+            <button type="submit" class="btn-upload" id="uploadBtn" disabled>
+                ⬆ Загрузить и импортировать
+            </button>
+        </form>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header"><strong>Требования к файлу</strong></div>
+    <div class="card-body p-0">
+        <table class="table">
+            <thead>
+                <tr>
+                    <th>Вкладка</th>
+                    <th>Колонки</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><div class="sheet-badge">ЛС и ФИО</div></td>
+                    <td>
+                        A — Номер лицевого счёта<br>
+                        B — ФИО владельца<br>
+                        C — Адрес
+                    </td>
+                </tr>
+                <tr>
+                    <td><div class="sheet-badge">Счетчики</div></td>
+                    <td>
+                        A — Номер ЛС<br>
+                        B — Тип ресурса<br>
+                        C — № счётчика<br>
+                        D — Тип (Однотарифный / Двухтарифный)<br>
+                        E — Начальные показания Т1<br>
+                        F — Начальные показания Т2 (если двухтарифный)
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    function onFileSelected(input) {
+        const btn = document.getElementById('uploadBtn');
+        const fname = document.getElementById('filename');
+        if (input.files.length > 0) {
+            fname.textContent = '✓ ' + input.files[0].name;
+            btn.disabled = false;
+        } else {
+            fname.textContent = '';
+            btn.disabled = true;
+        }
+    }
+
+    const dz = document.getElementById('dropzone');
+    dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag-over'); });
+    dz.addEventListener('dragleave', () => dz.classList.remove('drag-over'));
+    dz.addEventListener('drop', e => {
+        e.preventDefault();
+        dz.classList.remove('drag-over');
+        const fi = document.getElementById('fileInput');
+        fi.files = e.dataTransfer.files;
+        onFileSelected(fi);
+    });
+</script>
+{% endblock %}

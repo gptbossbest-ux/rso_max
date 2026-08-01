@@ -1,0 +1,144 @@
+{% extends "base.html" %}
+{% block title %}Домовые чаты{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Домовые чаты</h1>
+  <a href="{{ url_for('house_chats_broadcast_page') }}" class="btn btn-primary">
+    📢 Рассылка
+  </a>
+</div>
+
+{# ── Flash-сообщения ── #}
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for category, msg in messages %}
+    <div class="alert alert-{{ category }}">{{ msg }}</div>
+  {% endfor %}
+{% endwith %}
+
+{# ── Форма подключения нового чата ── #}
+{% if user.role == 'admin' %}
+<div class="card mb-4">
+  <div class="card-header"><strong>Подключить новый чат</strong></div>
+  <div class="card-body">
+    <form method="POST" action="{{ url_for('house_chat_create') }}">
+      <div class="form-row">
+        <div class="form-group col-md-5">
+          <label>Адрес дома</label>
+          <input type="text" name="address" class="form-control"
+                 placeholder="ул. Ленина, 10" required>
+        </div>
+        <div class="form-group col-md-2">
+          <label>Мессенджер</label>
+          <select name="messenger" class="form-control">
+            <option value="max">MAX</option>
+            <option value="telegram">Telegram</option>
+          </select>
+        </div>
+        <div class="form-group col-md-3">
+          <label>Chat ID</label>
+          <input type="text" name="chat_id" class="form-control"
+                 placeholder="-1001234567890" required>
+        </div>
+        <div class="form-group col-md-2 d-flex align-items-end">
+          <button type="submit" class="btn btn-success w-100">Подключить</button>
+        </div>
+      </div>
+    </form>
+  </div>
+</div>
+{% endif %}
+
+{# ── Активные чаты ── #}
+<div class="card mb-4">
+  <div class="card-header">
+    <strong>Активные чаты</strong>
+    <span class="badge badge-success ml-2">{{ active | length }}</span>
+  </div>
+  <div class="card-body p-0">
+    {% if active %}
+    <table class="table table-hover mb-0">
+      <thead class="thead-light">
+        <tr>
+          <th>Адрес</th>
+          <th>Мессенджер</th>
+          <th>Chat ID</th>
+          <th>Подключён</th>
+          <th>Сценарии</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for hc in active %}
+        <tr>
+          <td>
+            <a href="{{ url_for('house_chat_detail', house_chat_id=hc.id) }}">
+              {{ hc.address }}
+            </a>
+          </td>
+          <td>
+            <span class="badge badge-{% if hc.messenger == 'max' %}primary{% else %}info{% endif %}">
+              {{ hc.messenger | upper }}
+            </span>
+          </td>
+          <td><code>{{ hc.chat_id }}</code></td>
+          <td>{{ (hc.connected_at or '')[:16] }}</td>
+          <td>
+            <a href="{{ url_for('house_chat_detail', house_chat_id=hc.id) }}" class="text-muted">
+              Открыть →
+            </a>
+          </td>
+          <td>
+            {% if user.role == 'admin' %}
+            <form method="POST"
+                  action="{{ url_for('house_chat_deactivate', house_chat_id=hc.id) }}"
+                  onsubmit="return confirm('Отключить чат {{ hc.address }}?')">
+              <button type="submit" class="btn btn-sm btn-outline-danger">Отключить</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="p-3 text-muted">Нет активных чатов. Подключите первый выше.</div>
+    {% endif %}
+  </div>
+</div>
+
+{# ── Отключённые чаты (история) ── #}
+{% if inactive %}
+<div class="card">
+  <div class="card-header text-muted">
+    <strong>Отключённые чаты</strong>
+    <span class="badge badge-secondary ml-2">{{ inactive | length }}</span>
+  </div>
+  <div class="card-body p-0">
+    <table class="table table-sm mb-0 text-muted">
+      <thead class="thead-light">
+        <tr>
+          <th>Адрес</th>
+          <th>Мессенджер</th>
+          <th>Chat ID</th>
+          <th>Подключён</th>
+          <th>Отключён</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for hc in inactive %}
+        <tr>
+          <td>{{ hc.address }}</td>
+          <td>{{ hc.messenger | upper }}</td>
+          <td><code>{{ hc.chat_id }}</code></td>
+          <td>{{ (hc.connected_at or '')[:16] }}</td>
+          <td>{{ (hc.disconnected_at or '')[:16] }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}

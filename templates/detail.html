@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Обращение #{{ appeal['id'] }} — РСО Портал</title>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Unbounded:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        :root {
+            --bg: #0d0f12; --surface: #161a1f; --surface2: #1e2329;
+            --border: #2a2f38; --accent: #00c8ff; --accent2: #0077ff;
+            --text: #e8edf2; --muted: #6b7785; --error: #ff4d6d;
+            --success: #00e5a0; --warning: #ffb700; --pending: #a78bfa;
+            --sidebar: 240px;
+        }
+        body { font-family: 'JetBrains Mono', monospace; background: var(--bg); color: var(--text); min-height: 100vh; display: flex; }
+
+        .sidebar { width: var(--sidebar); background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; position: fixed; top: 0; left: 0; bottom: 0; }
+        .sidebar-logo { padding: 24px 20px; border-bottom: 1px solid var(--border); }
+        .sidebar-logo .icon { width: 36px; height: 36px; background: linear-gradient(135deg, var(--accent), var(--accent2)); border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; font-size: 18px; margin-bottom: 10px; }
+        .sidebar-logo h1 { font-family: 'Unbounded', sans-serif; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; }
+        .sidebar-logo p { font-size: 9px; color: var(--muted); letter-spacing: 0.08em; text-transform: uppercase; margin-top: 2px; }
+        .sidebar-nav { flex: 1; padding: 16px 12px; }
+        .nav-label { font-size: 9px; color: var(--muted); letter-spacing: 0.15em; text-transform: uppercase; padding: 0 8px; margin-bottom: 8px; margin-top: 16px; }
+        .nav-item { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 8px; text-decoration: none; color: var(--muted); font-size: 12px; transition: all 0.15s; margin-bottom: 2px; }
+        .nav-item:hover { background: var(--surface2); color: var(--text); }
+        .sidebar-user { padding: 16px 20px; border-top: 1px solid var(--border); display: flex; align-items: center; gap: 10px; }
+        .user-avatar { width: 30px; height: 30px; background: linear-gradient(135deg, var(--accent), var(--accent2)); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; color: #000; font-weight: 700; flex-shrink: 0; }
+        .user-name { font-size: 11px; color: var(--text); flex: 1; }
+        .logout-btn { font-size: 10px; color: var(--muted); text-decoration: none; padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border); transition: all 0.15s; }
+        .logout-btn:hover { color: var(--error); border-color: var(--error); }
+
+        .main { margin-left: var(--sidebar); flex: 1; padding: 32px; max-width: 860px; }
+
+        .back-link { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); text-decoration: none; font-size: 11px; margin-bottom: 24px; transition: color 0.15s; }
+        .back-link:hover { color: var(--accent); }
+
+        .page-header { display: flex; align-items: center; gap: 14px; margin-bottom: 28px; }
+        .page-title { font-family: 'Unbounded', sans-serif; font-size: 18px; font-weight: 700; }
+
+        .badge { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 10px; font-weight: 600; }
+        .badge-new { background: rgba(255,77,109,0.15); color: var(--error); }
+        .badge-in_work { background: rgba(255,183,0,0.15); color: var(--warning); }
+        .badge-pending_confirmation { background: rgba(167,139,250,0.15); color: var(--pending); }
+        .badge-closed { background: rgba(0,229,160,0.15); color: var(--success); }
+
+        .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 28px; margin-bottom: 20px; }
+        .card-title { font-size: 9px; color: var(--muted); letter-spacing: 0.15em; text-transform: uppercase; margin-bottom: 20px; }
+
+        .info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .info-item label { font-size: 9px; color: var(--muted); letter-spacing: 0.12em; text-transform: uppercase; display: block; margin-bottom: 6px; }
+        .info-item .value { font-size: 13px; color: var(--text); }
+
+        .appeal-text { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 16px; font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
+
+        /* Комментарии */
+        .comments-list { display: flex; flex-direction: column; gap: 12px; }
+        .comment-item { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+        .comment-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+        .comment-author { font-size: 11px; font-weight: 600; color: var(--accent); }
+        .comment-date { font-size: 10px; color: var(--muted); }
+        .comment-text { font-size: 12px; line-height: 1.5; }
+        .no-comments { font-size: 12px; color: var(--muted); font-style: italic; }
+
+        /* Форма комментария */
+        .form-field { margin-bottom: 16px; }
+        .form-field label { display: block; font-size: 9px; color: var(--muted); letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 8px; }
+        .form-field textarea { width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text); outline: none; resize: vertical; min-height: 80px; transition: border-color 0.2s; }
+        .form-field textarea:focus { border-color: var(--accent); }
+
+        /* Кнопки действий */
+        .actions { display: flex; flex-wrap: wrap; gap: 10px; }
+        .btn { padding: 11px 20px; border: none; border-radius: 8px; font-family: 'Unbounded', sans-serif; font-size: 11px; font-weight: 700; cursor: pointer; letter-spacing: 0.04em; transition: opacity 0.15s; }
+        .btn:hover { opacity: 0.88; }
+        .btn-take { background: linear-gradient(135deg, #ffb700, #ff8c00); color: #000; }
+        .btn-close { background: linear-gradient(135deg, #00e5a0, #00a870); color: #000; }
+        .btn-comment { background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #000; }
+        .btn-force { background: var(--surface2); color: var(--muted); border: 1px solid var(--border); }
+        .btn-force:hover { color: var(--text); }
+
+        .pending-notice { background: rgba(167,139,250,0.1); border: 1px solid rgba(167,139,250,0.3); border-radius: 8px; padding: 14px 18px; font-size: 12px; color: var(--pending); margin-bottom: 16px; }
+
+        .alert { padding: 12px 16px; border-radius: 8px; font-size: 12px; margin-bottom: 20px; }
+        .alert-success { background: rgba(0,229,160,0.1); border: 1px solid rgba(0,229,160,0.3); color: var(--success); }
+        .alert-error { background: rgba(255,77,109,0.1); border: 1px solid rgba(255,77,109,0.3); color: var(--error); }
+    </style>
+</head>
+<body>
+
+<aside class="sidebar">
+    <div class="sidebar-logo">
+        <div class="icon">⚡</div>
+        <h1>РСО ПОРТАЛ</h1>
+        <p>Обращения жителей</p>
+    </div>
+    <nav class="sidebar-nav">
+        <div class="nav-label">Разделы</div>
+        <a href="{{ url_for('index') }}" class="nav-item">📋 Обращения</a>
+        <a href="{{ url_for('pokazaniya') }}" class="nav-item">📊 Показания</a>
+        {% if user.role == 'admin' %}
+        <a href="{{ url_for('broadcast_page') }}" class="nav-item">📢 Оповещения</a>
+        <a href="{{ url_for('upload_page') }}" class="nav-item">📂 Загрузка данных</a>
+        <a href="{{ url_for('users_page') }}" class="nav-item">👥 Пользователи</a>
+        {% endif %}
+    </nav>
+    <div class="sidebar-user">
+        <div class="user-avatar">{{ user.name[0] }}</div>
+        <div class="user-name">{{ user.name }}</div>
+        <a href="{{ url_for('logout') }}" class="logout-btn">Выйти</a>
+    </div>
+</aside>
+
+<main class="main">
+    <a href="{{ url_for('index') }}" class="back-link">← Назад к списку</a>
+
+    <div class="page-header">
+        <h2 class="page-title">Обращение #{{ appeal['id'] }}</h2>
+        <span class="badge badge-{{ appeal['status'] }}">{{ statuses[appeal['status']] }}</span>
+    </div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% for category, message in messages %}
+            <div class="alert alert-{{ category }}">{{ message }}</div>
+        {% endfor %}
+    {% endwith %}
+
+    <!-- Инфо о заявителе -->
+    <div class="card">
+        <div class="card-title">Информация о заявителе</div>
+        <div class="info-grid">
+            <div class="info-item">
+                <label>ФИО</label>
+                <div class="value">{{ appeal['fio'] or '—' }}</div>
+            </div>
+            <div class="info-item">
+                <label>Лицевой счёт</label>
+                <div class="value">{{ appeal['ls'] }}</div>
+            </div>
+            <div class="info-item">
+                <label>Адрес</label>
+                <div class="value">{{ appeal['address'] or '—' }}</div>
+            </div>
+            <div class="info-item">
+                <label>Дата подачи</label>
+                <div class="value">{{ appeal['created_at'][:16] }}</div>
+            </div>
+            {% if appeal['assigned_to'] %}
+            <div class="info-item">
+                <label>Исполнитель</label>
+                <div class="value">{{ appeal['assigned_to'] }}</div>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- Текст обращения -->
+    <div class="card">
+        <div class="card-title">Текст обращения</div>
+        <div class="appeal-text">{{ appeal['text'] }}</div>
+    </div>
+
+    <!-- История комментариев -->
+    <div class="card">
+        <div class="card-title">Комментарии сотрудников ({{ comments|length }})</div>
+        {% if comments %}
+            <div class="comments-list">
+                {% for c in comments %}
+                <div class="comment-item">
+                    <div class="comment-header">
+                        <span class="comment-author">{{ c['author'] }}</span>
+                        <span class="comment-date">{{ c['created_at'] }}</span>
+                    </div>
+                    <div class="comment-text">{{ c['text'] }}</div>
+                </div>
+                {% endfor %}
+            </div>
+        {% else %}
+            <div class="no-comments">Комментариев пока нет</div>
+        {% endif %}
+    </div>
+
+    <!-- Действия -->
+    {% if appeal['status'] != 'closed' %}
+    <div class="card">
+        <div class="card-title">Действия</div>
+
+        {% if appeal['status'] == 'pending_confirmation' %}
+        <div class="pending-notice">
+            ⏳ Ожидается подтверждение закрытия от клиента в MAX
+        </div>
+        {% endif %}
+
+        <div class="actions" style="margin-bottom: 20px;">
+            {% if appeal['status'] == 'new' %}
+            <form method="POST"><input type="hidden" name="action" value="take">
+                <button type="submit" class="btn btn-take">▶ Взять в работу</button>
+            </form>
+            {% endif %}
+
+            {% if appeal['status'] == 'in_work' %}
+            <form method="POST"><input type="hidden" name="action" value="close">
+                <button type="submit" class="btn btn-close">✔ Закрыть заявку</button>
+            </form>
+            {% endif %}
+
+            {% if appeal['status'] == 'pending_confirmation' %}
+            <form method="POST"><input type="hidden" name="action" value="force_close">
+                <button type="submit" class="btn btn-force">🔒 Закрыть принудительно</button>
+            </form>
+            {% endif %}
+        </div>
+
+        {% if appeal['status'] in ['in_work', 'pending_confirmation'] %}
+        <form method="POST">
+            <input type="hidden" name="action" value="comment">
+            <div class="form-field">
+                <label>Новый комментарий клиенту</label>
+                <textarea name="comment" placeholder="Текст будет отправлен клиенту в MAX..."></textarea>
+            </div>
+            <button type="submit" class="btn btn-comment">📨 Отправить комментарий клиенту</button>
+        </form>
+        {% endif %}
+    </div>
+    {% endif %}
+
+</main>
+</body>
+</html>

@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block title %}Оповещения{% endblock %}
+
+{% block head %}
+<style>
+    .stat-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 28px; }
+    .stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+    .stat-label { font-size: 9px; color: var(--muted); letter-spacing: .12em; text-transform: uppercase; margin-bottom: 10px; }
+    .stat-value { font-family: 'Unbounded', sans-serif; font-size: 28px; font-weight: 700; color: var(--pending); }
+
+    .hint { font-size: 10px; color: var(--muted); margin-top: 6px; }
+
+    .btn-broadcast { width: 100%; padding: 14px; background: linear-gradient(135deg, var(--pending), #7c3aed); border: none; border-radius: 8px; font-family: 'Unbounded', sans-serif; font-size: 12px; font-weight: 700; color: #fff; cursor: pointer; letter-spacing: .04em; transition: opacity .15s; }
+    .btn-broadcast:hover { opacity: .9; }
+    .btn-broadcast:disabled { opacity: .4; cursor: not-allowed; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Оповещения</h1>
+</div>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+        <div class="alert alert-{{ category }}">{{ message }}</div>
+    {% endfor %}
+{% endwith %}
+
+<div class="stat-row">
+    <div class="stat-card">
+        <div class="stat-label">Пользователей в базе</div>
+        <div class="stat-value">{{ users|length }}</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label">Получат сообщение</div>
+        <div class="stat-value" style="color:var(--success)">{{ users|length }}</div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header"><strong>Отправить сообщение всем пользователям</strong></div>
+    <div class="card-body">
+        <form method="POST" action="{{ url_for('broadcast') }}"
+              onsubmit="return confirm('Отправить сообщение {{ users|length }} пользователям?')">
+            <div class="form-group">
+                <label>Текст сообщения</label>
+                <textarea name="text" class="form-control" rows="4" placeholder="Введите текст оповещения...">{% if users %}У Вас новая квитанция!
+Для получения нажмите «📄 Последняя квитанция» в меню бота.{% endif %}</textarea>
+                <div class="hint">Сообщение будет отправлено всем пользователям которые хотя бы раз авторизовались в боте</div>
+            </div>
+            <button type="submit" class="btn-broadcast" {% if not users %}disabled{% endif %}>
+                📢 Отправить оповещение
+            </button>
+        </form>
+        {% if not users %}
+        <p class="text-muted small text-center" style="margin-top:12px;">
+            Нет пользователей — они появятся после первой авторизации в боте
+        </p>
+        {% endif %}
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header"><strong>Пользователи бота</strong> <span class="badge badge-primary">{{ users|length }}</span></div>
+    <div class="card-body p-0">
+        {% if users %}
+        <table class="table">
+            <thead><tr><th>ФИО</th><th>Лицевой счёт</th><th>Последняя активность</th></tr></thead>
+            <tbody>
+                {% for u in users %}
+                <tr>
+                    <td>{{ u.fio or '—' }}</td>
+                    <td>{{ u.ls }}</td>
+                    <td class="text-muted small">{{ u.last_seen[:16] if u.last_seen else '—' }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="p-3 text-muted text-center">Пользователи появятся после первой авторизации в боте</div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

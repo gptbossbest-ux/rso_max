@@ -1,0 +1,137 @@
+{% extends "base.html" %}
+{% block title %}Обращения{% endblock %}
+
+{% block head %}
+<style>
+    .filters-bar { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+    .filter-group { display: flex; flex-direction: column; gap: 6px; }
+    .filter-group label { font-size: 9px; color: var(--muted); letter-spacing: 0.12em; text-transform: uppercase; }
+    .filter-group select,
+    .filter-group input[type="date"] {
+        background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+        padding: 7px 10px; font-family: 'JetBrains Mono', monospace; font-size: 11px;
+        color: var(--text); outline: none; transition: border-color 0.2s; min-width: 130px;
+    }
+    .filter-group select:focus, .filter-group input:focus { border-color: var(--accent); }
+    .filter-group select option { background: var(--surface); }
+    .filter-actions { display: flex; gap: 8px; align-items: flex-end; }
+    .btn-filter { padding: 8px 16px; background: linear-gradient(135deg, var(--accent), var(--accent2)); border: none; border-radius: 6px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #000; font-weight: 600; cursor: pointer; transition: opacity 0.15s; }
+    .btn-filter:hover { opacity: 0.88; }
+    .btn-reset { padding: 8px 12px; background: transparent; border: 1px solid var(--border); border-radius: 6px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); cursor: pointer; text-decoration: none; transition: all 0.15s; }
+    .btn-reset:hover { color: var(--error); border-color: var(--error); }
+
+    .table-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+    .table-header { padding: 14px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
+    .table-count { font-size: 11px; color: var(--muted); }
+    .table-wrap .table { margin-bottom: 0; }
+    .table-wrap tbody tr { cursor: pointer; }
+
+    .ticket-no { font-weight: 600; color: var(--accent); font-size: 11px; }
+    .preview { color: var(--muted); font-size: 11px; max-width: 220px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .date-cell { color: var(--muted); font-size: 11px; white-space: nowrap; }
+    .ls-cell { font-size: 11px; }
+
+    .badge-pending { background: rgba(167,139,250,0.15); color: var(--pending); border: 1px solid rgba(167,139,250,0.3); }
+    .badge-muted   { background: rgba(107,119,133,0.15); color: var(--muted); border: 1px solid var(--border); }
+    .priority-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; }
+    .dot-high   { background: var(--error); }
+    .dot-normal { background: var(--muted); }
+
+    .empty { text-align: center; padding: 60px; color: var(--muted); font-size: 13px; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Обращения</h1>
+</div>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+        <div class="alert alert-{{ category }}">{{ message }}</div>
+    {% endfor %}
+{% endwith %}
+
+<form method="GET" action="{{ url_for('appeals_list') }}">
+    <div class="filters-bar">
+        <div class="filter-group">
+            <label>Статус</label>
+            <select name="status">
+                <option value="">Все статусы</option>
+                {% for key, label in STATUSES.items() %}
+                <option value="{{ key }}" {{ 'selected' if current_filters.status == key }}>{{ label }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="filter-group">
+            <label>Категория</label>
+            <select name="category">
+                <option value="">Все категории</option>
+                {% for key, label in CATEGORIES.items() %}
+                <option value="{{ key }}" {{ 'selected' if current_filters.category == key }}>{{ label }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="filter-group">
+            <label>Приоритет</label>
+            <select name="priority">
+                <option value="">Любой</option>
+                <option value="high"   {{ 'selected' if current_filters.priority == 'high' }}>Высокий</option>
+                <option value="normal" {{ 'selected' if current_filters.priority == 'normal' }}>Обычный</option>
+            </select>
+        </div>
+        <div class="filter-group">
+            <label>С даты</label>
+            <input type="date" name="date_from" value="{{ current_filters.date_from or '' }}">
+        </div>
+        <div class="filter-group">
+            <label>По дату</label>
+            <input type="date" name="date_to" value="{{ current_filters.date_to or '' }}">
+        </div>
+        <div class="filter-actions">
+            <button type="submit" class="btn-filter">Применить</button>
+            <a href="{{ url_for('appeals_list') }}" class="btn-reset">Сбросить</a>
+        </div>
+    </div>
+</form>
+
+<div class="table-wrap">
+    <div class="table-header">
+        <span class="table-count">Найдено: {{ appeals|length }}</span>
+    </div>
+    {% if appeals %}
+    <table class="table">
+        <thead>
+            <tr>
+                <th>Номер</th>
+                <th>Категория</th>
+                <th>Лицевой счёт</th>
+                <th>Обращение</th>
+                <th>Статус</th>
+                <th>Канал</th>
+                <th>Дата подачи</th>
+                <th>Закрыта</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for a in appeals %}
+            <tr onclick="window.location='{{ url_for('appeal_detail', ticket_no=a.ticket_no) }}'">
+                <td class="ticket-no">
+                    <span class="priority-dot dot-{{ a.priority }}"></span>{{ a.ticket_no }}
+                </td>
+                <td>{{ a.category_label }}</td>
+                <td class="ls-cell">{{ a.ls or '—' }}</td>
+                <td><div class="preview">{{ a.body or '—' }}</div></td>
+                <td><span class="badge badge-{{ a.status_color }}">{{ a.status_label }}</span></td>
+                <td>{{ a.channel_label }}</td>
+                <td class="date-cell">{{ a.created_at[:16] if a.created_at else '—' }}</td>
+                <td class="date-cell">{{ a.closed_at[:16] if a.closed_at else '—' }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <div class="empty">Обращений не найдено</div>
+    {% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,229 @@
+{% extends "base.html" %}
+{% block title %}Показания{% endblock %}
+
+{% block head %}
+<style>
+    .toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+    .search-box { flex: 1; position: relative; }
+    .search-box input { width: 100%; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 9px 14px 9px 36px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text); outline: none; transition: border-color .2s; }
+    .search-box input:focus { border-color: var(--accent); }
+    .search-box .si { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: var(--muted); }
+    .clear-btn { padding: 9px 16px; background: transparent; border: 1px solid var(--border); border-radius: 8px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); cursor: pointer; transition: all .15s; }
+    .clear-btn:hover { color: var(--error); border-color: var(--error); }
+    .results-count { font-size: 11px; color: var(--muted); margin-bottom: 10px; }
+
+    .table-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; overflow-x: auto; }
+    .table-wrap .table { min-width: 900px; margin-bottom: 0; }
+    th.sortable { cursor: pointer; user-select: none; transition: color .15s; }
+    th.sortable:hover { color: var(--accent); }
+    th.sort-asc { color: var(--accent); }
+    th.sort-asc::after { content: ' ↑'; }
+    th.sort-desc { color: var(--accent); }
+    th.sort-desc::after { content: ' ↓'; }
+    .filter-row th { padding: 5px 8px; background: var(--surface2); }
+    .filter-row input { width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text); outline: none; }
+    .filter-row input:focus { border-color: var(--accent); }
+
+    .value-cell { font-family: 'Unbounded', sans-serif; font-size: 12px; color: var(--accent); }
+    .prev-cell { font-size: 11px; color: var(--muted); }
+    .diff-pos { font-family: 'Unbounded', sans-serif; font-size: 12px; color: var(--success); }
+    .diff-neg { font-family: 'Unbounded', sans-serif; font-size: 12px; color: var(--error); }
+    .diff-none { font-size: 11px; color: var(--muted); }
+
+    .badge-resource { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 10px; font-weight: 600; }
+    .badge-electric { background: rgba(255,183,0,0.15); color: #ffb700; }
+    .badge-hot { background: rgba(255,77,109,0.15); color: #ff4d6d; }
+    .badge-cold { background: rgba(0,200,255,0.15); color: #00c8ff; }
+
+    .two-values { display: flex; flex-direction: column; gap: 2px; }
+    .two-values .lbl { color: var(--muted); font-size: 10px; margin-right: 4px; }
+    .empty { text-align: center; padding: 60px; color: var(--muted); font-size: 13px; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Показания счётчиков</h1>
+</div>
+
+<div class="toolbar">
+    <div class="search-box">
+        <span class="si">🔍</span>
+        <input type="text" id="globalSearch" placeholder="Поиск по всем полям..." oninput="applyFilters()">
+    </div>
+    <button class="clear-btn" onclick="clearAll()">✕ Сбросить</button>
+</div>
+<div class="results-count" id="resultsCount"></div>
+
+<div class="table-wrap">
+    <table class="table">
+        <thead>
+            <tr>
+                <th class="sortable" onclick="sortTable(0)" data-type="num">№</th>
+                <th class="sortable" onclick="sortTable(1)" data-type="str">Лицевой счёт</th>
+                <th class="sortable" onclick="sortTable(2)" data-type="str">Ресурс</th>
+                <th class="sortable" onclick="sortTable(3)" data-type="str">№ счётчика</th>
+                <th class="sortable" onclick="sortTable(4)" data-type="num">Показания</th>
+                <th class="sortable" onclick="sortTable(5)" data-type="num">Предыдущие</th>
+                <th class="sortable" onclick="sortTable(6)" data-type="num">Разница</th>
+                <th class="sortable" onclick="sortTable(7)" data-type="date">Дата и время</th>
+            </tr>
+            <tr class="filter-row">
+                <th><input id="f0" placeholder="№" oninput="applyFilters()"></th>
+                <th><input id="f1" placeholder="ЛС" oninput="applyFilters()"></th>
+                <th><input id="f2" placeholder="Ресурс" oninput="applyFilters()"></th>
+                <th><input id="f3" placeholder="Счётчик" oninput="applyFilters()"></th>
+                <th><input id="f4" placeholder="Показания" oninput="applyFilters()"></th>
+                <th><input id="f5" placeholder="Предыдущие" oninput="applyFilters()"></th>
+                <th><input id="f6" placeholder="Разница" oninput="applyFilters()"></th>
+                <th><input id="f7" placeholder="Дата" oninput="applyFilters()"></th>
+            </tr>
+        </thead>
+        <tbody id="tableBody">
+            {% if rows %}
+                {% for r in rows %}
+                <tr>
+                    <td>{{ r['id'] }}</td>
+                    <td>{{ r['ls'] }}</td>
+                    <td>
+                        {% if r['resource_type'] == 'Электроэнергия' %}
+                            <span class="badge-resource badge-electric">⚡ {{ r['resource_type'] }}</span>
+                        {% elif r['resource_type'] == 'Горячая вода' %}
+                            <span class="badge-resource badge-hot">🔥 {{ r['resource_type'] }}</span>
+                        {% elif r['resource_type'] == 'Холодная вода' %}
+                            <span class="badge-resource badge-cold">💧 {{ r['resource_type'] }}</span>
+                        {% else %}
+                            {{ r['resource_type'] or '—' }}
+                        {% endif %}
+                    </td>
+                    <td>{{ r['meter_number'] or '—' }}</td>
+                    <td>
+                        {% if r['value2'] %}
+                            <div class="two-values">
+                                <div><span class="lbl">Т1:</span><span class="value-cell">{{ r['value1'] }}</span></div>
+                                <div><span class="lbl">Т2:</span><span class="value-cell">{{ r['value2'] }}</span></div>
+                            </div>
+                        {% else %}
+                            <span class="value-cell">{{ r['value1'] }}</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if r['prev_value1'] %}
+                            {% if r['prev_value2'] %}
+                                <div class="two-values">
+                                    <div><span class="lbl">Т1:</span><span class="prev-cell">{{ r['prev_value1'] }}</span></div>
+                                    <div><span class="lbl">Т2:</span><span class="prev-cell">{{ r['prev_value2'] }}</span></div>
+                                </div>
+                            {% else %}
+                                <span class="prev-cell">{{ r['prev_value1'] }}</span>
+                            {% endif %}
+                        {% else %}
+                            <span class="diff-none">—</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if r['diff1'] is not none %}
+                            {% if r['value2'] and r['diff2'] is not none %}
+                                <div class="two-values">
+                                    <div><span class="lbl">Т1:</span>
+                                        <span class="{{ 'diff-pos' if r['diff1'] >= 0 else 'diff-neg' }}">
+                                            {{ '+' if r['diff1'] > 0 else '' }}{{ r['diff1'] }}
+                                        </span>
+                                    </div>
+                                    <div><span class="lbl">Т2:</span>
+                                        <span class="{{ 'diff-pos' if r['diff2'] >= 0 else 'diff-neg' }}">
+                                            {{ '+' if r['diff2'] > 0 else '' }}{{ r['diff2'] }}
+                                        </span>
+                                    </div>
+                                </div>
+                            {% else %}
+                                <span class="{{ 'diff-pos' if r['diff1'] >= 0 else 'diff-neg' }}">
+                                    {{ '+' if r['diff1'] > 0 else '' }}{{ r['diff1'] }}
+                                </span>
+                            {% endif %}
+                        {% else %}
+                            <span class="diff-none">Первичные</span>
+                        {% endif %}
+                    </td>
+                    <td><span class="text-muted small">{{ r['created_at'][:16] if r['created_at'] else '—' }}</span></td>
+                </tr>
+                {% endfor %}
+            {% else %}
+                <tr><td colspan="8"><div class="empty">Показания пока не передавались</div></td></tr>
+            {% endif %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    let sortCol = -1, sortDir = 1;
+
+    function applyFilters() {
+        const global = document.getElementById('globalSearch').value.toLowerCase();
+        const filters = Array.from({length: 8}, (_, i) => {
+            const el = document.getElementById('f' + i);
+            return el ? el.value.toLowerCase() : '';
+        });
+        const rows = document.querySelectorAll('#tableBody tr');
+        let visible = 0;
+        rows.forEach(row => {
+            const cells = row.querySelectorAll('td');
+            if (!cells.length) return;
+            const texts = Array.from(cells).map(c => c.textContent.toLowerCase().trim());
+            const all = texts.join(' ');
+            if (global && !all.includes(global)) { row.style.display = 'none'; return; }
+            for (let i = 0; i < filters.length; i++) {
+                if (filters[i] && !texts[i].includes(filters[i])) { row.style.display = 'none'; return; }
+            }
+            row.style.display = '';
+            visible++;
+        });
+        const total = document.querySelectorAll('#tableBody tr td').length ? rows.length : 0;
+        document.getElementById('resultsCount').textContent =
+            visible === total ? `Показано: ${visible}` : `Показано: ${visible} из ${total}`;
+    }
+
+    function parseDate(str) {
+        if (!str || str === '—') return new Date(0);
+        const [d, t] = str.trim().split(' ');
+        const [y, m, dd] = d.split('-').map(Number);
+        const [hh, mm] = (t || '00:00').split(':').map(Number);
+        return new Date(y, m - 1, dd, hh, mm);
+    }
+
+    function sortTable(col) {
+        const ths = document.querySelectorAll('thead tr:first-child th.sortable');
+        const colType = ths[col]?.dataset.type || 'str';
+        const tbody = document.getElementById('tableBody');
+        const rows = Array.from(tbody.querySelectorAll('tr')).filter(r => r.querySelectorAll('td').length > 1);
+        if (sortCol === col) sortDir *= -1; else { sortCol = col; sortDir = 1; }
+        ths.forEach((th, i) => {
+            th.classList.remove('sort-asc', 'sort-desc');
+            if (i === col) th.classList.add(sortDir === 1 ? 'sort-asc' : 'sort-desc');
+        });
+        rows.sort((a, b) => {
+            const aT = a.querySelectorAll('td')[col]?.textContent.trim() || '';
+            const bT = b.querySelectorAll('td')[col]?.textContent.trim() || '';
+            if (colType === 'num') {
+                const aV = parseFloat(aT.replace(/[^0-9.\-]/g, '')) || 0;
+                const bV = parseFloat(bT.replace(/[^0-9.\-]/g, '')) || 0;
+                return (aV - bV) * sortDir;
+            }
+            if (colType === 'date') return (parseDate(aT) - parseDate(bT)) * sortDir;
+            return aT.localeCompare(bT, 'ru') * sortDir;
+        });
+        rows.forEach(r => tbody.appendChild(r));
+        applyFilters();
+    }
+
+    function clearAll() {
+        document.getElementById('globalSearch').value = '';
+        Array.from({length: 8}, (_, i) => { const el = document.getElementById('f'+i); if(el) el.value=''; });
+        applyFilters();
+    }
+
+    applyFilters();
+</script>
+{% endblock %}

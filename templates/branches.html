@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}Филиалы{% endblock %}
+
+{% block head %}
+<style>
+    .create-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .field label { display: block; font-size: 9px; color: var(--muted); letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 6px; }
+    .field input { width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text); outline: none; transition: border-color .2s; }
+    .field input:focus { border-color: var(--accent); }
+
+    .branch-list { display: flex; flex-direction: column; gap: 12px; }
+    .branch-item { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 16px 20px; display: flex; align-items: center; justify-content: space-between; text-decoration: none; color: var(--text); transition: border-color .15s; }
+    .branch-item:hover { border-color: var(--accent); }
+    .branch-name { font-size: 13px; font-weight: 600; }
+    .branch-address { font-size: 11px; color: var(--muted); margin-top: 4px; }
+
+    .empty { text-align: center; padding: 40px; color: var(--muted); font-size: 12px; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Филиалы</h1>
+</div>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+        <div class="alert alert-{{ category }}">{{ message }}</div>
+    {% endfor %}
+{% endwith %}
+
+<div class="card">
+    <div class="card-header"><strong>Добавить филиал</strong></div>
+    <div class="card-body">
+        <form method="POST" action="{{ url_for('branch_create') }}">
+            <div class="create-grid">
+                <div class="field">
+                    <label>Название</label>
+                    <input type="text" name="name" placeholder="Центральный офис" required>
+                </div>
+                <div class="field">
+                    <label>Адрес</label>
+                    <input type="text" name="address" placeholder="ул. Ленина, 1" required>
+                </div>
+            </div>
+            <button type="submit" class="btn btn-primary" style="margin-top:14px">+ Добавить филиал</button>
+        </form>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">
+        <strong>Список филиалов</strong>
+        <span class="badge badge-primary">{{ branches|length }}</span>
+    </div>
+    <div class="card-body">
+        {% if branches %}
+        <div class="branch-list">
+            {% for b in branches %}
+            <a href="{{ url_for('branch_detail', branch_id=b.id) }}" class="branch-item">
+                <div>
+                    <div class="branch-name">{{ b.name }}</div>
+                    <div class="branch-address">{{ b.address }}</div>
+                </div>
+                <span class="badge badge-{{ 'success' if b.is_active else 'secondary' }}">
+                    {{ 'Активен' if b.is_active else 'Отключён' }}
+                </span>
+            </a>
+            {% endfor %}
+        </div>
+        {% else %}
+        <div class="empty">Филиалы ещё не добавлены</div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

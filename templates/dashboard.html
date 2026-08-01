@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}Дашборд{% endblock %}
+
+{% block head %}
+<style>
+    .stats-section { margin-bottom: 32px; }
+    .stats-label { font-size: 9px; color: var(--muted); letter-spacing: 0.15em; text-transform: uppercase; margin-bottom: 14px; }
+    .stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 14px; }
+
+    .stat-card {
+        background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+        padding: 20px; cursor: pointer; transition: border-color 0.15s, transform 0.1s;
+        text-decoration: none; display: block;
+    }
+    .stat-card:hover { border-color: var(--accent); transform: translateY(-1px); }
+    .stat-label { font-size: 9px; color: var(--muted); letter-spacing: 0.10em; text-transform: uppercase; margin-bottom: 10px; }
+    .stat-value { font-family: 'Unbounded', sans-serif; font-size: 32px; font-weight: 700; line-height: 1; }
+    .stat-card.c-new      .stat-value { color: var(--error); }
+    .stat-card.c-inwork   .stat-value { color: var(--warning); }
+    .stat-card.c-pending  .stat-value { color: var(--pending); }
+    .stat-card.c-resolved .stat-value { color: var(--accent); }
+    .stat-card.c-closed   .stat-value { color: var(--success); }
+    .stat-card.c-total    .stat-value { color: var(--text); }
+
+    .quick-actions { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 32px; }
+    .quick-link {
+        padding: 12px 20px; background: var(--surface); border: 1px solid var(--border);
+        border-radius: 10px; text-decoration: none; color: var(--text); font-size: 12px;
+        transition: all 0.15s; display: flex; align-items: center; gap: 8px;
+    }
+    .quick-link:hover { border-color: var(--accent); color: var(--accent); }
+    .quick-link.urgent { border-color: rgba(255,77,109,0.4); color: var(--error); background: rgba(255,77,109,0.05); }
+</style>
+{% endblock %}
+
+{% block content %}
+<h2 class="page-title">Дашборд</h2>
+
+<div class="stats-section">
+    <div class="stats-label">Обращения</div>
+    <div class="stats-grid">
+        <a href="{{ url_for('appeals_list') }}" class="stat-card c-total">
+            <div class="stat-label">Всего</div>
+            <div class="stat-value">{{ counts.new + counts.in_work + counts.pending_confirmation + counts.resolved + counts.closed }}</div>
+        </a>
+        <a href="{{ url_for('appeals_list', status='new') }}" class="stat-card c-new">
+            <div class="stat-label">Новые</div>
+            <div class="stat-value">{{ counts.new }}</div>
+        </a>
+        <a href="{{ url_for('appeals_list', status='in_work') }}" class="stat-card c-inwork">
+            <div class="stat-label">В работе</div>
+            <div class="stat-value">{{ counts.in_work }}</div>
+        </a>
+        <a href="{{ url_for('appeals_list', status='pending_confirmation') }}" class="stat-card c-pending">
+            <div class="stat-label">На подтверждении</div>
+            <div class="stat-value">{{ counts.pending_confirmation }}</div>
+        </a>
+        <a href="{{ url_for('appeals_list', status='resolved') }}" class="stat-card c-resolved">
+            <div class="stat-label">Решены</div>
+            <div class="stat-value">{{ counts.resolved }}</div>
+        </a>
+        <a href="{{ url_for('appeals_list', status='closed') }}" class="stat-card c-closed">
+            <div class="stat-label">Закрыты</div>
+            <div class="stat-value">{{ counts.closed }}</div>
+        </a>
+    </div>
+</div>
+
+<div class="stats-section">
+    <div class="stats-label">Показания счётчиков</div>
+    <div class="stats-grid">
+        <a href="{{ url_for('pokazaniya') }}" class="stat-card c-resolved">
+            <div class="stat-label">Передано</div>
+            <div class="stat-value">{{ counts.pokazaniya }}</div>
+        </a>
+    </div>
+</div>
+
+<div class="stats-section">
+    <div class="stats-label">Быстрые действия</div>
+    <div class="quick-actions">
+        <a href="{{ url_for('appeals_list', status='new') }}" class="quick-link {% if counts.new > 0 %}urgent{% endif %}">
+            📋 Новые обращения{% if counts.new > 0 %} ({{ counts.new }}){% endif %}
+        </a>
+        <a href="{{ url_for('appeals_list', priority='high') }}" class="quick-link {% if counts.new > 0 %}urgent{% endif %}">
+            🚨 Высокий приоритет
+        </a>
+        <a href="{{ url_for('appeals_list', status='pending_confirmation') }}" class="quick-link">
+            ⏳ На подтверждении{% if counts.pending_confirmation > 0 %} ({{ counts.pending_confirmation }}){% endif %}
+        </a>
+        <a href="{{ url_for('pokazaniya') }}" class="quick-link">
+            📊 Показания счётчиков
+        </a>
+    </div>
+</div>
+{% endblock %}

@@ -1,0 +1,178 @@
+{% extends "base.html" %}
+{% block title %}Рассылка в домовые чаты{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <a href="{{ url_for('house_chats_list') }}" class="text-muted">← Домовые чаты</a>
+    <h1 class="mt-1">Рассылка в домовые чаты</h1>
+  </div>
+</div>
+
+{# ── Flash-сообщения ── #}
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for category, msg in messages %}
+    <div class="alert alert-{{ category }}">{{ msg }}</div>
+  {% endfor %}
+{% endwith %}
+
+{% if chats %}
+<form method="POST" action="{{ url_for('house_chats_broadcast') }}"
+      onsubmit="return confirmBroadcast()">
+
+  <div class="row">
+
+    {# ── Выбор чатов ── #}
+    <div class="col-md-5">
+      <div class="card mb-4">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <strong>Получатели</strong>
+          <div>
+            <button type="button" class="btn btn-xs btn-outline-secondary mr-1"
+                    onclick="selectAll()">Все</button>
+            <button type="button" class="btn btn-xs btn-outline-secondary"
+                    onclick="selectNone()">Сбросить</button>
+          </div>
+        </div>
+        <div class="card-body p-0">
+          <table class="table table-sm table-hover mb-0">
+            <tbody>
+              {% for chat in chats %}
+              <tr>
+                <td class="pl-3" style="width:36px">
+                  <input type="checkbox" name="chat_ids" value="{{ chat.id }}"
+                         id="chat_{{ chat.id }}" class="chat-checkbox">
+                </td>
+                <td>
+                  <label for="chat_{{ chat.id }}" class="mb-0 d-block cursor-pointer">
+                    {{ chat.address }}
+                  </label>
+                </td>
+                <td class="text-right pr-3">
+                  <span class="badge badge-{% if chat.messenger == 'max' %}primary{% else %}info{% endif %}">
+                    {{ chat.messenger | upper }}
+                  </span>
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <div class="card-footer text-muted small">
+          Выбрано: <span id="selected-count">0</span> из {{ chats | length }}
+        </div>
+      </div>
+    </div>
+
+    {# ── Текст сообщения ── #}
+    <div class="col-md-7">
+      <div class="card mb-4">
+        <div class="card-header"><strong>Текст сообщения</strong></div>
+        <div class="card-body">
+          <textarea name="text" id="broadcast-text" class="form-control"
+                    rows="8" placeholder="Введите текст рассылки..."
+                    required oninput="updatePreview()"></textarea>
+          <div class="text-right text-muted small mt-1">
+            <span id="char-count">0</span> символов
+          </div>
+        </div>
+      </div>
+
+      {# ── Предпросмотр ── #}
+      <div class="card mb-4" id="preview-card" style="display:none">
+        <div class="card-header text-muted"><strong>Предпросмотр</strong></div>
+        <div class="card-body">
+          <div class="p-3 bg-light rounded border" id="preview-text"
+               style="white-space: pre-wrap; font-family: inherit;"></div>
+        </div>
+      </div>
+
+      <button type="submit" class="btn btn-danger btn-block btn-lg">
+        📢 Отправить рассылку
+      </button>
+      <div class="text-muted small text-center mt-2">
+        Сообщение будет отправлено во все выбранные чаты
+      </div>
+    </div>
+
+  </div>
+</form>
+
+{% else %}
+<div class="card">
+  <div class="card-body text-center text-muted py-5">
+    <p class="mb-3">Нет активных домовых чатов.</p>
+    <a href="{{ url_for('house_chats_list') }}" class="btn btn-primary">
+      Подключить чат
+    </a>
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+  // Счётчик выбранных чатов
+  function updateCount() {
+    const checked = document.querySelectorAll('.chat-checkbox:checked').length;
+    document.getElementById('selected-count').textContent = checked;
+  }
+
+  document.querySelectorAll('.chat-checkbox').forEach(cb => {
+    cb.addEventListener('change', updateCount);
+  });
+
+  function selectAll() {
+    document.querySelectorAll('.chat-checkbox').forEach(cb => cb.checked = true);
+    updateCount();
+  }
+
+  function selectNone() {
+    document.querySelectorAll('.chat-checkbox').forEach(cb => cb.checked = false);
+    updateCount();
+  }
+
+  // Предпросмотр и счётчик символов
+  function updatePreview() {
+    const text = document.getElementById('broadcast-text').value;
+    document.getElementById('char-count').textContent = text.length;
+    const preview = document.getElementById('preview-text');
+    const card    = document.getElementById('preview-card');
+    if (text.trim()) {
+      preview.textContent = text;
+      card.style.display  = '';
+    } else {
+      card.style.display  = 'none';
+    }
+  }
+
+  // Подтверждение перед отправкой
+  function confirmBroadcast() {
+    const count = document.querySelectorAll('.chat-checkbox:checked').length;
+    if (count === 0) {
+      alert('Выберите хотя бы один чат.');
+      return false;
+    }
+    const text = document.getElementById('broadcast-text').value.trim();
+    if (!text) {
+      alert('Введите текст сообщения.');
+      return false;
+    }
+    return confirm(
+      `Отправить сообщение в ${count} ${declChats(count)}?\n\n"${text.substring(0, 100)}${text.length > 100 ? '...' : ''}"`
+    );
+  }
+
+  function declChats(n) {
+    const mod10 = n % 10, mod100 = n % 100;
+    if (mod100 >= 11 && mod100 <= 14) return 'чатов';
+    if (mod10 === 1)  return 'чат';
+    if (mod10 >= 2 && mod10 <= 4) return 'чата';
+    return 'чатов';
+  }
+
+  // Инициализация
+  updateCount();
+</script>
+{% endblock %}

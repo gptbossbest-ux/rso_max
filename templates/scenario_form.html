@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}{% if scenario %}Редактировать сценарий{% else %}Новый сценарий{% endif %}{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <a href="{{ url_for('scenarios_list') }}" class="text-muted">← Сценарии</a>
+    <h1 class="mt-1">
+      {% if scenario %}Редактировать: {{ scenario.title }}{% else %}Новый сценарий{% endif %}
+    </h1>
+  </div>
+</div>
+
+{# ── Flash-сообщения ── #}
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for category, msg in messages %}
+    <div class="alert alert-{{ category }}">{{ msg }}</div>
+  {% endfor %}
+{% endwith %}
+
+<div class="row">
+  <div class="col-md-7">
+    <div class="card">
+      <div class="card-body">
+        <form method="POST"
+              action="{% if scenario %}{{ url_for('scenario_edit', scenario_id=scenario.id) }}{% else %}{{ url_for('scenario_new') }}{% endif %}">
+
+          <div class="form-group">
+            <label>Название сценария</label>
+            <input type="text" name="title" class="form-control"
+                   placeholder="Например: Пожарная безопасность"
+                   value="{{ scenario.title if scenario else '' }}" required>
+          </div>
+
+          <div class="form-group">
+            <label>Ключевые слова — одно слово или фраза на строку</label>
+            <textarea name="keywords" class="form-control" rows="6"
+                      placeholder="пожар&#10;горит&#10;задымление"
+                      required>{{ scenario.keywords_text if scenario else '' }}</textarea>
+            <div class="text-muted small" style="margin-top:4px">
+              Бот сработает, если в сообщении встретится любое из слов
+              (регистр не важен, ищется вхождение подстроки).
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>Текст ответа бота</label>
+            <textarea name="response_text" class="form-control" rows="4"
+                      placeholder="🔥 При пожаре немедленно звоните 112!"
+                      required>{{ scenario.response_text if scenario else '' }}</textarea>
+          </div>
+
+          <div class="form-group">
+            <label style="display:flex;align-items:center;gap:8px;text-transform:none;cursor:pointer">
+              <input type="checkbox" name="suggest_appeal"
+                     {% if scenario and scenario.suggest_appeal %}checked{% endif %}>
+              <span>Предложить подать обращение (бот добавит ссылку на себя)</span>
+            </label>
+          </div>
+
+          {% if scenario %}
+          <div class="form-group">
+            <label style="display:flex;align-items:center;gap:8px;text-transform:none;cursor:pointer">
+              <input type="checkbox" name="is_active"
+                     {% if scenario.is_active %}checked{% endif %}>
+              <span>Сценарий активен</span>
+            </label>
+            <div class="text-muted small" style="margin-top:4px">
+              Выключенный сценарий не срабатывает, но остаётся привязанным к чатам.
+            </div>
+          </div>
+          {% endif %}
+
+          <div class="d-flex gap-2" style="margin-top:20px">
+            <button type="submit" class="btn btn-success">
+              {% if scenario %}Сохранить изменения{% else %}Создать сценарий{% endif %}
+            </button>
+            <a href="{{ url_for('scenarios_list') }}" class="btn btn-secondary">Отмена</a>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-md-5">
+    <div class="card">
+      <div class="card-header"><strong>Как это работает</strong></div>
+      <div class="card-body text-muted small" style="line-height:1.7">
+        <p class="mb-2">1. Бот следит за сообщениями в домовых чатах, к которым привязан сценарий.</p>
+        <p class="mb-2">2. Если в сообщении жителя встречается ключевое слово — бот публикует текст ответа в чат.</p>
+        <p class="mb-2">3. С включённой опцией «Предложить подать обращение» бот добавит к ответу ссылку на себя — житель сможет оформить обращение в личном диалоге.</p>
+        <p class="mb-0">4. Пользователи из списка исключений (например, сотрудники УК) не вызывают срабатывание сценариев.</p>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

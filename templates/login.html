@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Вход — РСО Портал</title>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Unbounded:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --bg: #0d0f12;
+            --surface: #161a1f;
+            --border: #2a2f38;
+            --accent: #00c8ff;
+            --accent2: #0077ff;
+            --text: #e8edf2;
+            --muted: #6b7785;
+            --error: #ff4d6d;
+            --success: #00e5a0;
+        }
+
+        body {
+            font-family: 'JetBrains Mono', monospace;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            overflow: hidden;
+        }
+
+        body::before {
+            content: '';
+            position: absolute;
+            width: 600px; height: 600px;
+            background: radial-gradient(circle, rgba(0,200,255,0.06) 0%, transparent 70%);
+            top: -100px; left: -100px;
+            pointer-events: none;
+        }
+
+        body::after {
+            content: '';
+            position: absolute;
+            width: 400px; height: 400px;
+            background: radial-gradient(circle, rgba(0,119,255,0.05) 0%, transparent 70%);
+            bottom: -50px; right: -50px;
+            pointer-events: none;
+        }
+
+        .login-wrap {
+            width: 100%;
+            max-width: 420px;
+            padding: 20px;
+            position: relative;
+            z-index: 1;
+        }
+
+        .logo {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+
+        .logo-icon {
+            width: 56px; height: 56px;
+            background: linear-gradient(135deg, var(--accent), var(--accent2));
+            border-radius: 14px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+            margin-bottom: 16px;
+            box-shadow: 0 0 30px rgba(0,200,255,0.3);
+        }
+
+        .logo h1 {
+            font-family: 'Unbounded', sans-serif;
+            font-size: 16px;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            color: var(--text);
+        }
+
+        .logo p {
+            font-size: 11px;
+            color: var(--muted);
+            margin-top: 4px;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+        }
+
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 36px;
+        }
+
+        .card h2 {
+            font-family: 'Unbounded', sans-serif;
+            font-size: 14px;
+            font-weight: 700;
+            color: var(--text);
+            margin-bottom: 28px;
+            letter-spacing: 0.03em;
+        }
+
+        .field {
+            margin-bottom: 18px;
+        }
+
+        .field label {
+            display: block;
+            font-size: 10px;
+            color: var(--muted);
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            margin-bottom: 8px;
+        }
+
+        .field input {
+            width: 100%;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 12px 14px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+            color: var(--text);
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        .field input:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(0,200,255,0.1);
+        }
+
+        .btn {
+            width: 100%;
+            padding: 14px;
+            background: linear-gradient(135deg, var(--accent), var(--accent2));
+            border: none;
+            border-radius: 8px;
+            font-family: 'Unbounded', sans-serif;
+            font-size: 12px;
+            font-weight: 700;
+            color: #000;
+            cursor: pointer;
+            letter-spacing: 0.05em;
+            margin-top: 8px;
+            transition: opacity 0.2s, transform 0.1s;
+        }
+
+        .btn:hover { opacity: 0.9; }
+        .btn:active { transform: scale(0.99); }
+
+        .alert {
+            padding: 10px 14px;
+            border-radius: 8px;
+            font-size: 12px;
+            margin-bottom: 20px;
+        }
+
+        .alert-error {
+            background: rgba(255,77,109,0.1);
+            border: 1px solid rgba(255,77,109,0.3);
+            color: var(--error);
+        }
+    </style>
+</head>
+<body>
+    <div class="login-wrap">
+        <div class="logo">
+            <div class="logo-icon">⚡</div>
+            <h1>РСО ПОРТАЛ</h1>
+            <p>Система обработки обращений</p>
+        </div>
+        <div class="card">
+            <h2>ВХОД В СИСТЕМУ</h2>
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ category }}">{{ message }}</div>
+                {% endfor %}
+            {% endwith %}
+            <form method="POST">
+                <div class="field">
+                    <label>Логин</label>
+                    <input type="text" name="username" placeholder="admin" autocomplete="username" required>
+                </div>
+                <div class="field">
+                    <label>Пароль</label>
+                    <input type="password" name="password" placeholder="••••••••" autocomplete="current-password" required>
+                </div>
+                <button type="submit" class="btn">ВОЙТИ</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>

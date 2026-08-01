@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+{% block title %}FAQ-скрипты{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>FAQ-скрипты</h1>
+</div>
+
+{# ── Flash-сообщения ── #}
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for category, msg in messages %}
+    <div class="alert alert-{{ category }}">{{ msg }}</div>
+  {% endfor %}
+{% endwith %}
+
+{# ── Форма создания нового скрипта ── #}
+<div class="card mb-4">
+  <div class="card-body">
+    <form method="POST" action="{{ url_for('script_create') }}" class="form-inline">
+      <input type="text" name="title" class="form-control mr-2"
+             style="flex:1;min-width:200px"
+             placeholder="Название нового скрипта — например: Вопросы по оплате" required>
+      <button type="submit" class="btn btn-primary">＋ Новый скрипт</button>
+    </form>
+  </div>
+</div>
+
+{# ── Список скриптов ── #}
+<div class="card">
+  <div class="card-header">
+    <strong>Все скрипты</strong>
+    <span class="badge badge-primary ml-2">{{ scripts | length }}</span>
+  </div>
+  <div class="card-body p-0">
+    {% if scripts %}
+    <table class="table mb-0">
+      <thead class="thead-light">
+        <tr>
+          <th>Название</th>
+          <th style="text-align:center">Статус</th>
+          <th style="text-align:center">Порядок</th>
+          <th style="text-align:center">Узлов</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in scripts %}
+        <tr {% if not s.is_active %}style="opacity:.5"{% endif %}>
+          <td>
+            <a href="{{ url_for('script_editor', script_id=s.id) }}">{{ s.title }}</a>
+          </td>
+          <td style="text-align:center">
+            {% if s.is_active %}
+              <span class="badge badge-success">Активен</span>
+            {% else %}
+              <span class="badge badge-secondary">Выключен</span>
+            {% endif %}
+          </td>
+          <td style="text-align:center">{{ s.sort_order }}</td>
+          <td style="text-align:center">
+            {% if s.node_count > 0 %}
+              {{ s.node_count }}
+            {% else %}
+              <span class="text-danger" title="Скрипт пуст — бот покажет «Скрипт пуст»">0 ⚠</span>
+            {% endif %}
+          </td>
+          <td>
+            <div class="d-flex gap-2" style="justify-content:flex-end">
+              <a href="{{ url_for('script_editor', script_id=s.id) }}"
+                 class="btn btn-sm btn-secondary">Редактировать</a>
+              <form method="POST"
+                    action="{{ url_for('script_delete', script_id=s.id) }}"
+                    onsubmit="return confirm('Удалить скрипт «{{ s.title }}»?\nВсе узлы ({{ s.node_count }}) и переходы будут удалены безвозвратно.')">
+                <button type="submit" class="btn btn-sm btn-outline-danger">Удалить</button>
+              </form>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="p-3 text-muted text-center py-5">
+      Пока нет ни одного скрипта. Создайте первый через форму выше.
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+<div class="text-muted small" style="margin-top:12px">
+  Активные скрипты показываются жителям в боте как темы раздела FAQ
+  (в порядке возрастания колонки «Порядок»). Выключенные скрипты бот не видит.
+</div>
+{% endblock %}
