@@ -123,10 +123,11 @@ def _migrate_appeals_legacy(c: sqlite3.Cursor) -> None:
 
 
 def _ensure_column(c: sqlite3.Cursor, table: str, column: str, definition: str) -> None:
-    """Добавляет колонку при обновлении старой SQLite-схемы."""
+    """Идемпотентно добавляет колонку в существующую SQLite-таблицу."""
     columns = {row[1] for row in c.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in columns:
         c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        log.info("Миграция: добавлена колонка %s.%s", table, column)
 
 
 def init_db() -> None:
@@ -193,9 +194,11 @@ def init_db() -> None:
             chat_id   INTEGER UNIQUE NOT NULL,
             ls        TEXT,
             fio       TEXT,
-            last_seen TEXT
+            last_seen TEXT,
+            authorized_1c INTEGER NOT NULL DEFAULT 0
         )
     """)
+    _ensure_column(c, "bot_users", "authorized_1c", "INTEGER NOT NULL DEFAULT 0")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS pokazaniya (
@@ -206,9 +209,33 @@ def init_db() -> None:
             meter_number  TEXT,
             value1        TEXT,
             value2        TEXT,
-            created_at    TEXT
+            created_at    TEXT,
+            sent_to_1c    INTEGER NOT NULL DEFAULT 0,
+            status_1c     TEXT DEFAULT NULL,
+            batch_id      TEXT DEFAULT NULL
         )
     """)
+
+    _ensure_column(c, "pokazaniya", "sent_to_1c", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(c, "pokazaniya", "status_1c", "TEXT DEFAULT NULL")
+    _ensure_column(c, "pokazaniya", "batch_id", "TEXT DEFAULT NULL")
+    # Excel imports use this exact signature for starting meter values, not
+    # customer submissions. Keep genuine historical readings in the queue.
+    c.execute("""
+        UPDATE pokazaniya SET sent_to_1c=1
+        WHERE chat_id=0 AND created_at='2000-01-01 00:00' AND sent_to_1c=0
+          AND batch_id IS NULL
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS sync_1c_state (
+            id               INTEGER PRIMARY KEY CHECK (id = 1),
+            last_success_at  TEXT DEFAULT NULL,
+            last_attempt_at  TEXT DEFAULT NULL,
+            pending_batch_id TEXT DEFAULT NULL
+        )
+    """)
+    c.execute("INSERT OR IGNORE INTO sync_1c_state (id) VALUES (1)")
 
     # Таблица comments остаётся как архивная (appeal_id → appeals_legacy).
     # Новые ответы операторов идут в appeal_responses.
@@ -460,6 +487,14 @@ def init_db() -> None:
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_pokazaniya_ls_meter
         ON pokazaniya(ls, meter_number)
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_pokazaniya_1c_queue
+        ON pokazaniya(sent_to_1c, batch_id, created_at)
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_schetchiki_ls_meter
+        ON schetchiki(ls, meter_number)
     """)
 
     # 5. Seed ──────────────────────────────────────────────────────────────────
@@ -1015,6 +1050,254 @@ def get_pokazaniya_with_prev() -> list[dict]:
     return result
 
 
+_CUSTOMER_READING_SQL = "NOT (chat_id IS 0 AND created_at IS '2000-01-01 00:00')"
+
+
+def claim_1c_sync_batch(
+    now: datetime,
+    new_batch_id: str,
+    limit: int,
+    retry_hours: int,
+    period_hours: int,
+) -> dict | None:
+    """Claim due work atomically, retaining orphan batch IDs from old versions.
+
+    BEGIN IMMEDIATE serializes scheduler processes before they read the state.
+    The attempt timestamp is committed together with membership, so another
+    scheduler cannot send a different payload for the same pending batch.
+    """
+    def parsed(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        result = datetime.fromisoformat(value)
+        return result if result.tzinfo else result.replace(
+            tzinfo=timezone(timedelta(hours=TIMEZONE_OFFSET))
+        )
+
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT OR IGNORE INTO sync_1c_state (id) VALUES (1)")
+        state = dict(conn.execute("SELECT * FROM sync_1c_state WHERE id=1").fetchone())
+        batch_id = state["pending_batch_id"]
+        recovered = False
+        if batch_id is None:
+            orphan = conn.execute(
+                "SELECT batch_id FROM pokazaniya WHERE sent_to_1c=0 "
+                "AND batch_id IS NOT NULL ORDER BY id LIMIT 1"
+            ).fetchone()
+            if orphan is not None:
+                batch_id = orphan["batch_id"]
+                recovered = True
+
+        first_attempt = batch_id is None
+        last_attempt = parsed(state["last_attempt_at"])
+        last_success = parsed(state["last_success_at"])
+        if not recovered:
+            if batch_id is not None and last_attempt and now - last_attempt < timedelta(hours=retry_hours):
+                return None
+            if batch_id is None and last_success and now - last_success < timedelta(hours=period_hours):
+                return None
+
+        if first_attempt:
+            batch_id = new_batch_id
+            rows = conn.execute(
+                "SELECT id FROM pokazaniya WHERE sent_to_1c=0 AND batch_id IS NULL "
+                f"AND {_CUSTOMER_READING_SQL} AND created_at <= ? ORDER BY id LIMIT ?",
+                (now.strftime("%Y-%m-%d %H:%M"), limit),
+            ).fetchall()
+            conn.executemany(
+                "UPDATE pokazaniya SET batch_id=? WHERE id=?",
+                [(batch_id, row["id"]) for row in rows],
+            )
+        conn.execute(
+            "UPDATE sync_1c_state SET pending_batch_id=?, last_attempt_at=? WHERE id=1",
+            (batch_id, now.isoformat(timespec="minutes")),
+        )
+        rows = conn.execute(
+            # Assigned legacy baselines may already have reached 1C. Preserve
+            # the complete original payload under that idempotency key.
+            "SELECT * FROM pokazaniya WHERE batch_id=? ORDER BY id",
+            (batch_id,),
+        ).fetchall()
+        conn.commit()
+        return {
+            "batch_id": batch_id, "rows": rows, "first_attempt": first_attempt,
+            "attempt_at": now.isoformat(timespec="minutes"),
+        }
+    finally:
+        conn.close()
+
+
+def complete_1c_sync_batch(batch_id: str, attempt_at: str) -> bool:
+    """Finish only the claimed attempt; a stale worker cannot clear newer work."""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        state = conn.execute("SELECT * FROM sync_1c_state WHERE id=1").fetchone()
+        if state["pending_batch_id"] != batch_id or state["last_attempt_at"] != attempt_at:
+            return False
+        more = conn.execute(
+            "SELECT 1 FROM pokazaniya WHERE sent_to_1c=0 "
+            f"AND (batch_id IS NOT NULL OR {_CUSTOMER_READING_SQL}) LIMIT 1"
+        ).fetchone()
+        conn.execute(
+            "UPDATE sync_1c_state SET pending_batch_id=NULL, last_success_at=? WHERE id=1",
+            (state["last_success_at"] if more else attempt_at,),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def get_unsent_1c_readings(
+    limit: int,
+    created_before: str | None = None,
+) -> list[sqlite3.Row]:
+    """Возвращает ещё не закреплённые за пакетом показания."""
+    conn = get_conn()
+    try:
+        sql = (
+            "SELECT * FROM pokazaniya "
+            "WHERE sent_to_1c=0 AND batch_id IS NULL "
+            f"AND {_CUSTOMER_READING_SQL} "
+        )
+        params: list = []
+        if created_before is not None:
+            sql += "AND created_at <= ? "
+            params.append(created_before)
+        sql += "ORDER BY id LIMIT ?"
+        params.append(limit)
+        return conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+
+
+def has_unsent_1c_readings() -> bool:
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            # Orphan batches must also prevent the daily timer from starting.
+            "SELECT 1 FROM pokazaniya WHERE sent_to_1c=0 "
+            f"AND (batch_id IS NOT NULL OR {_CUSTOMER_READING_SQL}) LIMIT 1"
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def assign_readings_to_1c_batch(reading_ids: list[int], batch_id: str) -> None:
+    """Atomically assign membership and its pending state (legacy callers)."""
+    if not reading_ids:
+        return
+    placeholders = ",".join("?" for _ in reading_ids)
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT OR IGNORE INTO sync_1c_state (id) VALUES (1)")
+        pending = conn.execute("SELECT pending_batch_id FROM sync_1c_state WHERE id=1").fetchone()[0]
+        if pending is not None:
+            raise ValueError("A 1C batch is already pending")
+        conn.execute(
+            f"UPDATE pokazaniya SET batch_id=? "
+            f"WHERE id IN ({placeholders}) AND sent_to_1c=0 AND batch_id IS NULL "
+            f"AND {_CUSTOMER_READING_SQL}",
+            [batch_id, *reading_ids],
+        )
+        conn.execute("UPDATE sync_1c_state SET pending_batch_id=? WHERE id=1", (batch_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_1c_readings_by_batch(batch_id: str) -> list[sqlite3.Row]:
+    conn = get_conn()
+    try:
+        return conn.execute(
+            "SELECT * FROM pokazaniya WHERE batch_id=? ORDER BY id", (batch_id,)
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def apply_1c_reading_statuses(batch_id: str, statuses: list[dict]) -> list[dict]:
+    """Финализирует строки пакета и возвращает данные для уведомлений MAX."""
+    conn = get_conn()
+    updated: list[dict] = []
+    try:
+        for item in statuses:
+            status = item.get("status")
+            if status not in {"accepted", "rejected"}:
+                raise ValueError(f"Неизвестный статус показания: {status!r}")
+            row = conn.execute(
+                """
+                SELECT * FROM pokazaniya
+                WHERE batch_id=? AND ls=? AND meter_number=? AND value1=?
+                  AND ((value2 IS NULL AND ? IS NULL) OR value2=?)
+                  AND created_at=? AND sent_to_1c=0
+                ORDER BY id LIMIT 1
+                """,
+                (
+                    batch_id,
+                    item.get("ls"),
+                    item.get("meter_number"),
+                    str(item.get("value1")),
+                    item.get("value2"),
+                    None if item.get("value2") is None else str(item.get("value2")),
+                    item.get("submitted_at"),
+                ),
+            ).fetchone()
+            if row is None:
+                log.error("Ответ 1С содержит неизвестное показание: batch_id=%s", batch_id)
+                continue
+            conn.execute(
+                "UPDATE pokazaniya SET sent_to_1c=1, status_1c=? WHERE id=?",
+                (status, row["id"]),
+            )
+            result = dict(row)
+            result["status_1c"] = status
+            result["sent_to_1c"] = 1
+            updated.append(result)
+        conn.commit()
+        return updated
+    finally:
+        conn.close()
+
+
+def get_1c_sync_state() -> dict:
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT * FROM sync_1c_state WHERE id=1").fetchone()
+        if row is None:
+            conn.execute("INSERT INTO sync_1c_state (id) VALUES (1)")
+            conn.commit()
+            row = conn.execute("SELECT * FROM sync_1c_state WHERE id=1").fetchone()
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def update_1c_sync_state(**fields: str | None) -> None:
+    allowed = {"last_success_at", "last_attempt_at", "pending_batch_id"}
+    unknown = set(fields) - allowed
+    if unknown:
+        raise ValueError(f"Неизвестные поля sync_1c_state: {sorted(unknown)}")
+    if not fields:
+        return
+    assignments = ", ".join(f"{name}=?" for name in fields)
+    conn = get_conn()
+    try:
+        conn.execute("INSERT OR IGNORE INTO sync_1c_state (id) VALUES (1)")
+        conn.execute(
+            f"UPDATE sync_1c_state SET {assignments} WHERE id=1",
+            list(fields.values()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ── Лицевые счета и счётчики ──────────────────────────────────────────────────
 
 def get_ls(number: str) -> sqlite3.Row | None:
@@ -1031,18 +1314,94 @@ def get_schetchiki(ls: str) -> list[sqlite3.Row]:
     return rows
 
 
+def _validate_1c_meter(meter: dict) -> None:
+    if not meter.get("meter_number"):
+        raise ValueError("В ответе 1С отсутствует meter_number")
+    if meter.get("meter_type") not in {"Однотарифный", "Двухтарифный"}:
+        raise ValueError(f"Неподдерживаемый meter_type: {meter.get('meter_type')!r}")
+
+
+def _upsert_1c_meter_conn(conn: sqlite3.Connection, ls: str, meter: dict) -> None:
+    """Обновляет существующий счётчик без удаления возможных старых дублей."""
+    existing = conn.execute(
+        "SELECT id FROM schetchiki WHERE ls=? AND meter_number=? ORDER BY id LIMIT 1",
+        (ls, meter["meter_number"]),
+    ).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE schetchiki SET resource_type=?, meter_type=? WHERE id=?",
+            (meter.get("resource_type"), meter["meter_type"], existing["id"]),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO schetchiki "
+            "(ls, resource_type, meter_number, meter_type, initial1, initial2) "
+            "VALUES (?, ?, ?, ?, '0', '0')",
+            (ls, meter.get("resource_type"), meter["meter_number"], meter["meter_type"]),
+        )
+
+
+def upsert_1c_meters(ls: str, meters: list[dict]) -> None:
+    conn = get_conn()
+    try:
+        for meter in meters:
+            _validate_1c_meter(meter)
+            _upsert_1c_meter_conn(conn, ls, meter)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def apply_1c_meter_changes(changes: list[dict]) -> None:
+    conn = get_conn()
+    try:
+        for change in changes:
+            action = change.get("action")
+            ls = change.get("ls")
+            meter_number = change.get("meter_number")
+            if not ls or not meter_number:
+                raise ValueError("Изменение счётчика без ls или meter_number")
+            if action == "removed":
+                conn.execute(
+                    "DELETE FROM schetchiki WHERE ls=? AND meter_number=?",
+                    (ls, meter_number),
+                )
+            elif action == "changed":
+                _validate_1c_meter(change)
+                conn.execute(
+                    "UPDATE schetchiki SET resource_type=?, meter_type=? "
+                    "WHERE ls=? AND meter_number=?",
+                    (
+                        change.get("resource_type"),
+                        change.get("meter_type"),
+                        ls,
+                        meter_number,
+                    ),
+                )
+            elif action == "added":
+                _validate_1c_meter(change)
+                _upsert_1c_meter_conn(conn, ls, change)
+            else:
+                raise ValueError(f"Неизвестное действие счётчика: {action!r}")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def import_from_excel(filepath: str = "Данные_по_ЛС.xlsx") -> None:
     try:
         from openpyxl import load_workbook
-    except ImportError:
-        log.error("openpyxl не установлен: pip install openpyxl")
-        return
+    except ImportError as exc:
+        message = "Для импорта Excel не установлен openpyxl"
+        log.error(message)
+        raise RuntimeError(message) from exc
 
     try:
         wb = load_workbook(filepath, read_only=True)
-    except FileNotFoundError:
-        log.error("Файл не найден: %s", filepath)
-        return
+    except FileNotFoundError as exc:
+        message = f"Файл не найден: {filepath}"
+        log.error(message)
+        raise FileNotFoundError(message) from exc
 
     conn = get_conn()
 
@@ -1097,8 +1456,8 @@ def import_from_excel(filepath: str = "Данные_по_ЛС.xlsx") -> None:
                 v2 = initial2 if meter_type == "Двухтарифный" and initial2 else None
                 conn.execute(
                     "INSERT INTO pokazaniya "
-                    "(chat_id, ls, resource_type, meter_number, value1, value2, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "(chat_id, ls, resource_type, meter_number, value1, value2, created_at, sent_to_1c) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
                     (0, ls, resource_type, meter_number, initial1, v2, "2000-01-01 00:00"),
                 )
                 init_count += 1
@@ -1197,15 +1556,27 @@ def get_bot_user(chat_id: int) -> sqlite3.Row | None:
     return row
 
 
-def upsert_bot_user(chat_id: int, ls: str, fio: str) -> None:
+def upsert_bot_user(
+    chat_id: int,
+    ls: str,
+    fio: str,
+    authorized_1c: bool | None = None,
+) -> None:
     conn = get_conn()
-    conn.execute(
-        "INSERT INTO bot_users (chat_id, ls, fio, last_seen) VALUES (?, ?, ?, ?) "
-        "ON CONFLICT(chat_id) DO UPDATE SET ls=excluded.ls, fio=excluded.fio, last_seen=excluded.last_seen",
-        (chat_id, ls, fio, msk_now()),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        auth_value = int(bool(authorized_1c)) if authorized_1c is not None else 0
+        conn.execute(
+            "INSERT INTO bot_users (chat_id, ls, fio, last_seen, authorized_1c) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET "
+            "ls=excluded.ls, fio=excluded.fio, last_seen=excluded.last_seen, "
+            "authorized_1c=CASE WHEN ? IS NULL THEN bot_users.authorized_1c "
+            "ELSE excluded.authorized_1c END",
+            (chat_id, ls, fio, msk_now(), auth_value, authorized_1c),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_all_bot_users() -> list[sqlite3.Row]:
@@ -1279,18 +1650,6 @@ def get_counts() -> dict:
 
 # ── Cleanup-функции для APScheduler (Этап 4) ──────────────────────────────────
 #
-# Регистрация задач (добавить в bot.py при Этапе 4):
-#
-#   from apscheduler.schedulers.background import BackgroundScheduler
-#   from database import cleanup_old_cache, auto_resolve_pending
-#
-#   scheduler = BackgroundScheduler()
-#   scheduler.add_job(sync_readings_to_1c,  'interval', minutes=SYNC_INTERVAL_MINUTES)
-#   scheduler.add_job(auto_resolve_pending,  'interval', hours=1)
-#   scheduler.add_job(cleanup_user_states,   'interval', hours=1)   # живёт в bot.py
-#   # scheduler.add_job(cleanup_old_cache,   'interval', hours=24)  # активировать в Этапе 4
-#   scheduler.start()
-#
 # cleanup_user_states() — НЕ здесь.
 # Функция оперирует dict user_states, объявленным в bot.py в том же процессе.
 # Сигнатура: cleanup_user_states(user_states: dict, ttl_minutes: int = SESSION_TTL_MINUTES)
@@ -1300,16 +1659,15 @@ def get_counts() -> dict:
 def cleanup_old_cache(days: int = 90) -> int:
     """
     Удаляет показания старше `days` дней.
-    В Этапе 4 будет добавлен фильтр sent_to_1c=1 после добавления колонки
-    в таблицу pokazaniya в рамках рефакторинга sync_worker.
+    В режиме очереди удаляет только уже финализированные в 1С строки.
     Возвращает количество удалённых строк.
     """
     conn = get_conn()
     tz = timezone(timedelta(hours=TIMEZONE_OFFSET))
     cutoff = (datetime.now(tz) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M")
     cursor = conn.execute(
-        # TODO Этап 4: добавить AND sent_to_1c=1 после миграции схемы pokazaniya
-        "DELETE FROM pokazaniya WHERE created_at < ? AND created_at != '2000-01-01 00:00'",
+        "DELETE FROM pokazaniya WHERE created_at < ? "
+        "AND created_at != '2000-01-01 00:00' AND sent_to_1c=1",
         (cutoff,),
     )
     deleted = cursor.rowcount

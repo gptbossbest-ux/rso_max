@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import io
 import sqlite3
 import subprocess
 import sys
@@ -107,6 +108,96 @@ def test_production_configuration_accepts_strong_secret():
         cwd=os.getcwd(), env=env, capture_output=True, text=True, check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def _production_1c_env(**overrides):
+    env = os.environ.copy()
+    env.update(
+        APP_ENV="production",
+        SECRET_KEY="a-unique-production-secret-value-123456789",
+        INTERNAL_API_TOKEN="valid-api-token",
+        ENABLE_1C_INTEGRATION="true",
+        INTEGRATION_1C_MOCK="false",
+        INTEGRATION_1C_BASE_URL="https://1c.example.test/publication/hs/service",
+        INTEGRATION_1C_AUTH_TOKEN="valid-1c-token",
+    )
+    env.update(overrides)
+    return env
+
+
+def _import_config(env):
+    return subprocess.run(
+        [sys.executable, "-c", "import config"],
+        cwd=os.getcwd(), env=env, capture_output=True, text=True, check=False,
+    )
+
+
+def test_production_enabled_1c_rejects_mock_mode():
+    result = _import_config(_production_1c_env(INTEGRATION_1C_MOCK="true"))
+    assert result.returncode != 0
+    assert "INTEGRATION_1C_MOCK" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("missing_name", "overrides"),
+    [
+        ("INTEGRATION_1C_BASE_URL", {"INTEGRATION_1C_BASE_URL": ""}),
+        ("INTEGRATION_1C_AUTH_TOKEN", {"INTEGRATION_1C_AUTH_TOKEN": ""}),
+    ],
+)
+def test_production_real_1c_requires_connection_settings(missing_name, overrides):
+    result = _import_config(_production_1c_env(**overrides))
+    assert result.returncode != 0
+    assert missing_name in result.stderr
+
+
+def test_production_real_1c_accepts_complete_configuration():
+    result = _import_config(_production_1c_env())
+    assert result.returncode == 0, result.stderr
+
+
+def test_excel_import_reports_missing_openpyxl(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def import_without_openpyxl(name, *args, **kwargs):
+        if name == "openpyxl":
+            raise ImportError("not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_openpyxl)
+    with pytest.raises(RuntimeError, match="openpyxl"):
+        db.import_from_excel("meters.xlsx")
+
+
+def test_upload_displays_excel_import_failure(clean_db, tmp_path, monkeypatch):
+    import web
+
+    ok, _ = db.create_user("upload-admin", "initial-password", "Admin", "admin")
+    assert ok
+    client = web.app.test_client()
+    client.post(
+        "/login",
+        data={"username": "upload-admin", "password": "initial-password"},
+    )
+    monkeypatch.setattr(web.os, "getcwd", lambda: str(tmp_path))
+
+    def fail_import(_filepath):
+        raise RuntimeError("Для импорта Excel не установлен openpyxl")
+
+    monkeypatch.setattr(web.db, "import_from_excel", fail_import)
+    response = client.post(
+        "/upload",
+        data={"file": (io.BytesIO(b"not-an-xlsx"), "meters.xlsx")},
+        content_type="multipart/form-data",
+    )
+    assert response.status_code == 302
+    with client.session_transaction() as session:
+        assert (
+            "error",
+            "Ошибка импорта: Для импорта Excel не установлен openpyxl",
+        ) in session["_flashes"]
 
 
 def test_internal_api_missing_token_is_closed(monkeypatch):

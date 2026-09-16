@@ -44,6 +44,7 @@ from werkzeug.security import check_password_hash
 import client_api
 import database as db
 from config import (
+    ENABLE_1C_INTEGRATION,
     LOG_BACKUP_COUNT,
     LOG_FILE,
     LOG_LEVEL,
@@ -465,7 +466,12 @@ def legacy_list():
 @login_required
 def pokazaniya():
     rows = db.get_pokazaniya_with_prev()
-    return render_template("pokazaniya.html", rows=rows, user=session["user"])
+    return render_template(
+        "pokazaniya.html",
+        rows=rows,
+        user=session["user"],
+        integration_1c_enabled=ENABLE_1C_INTEGRATION,
+    )
 
 
 # ── Оповещения ────────────────────────────────────────────────────────────────
@@ -531,21 +537,14 @@ def upload_file():
     filepath = os.path.join(os.getcwd(), "Данные_по_ЛС.xlsx")
     file.save(filepath)
 
-    # TODO: заменить на возврат счётчиков из import_from_excel()
-    # Когда import_from_excel будет возвращать dict {"licschet": N, "schetchiki": N, "pokazaniya": N},
-    # убрать перехват stdout и использовать результат напрямую.
-    import io, sys
-    old_out = sys.stdout
-    sys.stdout = buf = io.StringIO()
     try:
         db.import_from_excel(filepath)
-        out = buf.getvalue()
     except Exception as exc:
-        out = f"Ошибка: {exc}"
-    finally:
-        sys.stdout = old_out
+        log.exception("Ошибка импорта Excel")
+        flash(f"Ошибка импорта: {exc}", "error")
+        return redirect(url_for("upload_page"))
 
-    flash(f"Файл загружен. {out.strip().replace(chr(10), ' | ')}", "success")
+    flash("Файл успешно загружен и импортирован", "success")
     return redirect(url_for("upload_page"))
 
 
