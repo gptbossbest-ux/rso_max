@@ -183,6 +183,27 @@ def reopen_appeal(appeal_id: int) -> tuple[dict | None, str | None]:
     return change_appeal_status(appeal_id, "in_work")
 
 
+# ── Авторизация через 1С ─────────────────────────────────────────────────────
+
+def request_1c_auth_code(ls: str, chat_id: int) -> tuple[dict | None, str | None]:
+    return _post("/api/v1/integrations/1c/auth/request-code", {
+        "ls": ls,
+        "chat_id": chat_id,
+    })
+
+
+def verify_1c_auth_code(
+    ls: str,
+    chat_id: int,
+    code: str,
+) -> tuple[dict | None, str | None]:
+    return _post("/api/v1/integrations/1c/auth/verify-code", {
+        "ls": ls,
+        "chat_id": chat_id,
+        "code": code,
+    })
+
+
 # ── Скрипты ───────────────────────────────────────────────────────────────────
 
 def list_scripts() -> tuple[list | None, str | None]:

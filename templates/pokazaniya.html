@@ -64,9 +64,14 @@
                 <th class="sortable" onclick="sortTable(2)" data-type="str">Ресурс</th>
                 <th class="sortable" onclick="sortTable(3)" data-type="str">№ счётчика</th>
                 <th class="sortable" onclick="sortTable(4)" data-type="num">Показания</th>
+                {% if integration_1c_enabled %}
+                <th class="sortable" onclick="sortTable(5)" data-type="str">Статус 1С</th>
+                <th class="sortable" onclick="sortTable(6)" data-type="date">Дата и время</th>
+                {% else %}
                 <th class="sortable" onclick="sortTable(5)" data-type="num">Предыдущие</th>
                 <th class="sortable" onclick="sortTable(6)" data-type="num">Разница</th>
                 <th class="sortable" onclick="sortTable(7)" data-type="date">Дата и время</th>
+                {% endif %}
             </tr>
             <tr class="filter-row">
                 <th><input id="f0" placeholder="№" oninput="applyFilters()"></th>
@@ -74,9 +79,14 @@
                 <th><input id="f2" placeholder="Ресурс" oninput="applyFilters()"></th>
                 <th><input id="f3" placeholder="Счётчик" oninput="applyFilters()"></th>
                 <th><input id="f4" placeholder="Показания" oninput="applyFilters()"></th>
+                {% if integration_1c_enabled %}
+                <th><input id="f5" placeholder="Статус 1С" oninput="applyFilters()"></th>
+                <th><input id="f6" placeholder="Дата" oninput="applyFilters()"></th>
+                {% else %}
                 <th><input id="f5" placeholder="Предыдущие" oninput="applyFilters()"></th>
                 <th><input id="f6" placeholder="Разница" oninput="applyFilters()"></th>
                 <th><input id="f7" placeholder="Дата" oninput="applyFilters()"></th>
+                {% endif %}
             </tr>
         </thead>
         <tbody id="tableBody">
@@ -107,6 +117,17 @@
                             <span class="value-cell">{{ r['value1'] }}</span>
                         {% endif %}
                     </td>
+                    {% if integration_1c_enabled %}
+                    <td>
+                        {% if r['status_1c'] == 'accepted' %}
+                            <span class="badge badge-success">Принято</span>
+                        {% elif r['status_1c'] == 'rejected' %}
+                            <span class="badge badge-danger">Отклонено</span>
+                        {% else %}
+                            <span class="badge badge-warning">Ожидает</span>
+                        {% endif %}
+                    </td>
+                    {% else %}
                     <td>
                         {% if r['prev_value1'] %}
                             {% if r['prev_value2'] %}
@@ -145,11 +166,12 @@
                             <span class="diff-none">Первичные</span>
                         {% endif %}
                     </td>
+                    {% endif %}
                     <td><span class="text-muted small">{{ r['created_at'][:16] if r['created_at'] else '—' }}</span></td>
                 </tr>
                 {% endfor %}
             {% else %}
-                <tr><td colspan="8"><div class="empty">Показания пока не передавались</div></td></tr>
+                <tr><td colspan="{{ 7 if integration_1c_enabled else 8 }}"><div class="empty">Показания пока не передавались</div></td></tr>
             {% endif %}
         </tbody>
     </table>
@@ -159,10 +181,11 @@
 {% block scripts %}
 <script>
     let sortCol = -1, sortDir = 1;
+    const columnCount = {{ 7 if integration_1c_enabled else 8 }};
 
     function applyFilters() {
         const global = document.getElementById('globalSearch').value.toLowerCase();
-        const filters = Array.from({length: 8}, (_, i) => {
+        const filters = Array.from({length: columnCount}, (_, i) => {
             const el = document.getElementById('f' + i);
             return el ? el.value.toLowerCase() : '';
         });
@@ -220,7 +243,7 @@
 
     function clearAll() {
         document.getElementById('globalSearch').value = '';
-        Array.from({length: 8}, (_, i) => { const el = document.getElementById('f'+i); if(el) el.value=''; });
+        Array.from({length: columnCount}, (_, i) => { const el = document.getElementById('f'+i); if(el) el.value=''; });
         applyFilters();
     }
 

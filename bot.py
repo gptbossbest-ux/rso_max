@@ -47,13 +47,13 @@ import database as db
 from config import (
     API,
     AUTH_BLOCK_MINUTES,
+    ENABLE_1C_INTEGRATION,
     LOG_BACKUP_COUNT,
     LOG_FILE,
     LOG_LEVEL,
     LOG_MAX_BYTES,
     MAX_AUTH_ATTEMPTS,
     SESSION_TTL_MINUTES,
-    SYNC_INTERVAL_MINUTES,
     TIMEZONE_OFFSET,
     TOKEN,
 )
@@ -114,6 +114,8 @@ class S:
     APPEAL_CATEGORY = "appeal_category"
     APPEAL_BODY     = "appeal_body"
     AWAIT_LS        = "await_ls"        # универсальное ожидание ЛС (см. _AFTER_LS_ACTIONS)
+    AWAIT_LS_1C     = "await_ls_1c"
+    AWAIT_CODE_1C   = "await_code_1c"
 
     # Возврат обращения из pending_confirmation
     REOPEN_COMMENT  = "reopen_comment"
@@ -245,14 +247,17 @@ def send_main_menu(chat_id: int, text: str = "Выберите действие:
     Главное меню — показывается сразу без авторизации (раздел 6.2 ТЗ).
     ЛС-зависимые функции спрашивают ЛС внутри своего флоу.
     """
-    send_buttons(chat_id, text, [
+    rows = [
         [_cb("📝 Подать обращение",         "appeal_start")],
         [_cb("📋 Проверить статус обращения", "my_appeals")],
         [_cb("📊 Передать показания",       "pokazaniya")],
         [_cb("📚 Ответ на типовой вопрос",  "scripts_list")],
         [_cb("📄 Последняя квитанция",      "kvitanciya")],
         [_cb("🗓️ Записаться на приём",      "appointment_start")],
-    ])
+    ]
+    if ENABLE_1C_INTEGRATION and not _get_saved_ls(chat_id):
+        rows.insert(0, [_cb("🔐 Авторизоваться", "auth_1c")])
+    send_buttons(chat_id, text, rows)
 
 
 # ── Вспомогательные функции ───────────────────────────────────────────────────
@@ -260,12 +265,15 @@ def send_main_menu(chat_id: int, text: str = "Выберите действие:
 def _get_saved_ls(chat_id: int) -> str | None:
     """Возвращает сохранённый ЛС из сессии или таблицы bot_users."""
     st = _get_state(chat_id)
-    if st.get("ls"):
+    if st.get("ls") and (not ENABLE_1C_INTEGRATION or st.get("authorized_1c")):
         return st["ls"]
     row = db.get_bot_user(chat_id)
-    if row and row["ls"]:
+    if row and row["ls"] and (
+        not ENABLE_1C_INTEGRATION or bool(row["authorized_1c"])
+    ):
         st["ls"] = row["ls"]
         st["fio"] = row["fio"]
+        st["authorized_1c"] = bool(row["authorized_1c"])
         return row["ls"]
     return None
 
@@ -273,9 +281,15 @@ def _get_saved_ls(chat_id: int) -> str | None:
 def _save_ls(chat_id: int, ls: str, fio: str | None = None) -> None:
     st = _get_state(chat_id)
     st["ls"] = ls
+    st["authorized_1c"] = ENABLE_1C_INTEGRATION
     if fio:
         st["fio"] = fio
-    db.upsert_bot_user(chat_id, ls, fio or "")
+    db.upsert_bot_user(
+        chat_id,
+        ls,
+        fio or "",
+        authorized_1c=ENABLE_1C_INTEGRATION,
+    )
 
 
 def _validate_ls(ls_number: str) -> bool:
@@ -319,6 +333,7 @@ _FLOW_KEYS = (
     "appeal", "script", "after_ls", "reopen_appeal_id",
     "meters", "meter_idx", "new_value1", "new_value2",
     "appt_branch_id", "appt_date", "appt_time", "appt_theme",
+    "pending_1c_ls", "after_1c_auth",
 )
 
 # Ключи ввода показаний — сбрасываются при переходе к следующему счётчику.
@@ -344,9 +359,23 @@ def _request_ls(chat_id: int, after: str) -> None:
     Запрашивает ЛС у клиента и запоминает, какое действие выполнить после
     успешной валидации (см. _AFTER_LS_ACTIONS).
     """
+    if ENABLE_1C_INTEGRATION:
+        _start_1c_auth(chat_id, after=after)
+        return
     st = _get_state(chat_id)
     st["state"] = S.AWAIT_LS
     st["after_ls"] = after
+    _touch(st)
+    send_message(chat_id, "Введите номер вашего лицевого счёта:")
+
+
+def _start_1c_auth(chat_id: int, after: str | None = None) -> None:
+    """Начинает двухшаговую авторизацию ЛС через опубликованный сервис 1С."""
+    st = _get_state(chat_id)
+    _clear_flow(st)
+    st["state"] = S.AWAIT_LS_1C
+    if after:
+        st["after_1c_auth"] = after
     _touch(st)
     send_message(chat_id, "Введите номер вашего лицевого счёта:")
 
@@ -645,23 +674,28 @@ def _ask_meter_value(chat_id: int) -> None:
     number   = meter["meter_number"]
     is_two   = meter["meter_type"] == "Двухтарифный"
 
-    last = db.get_last_pokazaniya(st["ls"], number)
-    if last:
-        if is_two and last["value2"]:
-            current_info = f"Текущие: Т1={last['value1']}, Т2={last['value2']}"
-        else:
-            current_info = f"Текущее показание: {last['value1']}"
-        current_info += f" (от {(last['created_at'] or '')[:10]})"
+    if ENABLE_1C_INTEGRATION:
+        current_info = ""
     else:
-        initial = meter.get("initial2" if waiting_v2 else "initial1", "0")
-        current_info = f"Начальное: {initial}"
+        last = db.get_last_pokazaniya(st["ls"], number)
+        if last:
+            if is_two and last["value2"]:
+                current_info = f"Текущие: Т1={last['value1']}, Т2={last['value2']}"
+            else:
+                current_info = f"Текущее показание: {last['value1']}"
+            current_info += f" (от {(last['created_at'] or '')[:10]})"
+        else:
+            initial = meter.get("initial2" if waiting_v2 else "initial1", "0")
+            current_info = f"Начальное: {initial}"
+
+    info_line = f"\n{current_info}" if current_info else ""
 
     if waiting_v2:
-        prompt = f"{resource} №{number}\n{current_info}\nВведите Т2 (ночь):"
+        prompt = f"{resource} №{number}{info_line}\nВведите Т2 (ночь):"
     elif is_two:
-        prompt = f"{resource} №{number} (двухтарифный)\n{current_info}\nВведите Т1 (день):"
+        prompt = f"{resource} №{number} (двухтарифный){info_line}\nВведите Т1 (день):"
     else:
-        prompt = f"{resource} №{number}\n{current_info}\nВведите показание:"
+        prompt = f"{resource} №{number}{info_line}\nВведите показание:"
 
     send_message(chat_id, prompt)
 
@@ -1034,14 +1068,25 @@ def _cb_meter_confirm(chat_id: int, st: dict) -> None:
         chat_id, st["ls"], meter["resource_type"], meter["meter_number"],
         st.get("new_value1"), st.get("new_value2"),
     )
-    log.info("Показания приняты: ЛС=%s  счётчик=%s  chat_id=%s",
-             st["ls"], meter["meter_number"], chat_id)
+    if ENABLE_1C_INTEGRATION:
+        log.info("Показания сохранены в очередь 1С: ЛС=%s  счётчик=%s  chat_id=%s",
+                 st["ls"], meter["meter_number"], chat_id)
+    else:
+        log.info("Показания приняты: ЛС=%s  счётчик=%s  chat_id=%s",
+                 st["ls"], meter["meter_number"], chat_id)
 
     ls = st["ls"]
     _clear_flow(st)
     _touch(st)
 
-    send_message(chat_id, f"✅ Показания по счётчику {meter['resource_type']} №{meter['meter_number']} приняты!")
+    if ENABLE_1C_INTEGRATION:
+        send_message(
+            chat_id,
+            f"✅ Показания по счётчику {meter['resource_type']} №{meter['meter_number']} "
+            "сохранены и ожидают обработки в 1С.",
+        )
+    else:
+        send_message(chat_id, f"✅ Показания по счётчику {meter['resource_type']} №{meter['meter_number']} приняты!")
     _show_meter_select(chat_id, ls)
 
 
@@ -1055,6 +1100,7 @@ def _cb_meter_retry(chat_id: int, st: dict) -> None:
 
 
 _CALLBACK_STATIC: dict[str, callable] = {
+    "auth_1c":          lambda chat_id, st: _start_1c_auth(chat_id),
     "appeal_start":      lambda chat_id, st: _start_appeal(chat_id),
     "my_appeals":        lambda chat_id, st: _show_my_appeals(chat_id),
     "pokazaniya":        lambda chat_id, st: _start_pokazaniya(chat_id),
@@ -1143,6 +1189,66 @@ def _on_await_ls(chat_id: int, st: dict, text: str) -> None:
         send_main_menu(chat_id)
 
 
+def _on_await_ls_1c(chat_id: int, st: dict, text: str) -> None:
+    """Запрашивает одноразовый код для введённого ЛС."""
+    ls = text.strip()
+    if not ls:
+        send_message(chat_id, "Введите номер лицевого счёта.")
+        return
+    data, error = client_api.request_1c_auth_code(ls, chat_id)
+    if error or not data:
+        send_message(chat_id, "⚠️ Сервис авторизации временно недоступен. Попробуйте позже.")
+        _clear_flow(st)
+        send_main_menu(chat_id)
+        return
+    status = data.get("status")
+    message = data.get("message") or "Не удалось запросить код."
+    if status == "ok":
+        st["pending_1c_ls"] = ls
+        st["state"] = S.AWAIT_CODE_1C
+        _touch(st)
+        send_message(chat_id, message)
+        return
+    send_message(chat_id, message)
+    _clear_flow(st)
+    send_main_menu(chat_id)
+
+
+def _on_await_code_1c(chat_id: int, st: dict, text: str) -> None:
+    """Проверяет введённый код; сам код не сохраняет и не логирует."""
+    ls = st.get("pending_1c_ls")
+    if not ls:
+        _clear_flow(st)
+        send_main_menu(chat_id, "Начнём авторизацию заново.")
+        return
+    data, error = client_api.verify_1c_auth_code(ls, chat_id, text.strip())
+    if error or not data:
+        send_message(chat_id, "⚠️ Сервис авторизации временно недоступен. Попробуйте позже.")
+        _clear_flow(st)
+        send_main_menu(chat_id)
+        return
+    status = data.get("status")
+    message = data.get("message") or "Не удалось проверить код."
+    if status == "wrong_code":
+        send_message(chat_id, message)
+        return
+    if status == "ok":
+        after = st.get("after_1c_auth")
+        _save_ls(chat_id, ls)
+        _clear_flow(st)
+        _touch(st)
+        send_message(chat_id, message)
+        action = _AFTER_LS_ACTIONS.get(after)
+        if action:
+            action(chat_id, ls)
+        else:
+            send_main_menu(chat_id)
+        return
+    send_message(chat_id, message)
+    _clear_flow(st)
+    send_main_menu(chat_id)
+
+
 def _on_reopen_comment(chat_id: int, st: dict, text: str) -> None:
     """Клиент написал причину возврата обращения в работу."""
     appeal_id = st.pop("reopen_appeal_id", None)
@@ -1181,7 +1287,7 @@ def _on_value1(chat_id: int, st: dict, text: str) -> None:
         return
 
     current = _current_reading(st.get("ls", ""), meter, "value1", "initial1")
-    if val < current:
+    if not ENABLE_1C_INTEGRATION and val < current:
         send_message(chat_id,
             f"Показание {val} не может быть меньше текущего {current}.\n"
             f"Введите корректное значение:")
@@ -1208,7 +1314,7 @@ def _on_value2(chat_id: int, st: dict, text: str) -> None:
         return
 
     current = _current_reading(st.get("ls", ""), meter, "value2", "initial2")
-    if val < current:
+    if not ENABLE_1C_INTEGRATION and val < current:
         send_message(chat_id,
             f"Показание Т2 {val} не может быть меньше текущего {current}.\n"
             f"Введите корректное значение:")
@@ -1223,6 +1329,8 @@ def _on_value2(chat_id: int, st: dict, text: str) -> None:
 _MESSAGE_HANDLERS: dict[str, callable] = {
     S.APPEAL_BODY:       lambda chat_id, st, text: _appeal_got_body(chat_id, text),
     S.AWAIT_LS:          _on_await_ls,
+    S.AWAIT_LS_1C:       _on_await_ls_1c,
+    S.AWAIT_CODE_1C:     _on_await_code_1c,
     S.REOPEN_COMMENT:    _on_reopen_comment,
     S.APPOINTMENT_THEME: _on_appointment_theme,
     S.WAITING_VALUE1:    _on_value1,
@@ -1236,7 +1344,9 @@ def handle_message(message: dict) -> None:
     chat_id = message["recipient"]["chat_id"]
     text    = (message.get("body") or {}).get("text", "").strip()
 
-    log.debug("msg chat_id=%s text='%s'", chat_id, text[:50])
+    current_state = _get_state(chat_id).get("state", S.MENU)
+    safe_text = "<скрыто>" if current_state == S.AWAIT_CODE_1C else text[:50]
+    log.debug("msg chat_id=%s text='%s'", chat_id, safe_text)
 
     if not text:
         return
@@ -1291,25 +1401,6 @@ def _task_cleanup_user_states() -> None:
         cleanup_user_states(user_states, SESSION_TTL_MINUTES)
     except Exception as exc:
         log.error("APScheduler cleanup_user_states ошибка: %s", exc)
-
-
-def _task_sync_readings_to_1c() -> None:
-    """
-    Задача APScheduler: синхронизация показаний в 1С.
-    Запускается каждые SYNC_INTERVAL_MINUTES минут.
-
-    TODO Этап 4 (ожидает миграции схемы):
-      1. Добавить колонку sent_to_1c INTEGER DEFAULT 0 в pokazaniya
-         (см. TODO в database.py, функция cleanup_old_cache).
-      2. Реализовать client_1c.send_readings(rows) — POST к 1С HTTP-сервису.
-      3. После успешной отправки: UPDATE pokazaniya SET sent_to_1c=1 WHERE id IN (...).
-    До завершения миграции функция является именованной заглушкой —
-    регистрируется в scheduler, выполняется без эффекта, видна в get_jobs().
-    """
-    log.debug(
-        "_task_sync_readings_to_1c: ожидает добавления колонки sent_to_1c "
-        "в таблицу pokazaniya (Этап 4 миграция схемы)"
-    )
 
 
 def _format_appointment_reminder(appointment, when_label: str) -> str:
@@ -1544,14 +1635,6 @@ if __name__ == "__main__":
         id="cleanup_user_states",
         max_instances=1,
         misfire_grace_time=300,
-    )
-    scheduler.add_job(
-        _task_sync_readings_to_1c,
-        trigger="interval",
-        minutes=SYNC_INTERVAL_MINUTES,
-        id="sync_readings_to_1c",
-        max_instances=1,
-        misfire_grace_time=60,
     )
     scheduler.add_job(
         _task_appointment_reminder_24h,

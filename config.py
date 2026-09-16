@@ -51,8 +51,33 @@ APPEAL_PENDING_AUTO_CLOSE_HOURS: int = int(os.getenv("APPEAL_PENDING_AUTO_CLOSE_
 TICKET_PREFIX: str = os.getenv("TICKET_PREFIX", "RSO")
 
 # ── Синхронизация с 1С ────────────────────────────────────────────────────────
-SYNC_INTERVAL_MINUTES: int = int(os.getenv("SYNC_INTERVAL_MINUTES", "2"))
 CACHE_CLEANUP_DAYS: int = int(os.getenv("CACHE_CLEANUP_DAYS", "90"))
+
+ENABLE_1C_INTEGRATION: bool = os.getenv("ENABLE_1C_INTEGRATION", "false").lower() == "true"
+INTEGRATION_1C_MOCK: bool = os.getenv("INTEGRATION_1C_MOCK", "true").lower() == "true"
+INTEGRATION_1C_BASE_URL: str = os.getenv("INTEGRATION_1C_BASE_URL", "").rstrip("/")
+INTEGRATION_1C_AUTH_TOKEN: str = os.getenv("INTEGRATION_1C_AUTH_TOKEN", "")
+INTEGRATION_1C_AUTH_TIMEOUT_SECONDS: int = int(
+    os.getenv("INTEGRATION_1C_AUTH_TIMEOUT_SECONDS", "5")
+)
+INTEGRATION_1C_SYNC_TIMEOUT_SECONDS: int = int(
+    os.getenv("INTEGRATION_1C_SYNC_TIMEOUT_SECONDS", "60")
+)
+INTEGRATION_1C_SYNC_PERIOD_HOURS: int = int(
+    os.getenv("INTEGRATION_1C_SYNC_PERIOD_HOURS", "24")
+)
+INTEGRATION_1C_SYNC_RETRY_HOURS: int = int(
+    os.getenv("INTEGRATION_1C_SYNC_RETRY_HOURS", "1")
+)
+INTEGRATION_1C_BATCH_SIZE: int = int(os.getenv("INTEGRATION_1C_BATCH_SIZE", "500"))
+INTEGRATION_1C_CODE_TTL_MINUTES: int = int(
+    os.getenv("INTEGRATION_1C_CODE_TTL_MINUTES", "10")
+)
+INTEGRATION_1C_CODE_MAX_ATTEMPTS: int = int(
+    os.getenv("INTEGRATION_1C_CODE_MAX_ATTEMPTS", "5")
+)
+# Только для локальной имитации. В production код генерирует и хранит 1С.
+INTEGRATION_1C_MOCK_CODE: str = os.getenv("INTEGRATION_1C_MOCK_CODE", "000000")
 
 # ── Маркерные слова для автоматического повышения приоритета ──────────────────
 # Используются в FastAPI (Этап 2), здесь только хранятся
@@ -70,5 +95,10 @@ def _validate() -> None:
         logger.warning("SECRET_KEY не изменён — небезопасно для production")
     if not INTERNAL_API_TOKEN:
         logger.warning("INTERNAL_API_TOKEN не задан — внутренние вызовы бот→FastAPI не защищены")
+    if ENABLE_1C_INTEGRATION and not INTEGRATION_1C_MOCK:
+        if not INTEGRATION_1C_BASE_URL:
+            logger.warning("INTEGRATION_1C_BASE_URL не задан — реальная интеграция с 1С не запустится")
+        if not INTEGRATION_1C_AUTH_TOKEN:
+            logger.warning("INTEGRATION_1C_AUTH_TOKEN не задан — 1С отклонит запросы")
 
 _validate()

@@ -44,6 +44,7 @@ from werkzeug.security import check_password_hash
 import client_api
 import database as db
 from config import (
+    ENABLE_1C_INTEGRATION,
     LOG_BACKUP_COUNT,
     LOG_FILE,
     LOG_LEVEL,
@@ -417,7 +418,12 @@ def legacy_list():
 @login_required
 def pokazaniya():
     rows = db.get_pokazaniya_with_prev()
-    return render_template("pokazaniya.html", rows=rows, user=session["user"])
+    return render_template(
+        "pokazaniya.html",
+        rows=rows,
+        user=session["user"],
+        integration_1c_enabled=ENABLE_1C_INTEGRATION,
+    )
 
 
 # ── Оповещения ────────────────────────────────────────────────────────────────
