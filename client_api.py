@@ -170,17 +170,19 @@ def change_appeal_status(
     appeal_id: int,
     status: str,
     operator_id: int | None = None,
+    reason: str | None = None,
 ) -> tuple[dict | None, str | None]:
     """PATCH /api/v1/appeals/{id}/status — сменить статус (+ уведомление клиенту)."""
     return _patch(f"/api/v1/appeals/{appeal_id}/status", {
         "status": status,
         "operator_id": operator_id,
+        "reason": reason,
     })
 
 
-def reopen_appeal(appeal_id: int) -> tuple[dict | None, str | None]:
+def reopen_appeal(appeal_id: int, reason: str) -> tuple[dict | None, str | None]:
     """PATCH /api/v1/appeals/{id}/status → in_work (используется ботом)."""
-    return change_appeal_status(appeal_id, "in_work")
+    return change_appeal_status(appeal_id, "in_work", reason=reason)
 
 
 # ── Скрипты ───────────────────────────────────────────────────────────────────

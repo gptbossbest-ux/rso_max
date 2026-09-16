@@ -13,10 +13,10 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import Depends, HTTPException, Security, status
+from fastapi import HTTPException, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from config import INTERNAL_API_TOKEN
+from config import ALLOW_INSECURE_DEV_API, API_HOST, APP_ENV, INTERNAL_API_TOKEN
 
 log = logging.getLogger("rso.api.deps")
 
@@ -31,15 +31,21 @@ def verify_token(
     Использование: добавь `Depends(verify_token)` в параметры маршрута
     или в APIRouter(dependencies=[Depends(verify_token)]).
 
-    Пропускает проверку если INTERNAL_API_TOKEN не задан
-    (локальная разработка без .env). Логирует предупреждение.
+    Без токена доступ закрыт. Единственное исключение — явно включённый
+    development/test bypass на loopback-интерфейсе.
     """
     if not INTERNAL_API_TOKEN:
-        log.warning(
-            "INTERNAL_API_TOKEN не задан — проверка токена пропущена. "
-            "Не использовать в production!"
+        if (
+            ALLOW_INSECURE_DEV_API
+            and APP_ENV in {"development", "test"}
+            and API_HOST in {"127.0.0.1", "localhost", "::1"}
+        ):
+            log.warning("Включён изолированный development bypass API-аутентификации")
+            return
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Внутренняя API-аутентификация не настроена",
         )
-        return
 
     if credentials is None or credentials.credentials != INTERNAL_API_TOKEN:
         raise HTTPException(

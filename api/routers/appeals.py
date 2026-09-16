@@ -210,7 +210,12 @@ async def update_status(
         )
 
     old_status = row["status"]
-    db.update_appeal_status(appeal_id, payload.status, payload.operator_id)
+    db.update_appeal_status(
+        appeal_id,
+        payload.status,
+        payload.operator_id,
+        reason=payload.reason,
+    )
 
     # Уведомляем клиента в его канал
     notified = False

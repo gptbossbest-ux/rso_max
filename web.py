@@ -156,8 +156,11 @@ def _ok_login(ip: str) -> None:
 def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        if "user" not in session:
+        user = _validated_session_user()
+        if user is None:
             return redirect(url_for("login"))
+        if user["must_change_password"] and request.endpoint != "change_own_password":
+            return redirect(url_for("change_own_password"))
         return f(*args, **kwargs)
     return decorated
 
@@ -165,13 +168,37 @@ def login_required(f):
 def admin_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        if "user" not in session:
+        user = _validated_session_user()
+        if user is None:
             return redirect(url_for("login"))
-        if session["user"].get("role") != "admin":
+        if user["must_change_password"]:
+            return redirect(url_for("change_own_password"))
+        if user["role"] != "admin":
             flash("Доступ запрещён — требуются права администратора", "error")
             return redirect(url_for("index"))
         return f(*args, **kwargs)
     return decorated
+
+
+def _validated_session_user():
+    """Сверяет cookie-сессию с текущим пользователем и версией в БД."""
+    saved = session.get("user")
+    if not saved:
+        return None
+    current = db.get_user_by_id(saved.get("id"))
+    if (
+        current is None
+        or current["username"] != saved.get("username")
+        or current["session_version"] != saved.get("session_version")
+    ):
+        session.clear()
+        return None
+    session["user"].update(
+        role=current["role"],
+        name=current["name"],
+        must_change_password=bool(current["must_change_password"]),
+    )
+    return current
 
 
 # ── Вспомогательные функции ───────────────────────────────────────────────────
@@ -217,8 +244,12 @@ def login():
                 "username": user["username"],
                 "name":     user["name"],
                 "role":     user["role"],
+                "session_version": user["session_version"],
+                "must_change_password": bool(user["must_change_password"]),
             }
             log.info("Вход: %s  ip=%s", username, ip)
+            if user["must_change_password"]:
+                return redirect(url_for("change_own_password"))
             return redirect(url_for("index"))
 
         msg = _fail_login(ip)
@@ -233,6 +264,23 @@ def logout():
     user = session.pop("user", {})
     log.info("Выход: %s", user.get("username", "?"))
     return redirect(url_for("login"))
+
+
+@app.route("/change-password", methods=["GET", "POST"])
+@login_required
+def change_own_password():
+    """Обязательная смена bootstrap-пароля текущим пользователем."""
+    if request.method == "POST":
+        password = request.form.get("password", "")
+        if len(password) < 12:
+            flash("Пароль должен содержать не менее 12 символов", "error")
+        else:
+            user_id = session["user"]["id"]
+            db.change_password(user_id, password)
+            session.clear()
+            flash("Пароль изменён. Войдите снова.", "success")
+            return redirect(url_for("login"))
+    return render_template("change_password.html", user=session["user"])
 
 
 # ── Дашборд ───────────────────────────────────────────────────────────────────
@@ -743,6 +791,10 @@ def schedule_create(branch_id: int):
         flash("Проверьте корректность введённых чисел", "error")
         return redirect(url_for("branch_detail", branch_id=branch_id))
 
+    if slot_duration <= 0 or capacity <= 0 or horizon < 0:
+        flash("Длительность и вместимость должны быть больше нуля", "error")
+        return redirect(url_for("branch_detail", branch_id=branch_id))
+
     if not time_from or not time_to:
         flash("Укажите время начала и окончания приёма", "error")
         return redirect(url_for("branch_detail", branch_id=branch_id))
@@ -751,7 +803,11 @@ def schedule_create(branch_id: int):
         flash("Время начала должно быть раньше времени окончания", "error")
         return redirect(url_for("branch_detail", branch_id=branch_id))
 
-    db.create_schedule(branch_id, weekday, time_from, time_to, slot_duration, capacity, horizon)
+    try:
+        db.create_schedule(branch_id, weekday, time_from, time_to, slot_duration, capacity, horizon)
+    except ValueError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("branch_detail", branch_id=branch_id))
     flash("Расписание добавлено", "success")
     return redirect(url_for("branch_detail", branch_id=branch_id))
 
@@ -1207,4 +1263,4 @@ def inject_globals():
 
 if __name__ == "__main__":
     db.init_db()
-    app.run(debug=True, port=5000)
+    app.run(debug=False, port=5000)

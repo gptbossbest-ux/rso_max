@@ -91,6 +91,22 @@ class AppealStatusUpdate(BaseModel):
         description="ID оператора из Flask-сессии. "
                     "Null для внутренних системных вызовов.",
     )
+    reason: str | None = Field(
+        None,
+        min_length=1,
+        max_length=2000,
+        description="Причина возврата обращения клиентом в работу.",
+    )
+
+    @field_validator("reason")
+    @classmethod
+    def reason_not_blank(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("reason не может быть пустым")
+        return value
 
 
 class AppealStatusUpdateOut(BaseModel):

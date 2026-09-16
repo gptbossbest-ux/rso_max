@@ -1150,15 +1150,10 @@ def _on_reopen_comment(chat_id: int, st: dict, text: str) -> None:
     _touch(st)
 
     if appeal_id:
-        data, err = client_api.reopen_appeal(appeal_id)
+        data, err = client_api.reopen_appeal(appeal_id, text)
         if err:
             send_message(chat_id, f"⚠️ Не удалось вернуть обращение: {err}")
         else:
-            # TODO Этап 5: сохранять комментарий клиента при reopen.
-            # Сейчас PATCH /api/v1/appeals/{id}/status меняет только статус.
-            # Нужно добавить POST /api/v1/appeals/{id}/respond с body=text
-            # (operator_id=0, системный) до смены статуса, чтобы комментарий
-            # клиента попал в appeal_responses и был виден в операторском портале.
             send_message(chat_id,
                 f"↩️ Обращение №{data['ticket_no']} возвращено в работу.\n"
                 f"Ваш комментарий: {text}"

@@ -129,13 +129,12 @@ app.add_middleware(
 # ── Роутеры ───────────────────────────────────────────────────────────────────
 
 from api.routers.appeals import router as appeals_router  # noqa: E402
+from api.routers.house_chats import router as house_chats_router  # noqa: E402
 from api.routers.scripts import router as scripts_router  # noqa: E402
 
 app.include_router(appeals_router, prefix="/api/v1")
 app.include_router(scripts_router, prefix="/api/v1")
-
-# TODO Этап 7:  from api.routers.house_chats  import router as house_chats_router
-#               app.include_router(house_chats_router, prefix="/api/v1")
+app.include_router(house_chats_router, prefix="/api/v1")
 # TODO Этап 8:  from api.routers.broadcast    import router as broadcast_router
 #               app.include_router(broadcast_router, prefix="/api/v1")
 

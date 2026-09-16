@@ -24,7 +24,7 @@ import os
 import sqlite3
 from datetime import datetime, timezone, timedelta
 from logging.handlers import RotatingFileHandler
-from werkzeug.security import generate_password_hash
+from werkzeug.security import check_password_hash, generate_password_hash
 
 from config import (
     DB_PATH,
@@ -34,6 +34,7 @@ from config import (
     LOG_MAX_BYTES,
     LOG_BACKUP_COUNT,
     TICKET_PREFIX,
+    BOOTSTRAP_ADMIN_PASSWORD,
 )
 
 # ── Логгер модуля ─────────────────────────────────────────────────────────────
@@ -121,6 +122,13 @@ def _migrate_appeals_legacy(c: sqlite3.Cursor) -> None:
     c.execute("ALTER TABLE appeals RENAME TO appeals_legacy")
 
 
+def _ensure_column(c: sqlite3.Cursor, table: str, column: str, definition: str) -> None:
+    """Добавляет колонку при обновлении старой SQLite-схемы."""
+    columns = {row[1] for row in c.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in columns:
+        c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def init_db() -> None:
     """
     Создаёт/обновляет схему БД. Идемпотентна — безопасно вызывать при каждом старте.
@@ -132,6 +140,10 @@ def init_db() -> None:
       4. Индексы
       5. Seed: admin-пользователь
     """
+    bootstrap_password = BOOTSTRAP_ADMIN_PASSWORD.strip()
+    if bootstrap_password and len(bootstrap_password) < 12:
+        raise RuntimeError("BOOTSTRAP_ADMIN_PASSWORD должен содержать не менее 12 символов")
+
     conn = get_conn()
     c = conn.cursor()
 
@@ -146,9 +158,13 @@ def init_db() -> None:
             username TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
             name     TEXT NOT NULL,
-            role     TEXT DEFAULT 'operator'
+            role     TEXT DEFAULT 'operator',
+            session_version INTEGER NOT NULL DEFAULT 1,
+            must_change_password INTEGER NOT NULL DEFAULT 0
         )
     """)
+    _ensure_column(c, "users", "session_version", "INTEGER NOT NULL DEFAULT 1")
+    _ensure_column(c, "users", "must_change_password", "INTEGER NOT NULL DEFAULT 0")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS licschet (
@@ -232,9 +248,11 @@ def init_db() -> None:
             created_at        TEXT,
             updated_at        TEXT,
             first_response_at TEXT,
-            closed_at         TEXT
+            closed_at         TEXT,
+            reopen_reason     TEXT
         )
     """)
+    _ensure_column(c, "appeals", "reopen_reason", "TEXT")
 
     # 4.2 Ответы операторов
     c.execute("""
@@ -355,8 +373,8 @@ def init_db() -> None:
             weekday              INTEGER NOT NULL CHECK(weekday BETWEEN 0 AND 6),
             time_from            TEXT    NOT NULL,  -- 'HH:MM'
             time_to              TEXT    NOT NULL,  -- 'HH:MM'
-            slot_duration_min    INTEGER NOT NULL DEFAULT 30,
-            capacity             INTEGER NOT NULL DEFAULT 1,
+            slot_duration_min    INTEGER NOT NULL DEFAULT 30 CHECK(slot_duration_min > 0),
+            capacity             INTEGER NOT NULL DEFAULT 1 CHECK(capacity > 0),
             booking_horizon_days INTEGER NOT NULL DEFAULT 14,
             is_active            INTEGER DEFAULT 1
         )
@@ -446,12 +464,34 @@ def init_db() -> None:
 
     # 5. Seed ──────────────────────────────────────────────────────────────────
     c.execute("SELECT COUNT(*) FROM users")
-    if c.fetchone()[0] == 0:
+    users_empty = c.fetchone()[0] == 0
+    if users_empty and bootstrap_password:
         c.execute(
-            "INSERT INTO users (username, password, name, role) VALUES (?, ?, ?, ?)",
-            ("admin", generate_password_hash("admin123"), "Администратор", "admin"),
+            "INSERT INTO users "
+            "(username, password, name, role, must_change_password) VALUES (?, ?, ?, ?, 1)",
+            ("admin", generate_password_hash(bootstrap_password), "Администратор", "admin"),
         )
-        log.info("Создан пользователь по умолчанию: admin / admin123")
+        log.warning("Создан bootstrap-администратор admin; требуется смена пароля")
+    elif users_empty:
+        log.warning("Пользователи отсутствуют; задайте BOOTSTRAP_ADMIN_PASSWORD для bootstrap")
+
+    # Обезвреживаем инсталляции старых версий с публично известным admin123.
+    legacy_admin = c.execute(
+        "SELECT id, password FROM users WHERE username='admin'"
+    ).fetchone()
+    if legacy_admin and check_password_hash(legacy_admin["password"], "admin123"):
+        if not bootstrap_password:
+            conn.close()
+            raise RuntimeError(
+                "Обнаружен admin с устаревшим паролем admin123. "
+                "Задайте BOOTSTRAP_ADMIN_PASSWORD (не менее 12 символов) и перезапустите."
+            )
+        c.execute(
+            "UPDATE users SET password=?, must_change_password=1, "
+            "session_version=session_version+1 WHERE id=?",
+            (generate_password_hash(bootstrap_password), legacy_admin["id"]),
+        )
+        log.warning("Небезопасный старый пароль admin заменён bootstrap-секретом")
 
     conn.commit()
     conn.close()
@@ -574,6 +614,7 @@ def update_appeal_status(
     appeal_id: int,
     status: str,
     operator_id: int | None = None,
+    reason: str | None = None,
 ) -> None:
     """
     Меняет статус обращения.
@@ -582,7 +623,12 @@ def update_appeal_status(
     """
     conn = get_conn()
     now = msk_now()
-    if status in ("closed", "resolved"):
+    if status == "in_work" and reason:
+        conn.execute(
+            "UPDATE appeals SET status=?, updated_at=?, closed_at=NULL, reopen_reason=? WHERE id=?",
+            (status, now, reason.strip(), appeal_id),
+        )
+    elif status in ("closed", "resolved"):
         conn.execute(
             "UPDATE appeals SET status=?, updated_at=?, closed_at=? WHERE id=?",
             (status, now, now, appeal_id),
@@ -629,11 +675,13 @@ def auto_resolve_pending(hours: int | None = None) -> int:
     count = 0
     now = msk_now()
     for row in rows:
-        conn.execute(
-            "UPDATE appeals SET status='resolved', closed_at=? WHERE id=?",
-            (now, row["id"]),
+        cursor = conn.execute(
+            "UPDATE appeals SET status='resolved', closed_at=?, updated_at=? "
+            "WHERE id=? AND status='pending_confirmation' "
+            "AND COALESCE(updated_at, created_at) <= ?",
+            (now, now, row["id"], cutoff),
         )
-        count += 1
+        count += cursor.rowcount
 
     conn.commit()
     conn.close()
@@ -680,7 +728,7 @@ def get_last_appeal_response(appeal_id: int) -> sqlite3.Row | None:
         "SELECT ar.*, u.name AS operator_name "
         "FROM appeal_responses ar "
         "LEFT JOIN users u ON u.id = ar.operator_id "
-        "WHERE ar.appeal_id = ? ORDER BY ar.sent_at DESC LIMIT 1",
+        "WHERE ar.appeal_id = ? ORDER BY ar.sent_at DESC, ar.id DESC LIMIT 1",
         (appeal_id,),
     ).fetchone()
     conn.close()
@@ -1071,6 +1119,13 @@ def get_user(username: str) -> sqlite3.Row | None:
     return row
 
 
+def get_user_by_id(user_id: int) -> sqlite3.Row | None:
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    conn.close()
+    return row
+
+
 def get_all_users() -> list[sqlite3.Row]:
     conn = get_conn()
     rows = conn.execute("SELECT id, username, name, role FROM users ORDER BY id").fetchall()
@@ -1107,7 +1162,8 @@ def change_password(user_id: int, new_password: str) -> None:
     conn = get_conn()
     try:
         conn.execute(
-            "UPDATE users SET password=? WHERE id=?",
+            "UPDATE users SET password=?, session_version=session_version+1, "
+            "must_change_password=0 WHERE id=?",
             (generate_password_hash(new_password), user_id),
         )
         conn.commit()
@@ -1119,7 +1175,10 @@ def change_password(user_id: int, new_password: str) -> None:
 def change_role(user_id: int, role: str) -> None:
     conn = get_conn()
     try:
-        conn.execute("UPDATE users SET role=? WHERE id=?", (role, user_id))
+        conn.execute(
+            "UPDATE users SET role=?, session_version=session_version+1 WHERE id=?",
+            (role, user_id),
+        )
         conn.commit()
         log.info("Роль пользователя id=%s изменена на %s", user_id, role)
     finally:
@@ -1325,6 +1384,18 @@ def create_schedule(
     capacity: int,
     booking_horizon_days: int,
 ) -> int:
+    if not 0 <= weekday <= 6:
+        raise ValueError("weekday должен быть от 0 до 6")
+    if slot_duration_min <= 0:
+        raise ValueError("Длительность слота должна быть больше нуля")
+    if capacity <= 0:
+        raise ValueError("Вместимость должна быть больше нуля")
+    if booking_horizon_days < 0:
+        raise ValueError("Горизонт записи не может быть отрицательным")
+    start = datetime.strptime(time_from, "%H:%M")
+    end = datetime.strptime(time_to, "%H:%M")
+    if start >= end:
+        raise ValueError("Время окончания должно быть позже времени начала")
     conn = get_conn()
     row_id = conn.execute(
         """INSERT INTO branch_schedules
@@ -1390,6 +1461,33 @@ def is_exception_day(branch_id: int, date: str) -> bool:
 
 # -- Слоты --------------------------------------------------------------------
 
+def _matching_schedule(schedules, slot_time: str):
+    """Детерминированно выбирает расписание для слота при пересечениях.
+
+    Приоритет имеет интервал с более поздним началом, затем более новая запись.
+    То же правило используется и при показе, и при подтверждении слота.
+    """
+    requested = datetime.strptime(slot_time, "%H:%M")
+    for schedule in sorted(
+        schedules,
+        key=lambda item: (item["time_from"], item["id"]),
+        reverse=True,
+    ):
+        duration = schedule["slot_duration_min"]
+        capacity = schedule["capacity"]
+        if duration <= 0 or capacity <= 0:
+            continue
+        start = datetime.strptime(schedule["time_from"], "%H:%M")
+        end = datetime.strptime(schedule["time_to"], "%H:%M")
+        offset_minutes = int((requested - start).total_seconds() // 60)
+        if (
+            requested >= start
+            and requested + timedelta(minutes=duration) <= end
+            and offset_minutes % duration == 0
+        ):
+            return schedule
+    return None
+
 def get_available_slots(branch_id: int, date: str) -> list[str]:
     """
     Возвращает список доступных слотов ('HH:MM') для филиала на дату.
@@ -1414,25 +1512,32 @@ def get_available_slots(branch_id: int, date: str) -> list[str]:
         return []
 
     now = datetime.now()
-    slots = []
+    candidate_slots: set[str] = set()
 
     for sched in day_schedules:
+        if sched["slot_duration_min"] <= 0 or sched["capacity"] <= 0:
+            log.error("Некорректное расписание id=%s пропущено", sched["id"])
+            continue
         t_from = datetime.strptime(f"{date} {sched['time_from']}", "%Y-%m-%d %H:%M")
         t_to   = datetime.strptime(f"{date} {sched['time_to']}",   "%Y-%m-%d %H:%M")
         step   = timedelta(minutes=sched["slot_duration_min"])
-        cap    = sched["capacity"]
-
         current = t_from
         while current + step <= t_to:
             # Не предлагаем прошедшие слоты
             if current > now:
-                slot_time = current.strftime("%H:%M")
-                booked = _count_booked(branch_id, date, slot_time)
-                if booked < cap:
-                    slots.append(slot_time)
+                candidate_slots.add(current.strftime("%H:%M"))
             current += step
 
-    return sorted(set(slots))
+    slots = []
+    for slot_time in sorted(candidate_slots):
+        schedule = _matching_schedule(day_schedules, slot_time)
+        if schedule is None:
+            continue
+        if parsed_date > now.date() + timedelta(days=schedule["booking_horizon_days"]):
+            continue
+        if _count_booked(branch_id, date, slot_time) < schedule["capacity"]:
+            slots.append(slot_time)
+    return slots
 
 
 def _count_booked(branch_id: int, date: str, slot_time: str) -> int:
@@ -1506,6 +1611,30 @@ def create_appointment(
     """
     conn = get_conn()
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            parsed_date = datetime.strptime(slot_date, "%Y-%m-%d").date()
+            parsed_time = datetime.strptime(slot_time, "%H:%M")
+        except ValueError:
+            return None, "Некорректная дата или время слота"
+
+        slot_dt = datetime.combine(parsed_date, parsed_time.time())
+        if slot_dt <= datetime.now():
+            return None, "Нельзя записаться на прошедший слот"
+
+        branch = conn.execute(
+            "SELECT is_active FROM branches WHERE id=?", (branch_id,)
+        ).fetchone()
+        if not branch or not branch["is_active"]:
+            return None, "Филиал недоступен для записи"
+
+        exception = conn.execute(
+            "SELECT 1 FROM schedule_exceptions WHERE branch_id=? AND date=?",
+            (branch_id, slot_date),
+        ).fetchone()
+        if exception:
+            return None, "Филиал не работает в выбранную дату"
+
         # Проверка активной записи на ЛС
         existing = conn.execute(
             "SELECT id FROM appointments WHERE ls=? AND status='active' LIMIT 1",
@@ -1514,12 +1643,20 @@ def create_appointment(
         if existing:
             return None, "У вас уже есть активная запись на приём"
 
-        # Проверка вместимости слота
+        # Выбираем именно то расписание дня и интервала, которое порождает слот.
         schedules = conn.execute(
-            "SELECT capacity FROM branch_schedules WHERE branch_id=? AND is_active=1 LIMIT 1",
-            (branch_id,)
-        ).fetchone()
-        capacity = schedules["capacity"] if schedules else 1
+            "SELECT * FROM branch_schedules WHERE branch_id=? AND weekday=? "
+            "AND is_active=1 ORDER BY time_from DESC, id DESC",
+            (branch_id, parsed_date.weekday()),
+        ).fetchall()
+        matched = _matching_schedule(schedules, slot_time)
+        if matched is None:
+            return None, "Выбранный слот больше недоступен"
+        if parsed_date > datetime.now().date() + timedelta(
+            days=matched["booking_horizon_days"]
+        ):
+            return None, "Дата находится за пределами горизонта записи"
+        capacity = matched["capacity"]
 
         booked = conn.execute(
             "SELECT COUNT(*) FROM appointments WHERE branch_id=? AND slot_date=? AND slot_time=? AND status='active'",
@@ -1539,6 +1676,9 @@ def create_appointment(
         log.info("Запись создана: id=%s  ls=%s  %s %s", row_id, ls, slot_date, slot_time)
         return row_id, None
 
+    except sqlite3.IntegrityError as exc:
+        log.info("create_appointment конфликт: %s", exc)
+        return None, "У вас уже есть активная запись или слот недоступен"
     except Exception as exc:
         log.error("create_appointment ошибка: %s", exc)
         return None, f"Ошибка: {exc}"
