@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
+import threading
 import unittest
 import warnings
 from pathlib import Path
@@ -10,6 +12,7 @@ from starlette.exceptions import StarletteDeprecationWarning
 
 warnings.filterwarnings("ignore", category=StarletteDeprecationWarning)
 
+import httpx
 from fastapi.testclient import TestClient
 
 import api.deps as deps
@@ -56,6 +59,38 @@ class Integration1CApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "ok")
         request.assert_called_once_with("100001", 42)
+
+    def test_synchronous_1c_calls_run_outside_event_loop_thread(self) -> None:
+        async def check_route(path: str, method: str, payload: dict, result: dict) -> None:
+            loop_thread = threading.get_ident()
+            call_threads = []
+
+            def call_1c(*args):
+                call_threads.append(threading.get_ident())
+                return result, None
+
+            with patch.object(client_1c, method, side_effect=call_1c):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://test",
+                ) as client:
+                    response = await client.post(path, headers=self.headers, json=payload)
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), result)
+            self.assertEqual(len(call_threads), 1)
+            self.assertNotEqual(call_threads[0], loop_thread)
+
+        cases = (
+            ("request-code", "request_auth_code", {"ls": "100001", "chat_id": 42},
+             {"status": "ok", "message": "Код отправлен"}),
+            ("verify-code", "verify_auth_code", {"ls": "100001", "chat_id": 42, "code": "123456"},
+             {"status": "wrong_code", "message": "Код неверный"}),
+        )
+        for route, method, payload, result in cases:
+            with self.subTest(route=route):
+                asyncio.run(check_route(
+                    f"/api/v1/integrations/1c/auth/{route}", method, payload, result,
+                ))
 
     def test_verify_success_persists_binding_and_meters(self) -> None:
         result = {

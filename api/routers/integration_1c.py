@@ -49,7 +49,7 @@ def _validated_result(data: dict | None, error: str | None, allowed: set[str]) -
 
 
 @router.post("/auth/request-code")
-async def request_code(payload: Integration1CAuthRequest) -> dict:
+def request_code(payload: Integration1CAuthRequest) -> dict:
     data, error = client_1c.request_auth_code(payload.ls, payload.chat_id)
     result = _validated_result(data, error, _REQUEST_STATUSES)
     log.info("Запрошен код авторизации в 1С: chat_id=%s", payload.chat_id)
@@ -57,7 +57,7 @@ async def request_code(payload: Integration1CAuthRequest) -> dict:
 
 
 @router.post("/auth/verify-code")
-async def verify_code(payload: Integration1CVerifyRequest) -> dict:
+def verify_code(payload: Integration1CVerifyRequest) -> dict:
     data, error = client_1c.verify_auth_code(payload.ls, payload.chat_id, payload.code)
     result = _validated_result(data, error, _VERIFY_STATUSES)
     if result["status"] == "ok":

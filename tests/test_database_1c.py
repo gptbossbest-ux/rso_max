@@ -3,7 +3,11 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
+from threading import Barrier
+from unittest.mock import MagicMock, patch
 
 import database as db
 
@@ -37,6 +41,87 @@ class Database1CTests(unittest.TestCase):
     def test_1c_authorization_flag_is_persisted(self) -> None:
         db.upsert_bot_user(42, "100001", "", authorized_1c=True)
         self.assertEqual(db.get_bot_user(42)["authorized_1c"], 1)
+
+    def claim(self, batch_id="new", now=None):
+        return db.claim_1c_sync_batch(
+            now or datetime(2099, 1, 1, tzinfo=timezone.utc), batch_id, 500, 1, 24,
+        )
+
+    def test_state_write_failure_rolls_back_batch_membership(self) -> None:
+        db.add_pokazaniya(11, "100001", "Вода", "M-1", "10")
+        conn = db.get_conn()
+        conn.execute("""CREATE TRIGGER fail_claim BEFORE UPDATE ON sync_1c_state
+                        BEGIN SELECT RAISE(ABORT, 'simulated crash'); END""")
+        conn.commit()
+        conn.close()
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.claim()
+
+        self.assertIsNone(db.get_1c_sync_state()["pending_batch_id"])
+        self.assertEqual(len(db.get_unsent_1c_readings(500)), 1)
+        self.assertEqual(db.get_1c_readings_by_batch("new"), [])
+
+    def test_concurrent_scheduler_claims_have_one_winner(self) -> None:
+        db.add_pokazaniya(11, "100001", "Вода", "M-1", "10")
+        barrier = Barrier(2)
+
+        def claim(batch_id):
+            barrier.wait(timeout=5)
+            return self.claim(batch_id)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(claim, ["worker-1", "worker-2"]))
+
+        winners = [result for result in results if result is not None]
+        self.assertEqual(len(winners), 1)
+        batch_id = winners[0]["batch_id"]
+        self.assertEqual(db.get_1c_sync_state()["pending_batch_id"], batch_id)
+        self.assertEqual([row["batch_id"] for row in winners[0]["rows"]], [batch_id])
+
+    def test_stale_completion_cannot_clear_newer_attempt(self) -> None:
+        first = self.claim()
+        now = datetime(2099, 1, 1, 1, tzinfo=timezone.utc)
+        second = self.claim("unused", now=now)
+        self.assertFalse(db.complete_1c_sync_batch(first["batch_id"], first["attempt_at"]))
+        self.assertEqual(db.get_1c_sync_state()["last_attempt_at"], second["attempt_at"])
+        self.assertEqual(db.get_1c_sync_state()["pending_batch_id"], "new")
+
+    def test_legacy_migration_excludes_only_exact_unassigned_baseline(self) -> None:
+        conn = db.get_conn()
+        conn.execute("DROP TABLE pokazaniya")
+        conn.execute("""CREATE TABLE pokazaniya (
+            id INTEGER PRIMARY KEY, chat_id INTEGER, ls TEXT, resource_type TEXT,
+            meter_number TEXT, value1 TEXT, value2 TEXT, created_at TEXT)""")
+        samples = [(0, "2000-01-01 00:00"), (11, "2000-01-01 00:00"),
+                   (0, "2026-08-19 11:59"), (None, None)]
+        conn.executemany("INSERT INTO pokazaniya (chat_id, created_at) VALUES (?, ?)", samples)
+        conn.commit()
+        conn.close()
+
+        db.init_db()
+        db.init_db()
+
+        rows = list(reversed(db.get_pokazaniya()))
+        self.assertEqual([row["sent_to_1c"] for row in rows], [1, 0, 0, 0])
+        self.assertEqual(len(db.get_unsent_1c_readings(500)), 3)
+
+    def test_imported_baseline_is_history_but_never_new_queue_work(self) -> None:
+        workbook = MagicMock()
+        workbook.sheetnames = ["Счетчики"]
+        workbook.__getitem__.return_value.iter_rows.return_value = [
+            ["ls", "resource", "number", "type", "initial1", "initial2"],
+            ["100001", "Вода", "M-1", "Однотарифный", 10, 0],
+        ]
+        excel = MagicMock()
+        excel.load_workbook.return_value = workbook
+        with patch.dict("sys.modules", {"openpyxl": excel}):
+            db.import_from_excel("meters.xlsx")
+
+        self.assertEqual(len(db.get_pokazaniya()), 1)
+        self.assertEqual(db.get_pokazaniya()[0]["sent_to_1c"], 1)
+        self.assertFalse(db.has_unsent_1c_readings())
+        self.assertEqual(self.claim()["rows"], [])
 
     def test_assigning_batch_keeps_same_members_on_retry(self) -> None:
         db.add_pokazaniya(11, "100001", "Электроэнергия", "M-1", "10")

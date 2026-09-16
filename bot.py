@@ -372,7 +372,12 @@ def _request_ls(chat_id: int, after: str) -> None:
 def _start_1c_auth(chat_id: int, after: str | None = None) -> None:
     """Начинает двухшаговую авторизацию ЛС через опубликованный сервис 1С."""
     st = _get_state(chat_id)
-    _clear_flow(st)
+    if after:
+        # Авторизация приостанавливает текущий флоу, сохраняя его данные.
+        st.pop("pending_1c_ls", None)
+        st.pop("after_ls", None)
+    else:
+        _clear_flow(st)
     st["state"] = S.AWAIT_LS_1C
     if after:
         st["after_1c_auth"] = after
@@ -1233,15 +1238,17 @@ def _on_await_code_1c(chat_id: int, st: dict, text: str) -> None:
         send_message(chat_id, message)
         return
     if status == "ok":
-        after = st.get("after_1c_auth")
+        after = st.pop("after_1c_auth", None)
         _save_ls(chat_id, ls)
-        _clear_flow(st)
+        st.pop("pending_1c_ls", None)
+        st["state"] = S.MENU
         _touch(st)
         send_message(chat_id, message)
         action = _AFTER_LS_ACTIONS.get(after)
         if action:
             action(chat_id, ls)
         else:
+            _clear_flow(st)
             send_main_menu(chat_id)
         return
     send_message(chat_id, message)

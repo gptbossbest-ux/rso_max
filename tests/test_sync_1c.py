@@ -95,6 +95,74 @@ class Sync1CTests(unittest.TestCase):
         self.assertEqual(outcome, "failed")
         self.assertEqual(db.get_1c_sync_state()["pending_batch_id"], "batch-1")
 
+    def test_upgrade_drains_multiple_orphans_with_original_ids_and_members(self) -> None:
+        for meter in ("M-1", "M-2", "M-3"):
+            db.add_pokazaniya(42, "100001", "Вода", meter, "10")
+        conn = db.get_conn()
+        conn.execute("UPDATE pokazaniya SET batch_id='orphan-1' WHERE meter_number IN ('M-1', 'M-2')")
+        conn.execute("UPDATE pokazaniya SET sent_to_1c=1, status_1c='accepted' WHERE meter_number='M-1'")
+        conn.execute("UPDATE pokazaniya SET batch_id='orphan-2' WHERE meter_number='M-3'")
+        conn.commit()
+        conn.close()
+        # Even a recent success must not hide pre-upgrade orphan work.
+        db.update_1c_sync_state(last_success_at=self.now.isoformat())
+
+        def response(batch_id, readings):
+            return ({"batch_id": batch_id, "meters_changes": [],
+                     "readings_status": [{**row, "status": "accepted"} for row in readings]}, None)
+
+        with patch.object(self.sync, "ENABLE_1C_INTEGRATION", True), \
+             patch.object(self.sync.client_1c, "sync_readings", side_effect=response) as send, \
+             patch.object(self.sync, "_notify_reading") as notify:
+            first = self.sync.sync_1c_job(self.now)
+            second = self.sync.sync_1c_job(self.now + timedelta(hours=1))
+
+        self.assertEqual((first, second), ("success", "success"))
+        self.assertEqual([call.args[0] for call in send.call_args_list], ["orphan-1", "orphan-2"])
+        self.assertEqual([row["meter_number"] for row in send.call_args_list[0].args[1]], ["M-1", "M-2"])
+        self.assertEqual(notify.call_count, 2)  # Already-final M-1 is not notified twice.
+        self.assertFalse(db.has_unsent_1c_readings())
+
+    def test_pending_legacy_baseline_keeps_payload_and_suppresses_notification(self) -> None:
+        conn = db.get_conn()
+        conn.execute("""INSERT INTO pokazaniya
+            (chat_id, ls, resource_type, meter_number, value1, created_at, batch_id)
+            VALUES (0, '100001', 'Вода', 'baseline', '10', '2000-01-01 00:00', 'legacy')""")
+        conn.commit()
+        conn.close()
+        db.update_1c_sync_state(pending_batch_id="legacy")
+        db.init_db()
+
+        def response(batch_id, readings):
+            return ({"batch_id": batch_id, "meters_changes": [],
+                     "readings_status": [{**row, "status": "accepted"} for row in readings]}, None)
+
+        with patch.object(self.sync, "ENABLE_1C_INTEGRATION", True), \
+             patch.object(self.sync.client_1c, "sync_readings", side_effect=response) as send, \
+             patch.object(self.sync, "notify_client") as notify:
+            outcome = self.sync.sync_1c_job(self.now)
+
+        self.assertEqual(outcome, "success")
+        self.assertEqual(send.call_args.args[0], "legacy")
+        self.assertEqual([row["meter_number"] for row in send.call_args.args[1]], ["baseline"])
+        notify.assert_not_called()
+
+    def test_scheduler_during_inflight_send_does_not_start_another_batch(self) -> None:
+        db.add_pokazaniya(42, "100001", "Вода", "M-1", "10")
+        nested_outcomes = []
+
+        def response(batch_id, readings):
+            nested_outcomes.append(self.sync.sync_1c_job(self.now))
+            return None, "timeout"
+
+        with patch.object(self.sync, "ENABLE_1C_INTEGRATION", True), \
+             patch.object(self.sync.client_1c, "sync_readings", side_effect=response) as send:
+            outcome = self.sync.sync_1c_job(self.now)
+
+        self.assertEqual(outcome, "failed")
+        self.assertEqual(nested_outcomes, ["not_due"])
+        send.assert_called_once()
+
     def test_duplicate_readings_require_one_status_per_row(self) -> None:
         reading = {
             "chat_id": 42,

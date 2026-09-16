@@ -25,22 +25,6 @@ def _now() -> datetime:
     return datetime.now(timezone(timedelta(hours=TIMEZONE_OFFSET)))
 
 
-def _format_time(value: datetime) -> str:
-    return value.isoformat(timespec="minutes")
-
-
-def _parse_time(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        parsed = datetime.strptime(value, "%Y-%m-%d %H:%M")
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone(timedelta(hours=TIMEZONE_OFFSET)))
-    return parsed
-
-
 def _generate_batch_id(now: datetime) -> str:
     return f"{now:%Y%m%d-%H%M}-{uuid.uuid4().hex[:8]}"
 
@@ -92,6 +76,8 @@ def _valid_result(result: dict | None, batch_id: str, readings: list[dict]) -> b
 
 
 def _notify_reading(reading: dict) -> None:
+    if reading.get("chat_id") == 0 and reading.get("created_at") == "2000-01-01 00:00":
+        return  # Historical import baselines have no customer to notify.
     status = reading["status_1c"]
     if status == "accepted":
         text = (
@@ -120,34 +106,15 @@ def sync_1c_job(now: datetime | None = None) -> str:
         return "disabled"
 
     now = now or _now()
-    state = db.get_1c_sync_state()
-    pending_batch_id = state.get("pending_batch_id")
-    last_attempt = _parse_time(state.get("last_attempt_at"))
-    last_success = _parse_time(state.get("last_success_at"))
-
-    if pending_batch_id:
-        if last_attempt and now - last_attempt < timedelta(hours=INTEGRATION_1C_SYNC_RETRY_HOURS):
-            return "not_due"
-        batch_id = pending_batch_id
-        rows = db.get_1c_readings_by_batch(batch_id)
-        first_attempt = False
-    else:
-        if last_success and now - last_success < timedelta(hours=INTEGRATION_1C_SYNC_PERIOD_HOURS):
-            return "not_due"
-        batch_id = _generate_batch_id(now)
-        rows = db.get_unsent_1c_readings(
-            limit=INTEGRATION_1C_BATCH_SIZE,
-            created_before=now.strftime("%Y-%m-%d %H:%M"),
-        )
-        db.assign_readings_to_1c_batch([row["id"] for row in rows], batch_id)
-        db.update_1c_sync_state(
-            pending_batch_id=batch_id,
-            last_attempt_at=_format_time(now),
-        )
-        first_attempt = True
-
-    if not first_attempt:
-        db.update_1c_sync_state(last_attempt_at=_format_time(now))
+    claim = db.claim_1c_sync_batch(
+        now, _generate_batch_id(now), INTEGRATION_1C_BATCH_SIZE,
+        INTEGRATION_1C_SYNC_RETRY_HOURS, INTEGRATION_1C_SYNC_PERIOD_HOURS,
+    )
+    if claim is None:
+        return "not_due"
+    batch_id = claim["batch_id"]
+    rows = claim["rows"]
+    first_attempt = claim["first_attempt"]
 
     readings = [_reading_payload(row) for row in rows]
     result, error = client_1c.sync_readings(batch_id, readings)
@@ -160,14 +127,7 @@ def sync_1c_job(now: datetime | None = None) -> str:
 
     updated = db.apply_1c_reading_statuses(batch_id, result["readings_status"])
     db.apply_1c_meter_changes(result["meters_changes"])
-    queue_has_more = db.has_unsent_1c_readings()
-    db.update_1c_sync_state(
-        pending_batch_id=None,
-        # Большая очередь выгружается последовательными пакетами каждый час.
-        # Суточный отсчёт начинается только после последнего пакета очереди.
-        last_success_at=state.get("last_success_at") if queue_has_more else _format_time(now),
-        last_attempt_at=_format_time(now),
-    )
+    db.complete_1c_sync_batch(batch_id, claim["attempt_at"])
     for reading in updated:
         _notify_reading(reading)
     log.info(

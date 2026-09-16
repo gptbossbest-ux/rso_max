@@ -211,6 +211,13 @@ def init_db() -> None:
     _ensure_column(c, "pokazaniya", "sent_to_1c", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(c, "pokazaniya", "status_1c", "TEXT DEFAULT NULL")
     _ensure_column(c, "pokazaniya", "batch_id", "TEXT DEFAULT NULL")
+    # Excel imports use this exact signature for starting meter values, not
+    # customer submissions. Keep genuine historical readings in the queue.
+    c.execute("""
+        UPDATE pokazaniya SET sent_to_1c=1
+        WHERE chat_id=0 AND created_at='2000-01-01 00:00' AND sent_to_1c=0
+          AND batch_id IS NULL
+    """)
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS sync_1c_state (
@@ -1003,6 +1010,107 @@ def get_pokazaniya_with_prev() -> list[dict]:
     return result
 
 
+_CUSTOMER_READING_SQL = "NOT (chat_id IS 0 AND created_at IS '2000-01-01 00:00')"
+
+
+def claim_1c_sync_batch(
+    now: datetime,
+    new_batch_id: str,
+    limit: int,
+    retry_hours: int,
+    period_hours: int,
+) -> dict | None:
+    """Claim due work atomically, retaining orphan batch IDs from old versions.
+
+    BEGIN IMMEDIATE serializes scheduler processes before they read the state.
+    The attempt timestamp is committed together with membership, so another
+    scheduler cannot send a different payload for the same pending batch.
+    """
+    def parsed(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        result = datetime.fromisoformat(value)
+        return result if result.tzinfo else result.replace(
+            tzinfo=timezone(timedelta(hours=TIMEZONE_OFFSET))
+        )
+
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT OR IGNORE INTO sync_1c_state (id) VALUES (1)")
+        state = dict(conn.execute("SELECT * FROM sync_1c_state WHERE id=1").fetchone())
+        batch_id = state["pending_batch_id"]
+        recovered = False
+        if batch_id is None:
+            orphan = conn.execute(
+                "SELECT batch_id FROM pokazaniya WHERE sent_to_1c=0 "
+                "AND batch_id IS NOT NULL ORDER BY id LIMIT 1"
+            ).fetchone()
+            if orphan is not None:
+                batch_id = orphan["batch_id"]
+                recovered = True
+
+        first_attempt = batch_id is None
+        last_attempt = parsed(state["last_attempt_at"])
+        last_success = parsed(state["last_success_at"])
+        if not recovered:
+            if batch_id is not None and last_attempt and now - last_attempt < timedelta(hours=retry_hours):
+                return None
+            if batch_id is None and last_success and now - last_success < timedelta(hours=period_hours):
+                return None
+
+        if first_attempt:
+            batch_id = new_batch_id
+            rows = conn.execute(
+                "SELECT id FROM pokazaniya WHERE sent_to_1c=0 AND batch_id IS NULL "
+                f"AND {_CUSTOMER_READING_SQL} AND created_at <= ? ORDER BY id LIMIT ?",
+                (now.strftime("%Y-%m-%d %H:%M"), limit),
+            ).fetchall()
+            conn.executemany(
+                "UPDATE pokazaniya SET batch_id=? WHERE id=?",
+                [(batch_id, row["id"]) for row in rows],
+            )
+        conn.execute(
+            "UPDATE sync_1c_state SET pending_batch_id=?, last_attempt_at=? WHERE id=1",
+            (batch_id, now.isoformat(timespec="minutes")),
+        )
+        rows = conn.execute(
+            # Assigned legacy baselines may already have reached 1C. Preserve
+            # the complete original payload under that idempotency key.
+            "SELECT * FROM pokazaniya WHERE batch_id=? ORDER BY id",
+            (batch_id,),
+        ).fetchall()
+        conn.commit()
+        return {
+            "batch_id": batch_id, "rows": rows, "first_attempt": first_attempt,
+            "attempt_at": now.isoformat(timespec="minutes"),
+        }
+    finally:
+        conn.close()
+
+
+def complete_1c_sync_batch(batch_id: str, attempt_at: str) -> bool:
+    """Finish only the claimed attempt; a stale worker cannot clear newer work."""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        state = conn.execute("SELECT * FROM sync_1c_state WHERE id=1").fetchone()
+        if state["pending_batch_id"] != batch_id or state["last_attempt_at"] != attempt_at:
+            return False
+        more = conn.execute(
+            "SELECT 1 FROM pokazaniya WHERE sent_to_1c=0 "
+            f"AND (batch_id IS NOT NULL OR {_CUSTOMER_READING_SQL}) LIMIT 1"
+        ).fetchone()
+        conn.execute(
+            "UPDATE sync_1c_state SET pending_batch_id=NULL, last_success_at=? WHERE id=1",
+            (state["last_success_at"] if more else attempt_at,),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
 def get_unsent_1c_readings(
     limit: int,
     created_before: str | None = None,
@@ -1013,6 +1121,7 @@ def get_unsent_1c_readings(
         sql = (
             "SELECT * FROM pokazaniya "
             "WHERE sent_to_1c=0 AND batch_id IS NULL "
+            f"AND {_CUSTOMER_READING_SQL} "
         )
         params: list = []
         if created_before is not None:
@@ -1029,7 +1138,9 @@ def has_unsent_1c_readings() -> bool:
     conn = get_conn()
     try:
         row = conn.execute(
-            "SELECT 1 FROM pokazaniya WHERE sent_to_1c=0 AND batch_id IS NULL LIMIT 1"
+            # Orphan batches must also prevent the daily timer from starting.
+            "SELECT 1 FROM pokazaniya WHERE sent_to_1c=0 "
+            f"AND (batch_id IS NOT NULL OR {_CUSTOMER_READING_SQL}) LIMIT 1"
         ).fetchone()
         return row is not None
     finally:
@@ -1037,17 +1148,24 @@ def has_unsent_1c_readings() -> bool:
 
 
 def assign_readings_to_1c_batch(reading_ids: list[int], batch_id: str) -> None:
-    """Атомарно закрепляет свободные показания за неизменяемым пакетом."""
+    """Atomically assign membership and its pending state (legacy callers)."""
     if not reading_ids:
         return
     placeholders = ",".join("?" for _ in reading_ids)
     conn = get_conn()
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT OR IGNORE INTO sync_1c_state (id) VALUES (1)")
+        pending = conn.execute("SELECT pending_batch_id FROM sync_1c_state WHERE id=1").fetchone()[0]
+        if pending is not None:
+            raise ValueError("A 1C batch is already pending")
         conn.execute(
             f"UPDATE pokazaniya SET batch_id=? "
-            f"WHERE id IN ({placeholders}) AND sent_to_1c=0 AND batch_id IS NULL",
+            f"WHERE id IN ({placeholders}) AND sent_to_1c=0 AND batch_id IS NULL "
+            f"AND {_CUSTOMER_READING_SQL}",
             [batch_id, *reading_ids],
         )
+        conn.execute("UPDATE sync_1c_state SET pending_batch_id=? WHERE id=1", (batch_id,))
         conn.commit()
     finally:
         conn.close()
@@ -1296,8 +1414,8 @@ def import_from_excel(filepath: str = "Данные_по_ЛС.xlsx") -> None:
                 v2 = initial2 if meter_type == "Двухтарифный" and initial2 else None
                 conn.execute(
                     "INSERT INTO pokazaniya "
-                    "(chat_id, ls, resource_type, meter_number, value1, value2, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "(chat_id, ls, resource_type, meter_number, value1, value2, created_at, sent_to_1c) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
                     (0, ls, resource_type, meter_number, initial1, v2, "2000-01-01 00:00"),
                 )
                 init_count += 1
