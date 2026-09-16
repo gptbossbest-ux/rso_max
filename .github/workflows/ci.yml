@@ -23,8 +23,8 @@ jobs:
     timeout-minutes: 15
     env:
       APP_ENV: test
-      DB_PATH: ${{ runner.temp }}/rso-ci.sqlite
-      LOG_FILE: ${{ runner.temp }}/rso-ci.log
+      DB_PATH: /tmp/rso-ci.sqlite
+      LOG_FILE: /tmp/rso-ci.log
       SECRET_KEY: ci-only-secret-key-not-for-production-123456
       INTERNAL_API_TOKEN: ci-only-internal-api-token
       ALLOW_INSECURE_DEV_API: "false"
