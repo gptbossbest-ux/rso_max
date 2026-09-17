@@ -1150,11 +1150,17 @@ def _format_appointment_reminder(appointment, when_label: str) -> str:
 
 
 def _appointment_reminder_dependencies(
+    now=None,
 ) -> appointment_reminders.AppointmentReminderDependencies:
     """Resolve reminder dependencies at call time for runtime patch compatibility."""
+    now_provider = now or appointment_reminders.moscow_now
     return appointment_reminders.AppointmentReminderDependencies(
-        get_appointments_for_reminder_24h=db.get_appointments_for_reminder_24h,
-        get_appointments_for_reminder_day=db.get_appointments_for_reminder_day,
+        get_appointments_for_reminder_24h=lambda: db.get_appointments_for_reminder_24h(
+            now_provider()
+        ),
+        get_appointments_for_reminder_day=lambda: db.get_appointments_for_reminder_day(
+            now_provider()
+        ),
         send_message=send_message,
         mark_reminded=db.mark_reminded,
         logger=log,
@@ -1168,9 +1174,8 @@ def _task_appointment_reminder_24h() -> None:
     (23–25ч от текущего момента) шире часового шага, дублей не будет
     благодаря флагу reminded_24h.
 
-    Ошибка доставки не блокирует простановку флага (см. notifier.py —
-    тот же принцип: не удалось отправить — логируем и идём дальше,
-    а не ретраим бесконечно на каждом следующем прогоне).
+    Доставка выполняется с ограниченным числом повторов. Флаг ставится только
+    после подтверждённой отправки; ошибка одной записи не прерывает пакет.
     """
     appointment_reminders.task_appointment_reminder_24h(
         _appointment_reminder_dependencies()
