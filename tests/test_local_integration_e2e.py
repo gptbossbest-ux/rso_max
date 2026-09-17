@@ -32,8 +32,11 @@ class LocalIntegrationE2ETests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.old_db_path = db.DB_PATH
         db.DB_PATH = str(Path(self.tmp.name) / "integration.sqlite")
-        db.init_db()
         self.now = datetime(2026, 9, 17, 9, 0, tzinfo=timezone.utc)
+        self.db_clock = patch.object(db, "msk_now", return_value="2026-09-17 08:59")
+        self.db_clock.start()
+        self.addCleanup(self.db_clock.stop)
+        db.init_db()
         self.one_c_requests: list[dict] = []
         self.max_requests: list[dict] = []
 
