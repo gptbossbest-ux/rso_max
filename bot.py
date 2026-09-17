@@ -45,7 +45,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import client_api
 import database as db
 from rso_bot import max_transport
-from rso_bot.flows import appeals, faq
+from rso_bot.flows import appeals, appointments, faq
 from config import (
     API,
     AUTH_BLOCK_MINUTES,
@@ -596,198 +596,98 @@ def _confirm_meter_reading(chat_id: int) -> None:
 
 # ── Запись на приём (раздел 6-7 ТЗ) ──────────────────────────────────────────
 
+def _appointment_dependencies() -> appointments.AppointmentDependencies:
+    """Build appointment dependencies from entry-point runtime patch points."""
+    return appointments.AppointmentDependencies(
+        get_active_appointment=db.get_active_appointment,
+        get_branches=db.get_branches,
+        get_available_dates=db.get_available_dates,
+        get_branch=db.get_branch,
+        get_available_slots=db.get_available_slots,
+        create_appointment=db.create_appointment,
+        get_appointment=db.get_appointment,
+        cancel_appointment=db.cancel_appointment,
+        get_state=_get_state,
+        touch=_touch,
+        get_saved_ls=_get_saved_ls,
+        request_ls=_request_ls,
+        clear_flow=_clear_flow,
+        show_active_appointment=_show_active_appointment,
+        show_branch_select=_show_branch_select,
+        show_date_select=_show_date_select,
+        show_time_select=_show_time_select,
+        show_appointment_confirm=_show_appointment_confirm,
+        finalize_appointment=_finalize_appointment,
+        make_callback=_cb,
+        send_message=send_message,
+        send_buttons=send_buttons,
+        send_main_menu=send_main_menu,
+        parse_date=datetime.strptime,
+        database_errors=(Exception,),
+        logger=log,
+        menu_state=S.MENU,
+        branch_state=S.APPOINTMENT_BRANCH,
+        date_state=S.APPOINTMENT_DATE,
+        time_state=S.APPOINTMENT_TIME,
+        theme_state=S.APPOINTMENT_THEME,
+        confirm_state=S.APPOINTMENT_CONFIRM,
+    )
+
+
 def _start_appointment_flow(chat_id: int, ls: str | None = None) -> None:
-    """
-    Точка входа флоу записи на приём.
-    Если у клиента уже есть активная запись — показываем её вместо выбора
-    филиала (REQ-КЛ-06-09), с возможностью отменить.
-    """
-    ls = ls or _get_saved_ls(chat_id)
-    if not ls:
-        _request_ls(chat_id, "appointment")
-        return
-
-    existing = db.get_active_appointment(ls)
-    if existing:
-        _show_active_appointment(chat_id, existing)
-        return
-
-    _show_branch_select(chat_id, ls)
+    """Compatibility wrapper for starting the extracted appointment flow."""
+    appointments.start_appointment_flow(chat_id, ls, _appointment_dependencies())
 
 
 def _show_active_appointment(chat_id: int, appointment) -> None:
-    """Показывает текущую активную запись клиента с возможностью отмены."""
-    st = _get_state(chat_id)
-    st["state"] = S.MENU
-    _touch(st)
-
-    theme_line = f"\nТема: {appointment['theme']}" if appointment["theme"] else ""
-    send_buttons(
-        chat_id,
-        f"У вас уже есть активная запись на приём:\n\n"
-        f"📍 {appointment['branch_name']}\n"
-        f"🏠 {appointment['branch_address']}\n"
-        f"📅 {appointment['slot_date']}  🕐 {appointment['slot_time']}"
-        f"{theme_line}",
-        [
-            [_cb("❌ Отменить запись", f"appt_cancel:{appointment['id']}")],
-            [_cb("🏠 Главное меню", "main_menu")],
-        ]
+    """Compatibility wrapper for displaying an active appointment."""
+    appointments.show_active_appointment(
+        chat_id, appointment, _appointment_dependencies()
     )
 
 
 def _show_branch_select(chat_id: int, ls: str) -> None:
-    """Шаг 1: выбор филиала."""
-    branches = db.get_branches()
-    if not branches:
-        send_message(chat_id, "На данный момент запись на приём недоступна.")
-        send_main_menu(chat_id)
-        return
-
-    st = _get_state(chat_id)
-    st["state"] = S.APPOINTMENT_BRANCH
-    st["ls"] = ls
-    _touch(st)
-
-    rows = [[_cb(f"📍 {b['name']}", f"appt_branch:{b['id']}")] for b in branches]
-    rows.append([_cb("❌ Отмена", "main_menu")])
-    send_buttons(chat_id, "Выберите филиал:", rows)
+    """Compatibility wrapper for selecting an appointment branch."""
+    appointments.show_branch_select(chat_id, ls, _appointment_dependencies())
 
 
 def _show_date_select(chat_id: int, branch_id: int) -> None:
-    """Шаг 2: выбор даты."""
-    dates = db.get_available_dates(branch_id)
-    if not dates:
-        send_message(chat_id, "На выбранный филиал сейчас нет свободных дат для записи.")
-        send_main_menu(chat_id)
-        return
-
-    branch = db.get_branch(branch_id)
-    st = _get_state(chat_id)
-    st["state"] = S.APPOINTMENT_DATE
-    st["appt_branch_id"] = branch_id
-    _touch(st)
-
-    # Показываем не более 10 ближайших дат одним списком кнопок
-    rows = [[_cb(_format_date_label(d), f"appt_date:{d}")] for d in dates[:10]]
-    rows.append([_cb("❌ Отмена", "main_menu")])
-    send_buttons(chat_id, f"Филиал: {branch['name']}\nВыберите дату:", rows)
-
-
-_WEEKDAYS_SHORT = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+    """Compatibility wrapper for selecting an appointment date."""
+    appointments.show_date_select(chat_id, branch_id, _appointment_dependencies())
 
 
 def _format_date_label(date_str: str) -> str:
-    """Форматирует 'YYYY-MM-DD' в читаемую метку с днём недели."""
-    d = datetime.strptime(date_str, "%Y-%m-%d")
-    return f"{d.strftime('%d.%m')} ({_WEEKDAYS_SHORT[d.weekday()]})"
+    """Compatibility wrapper for the appointment date label."""
+    return appointments.format_date_label(date_str, _appointment_dependencies())
 
 
 def _show_time_select(chat_id: int, branch_id: int, slot_date: str) -> None:
-    """Шаг 3: выбор времени."""
-    slots = db.get_available_slots(branch_id, slot_date)
-    if not slots:
-        send_message(chat_id, "На эту дату свободных слотов не осталось. Выберите другую дату.")
-        _show_date_select(chat_id, branch_id)
-        return
-
-    st = _get_state(chat_id)
-    st["state"] = S.APPOINTMENT_TIME
-    st["appt_date"] = slot_date
-    _touch(st)
-
-    # Кнопки временем, по 3 в ряд для компактности
-    rows = []
-    row = []
-    for i, slot in enumerate(slots, 1):
-        row.append(_cb(slot, f"appt_time:{slot}"))
-        if i % 3 == 0:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([_cb("❌ Отмена", "main_menu")])
-    send_buttons(chat_id, f"Дата: {_format_date_label(slot_date)}\nВыберите время:", rows)
+    """Compatibility wrapper for selecting an appointment time."""
+    appointments.show_time_select(
+        chat_id, branch_id, slot_date, _appointment_dependencies()
+    )
 
 
 def _ask_theme(chat_id: int, slot_time: str) -> None:
-    """Шаг 4: тема обращения (опционально, REQ-КЛ-06-08)."""
-    st = _get_state(chat_id)
-    st["state"] = S.APPOINTMENT_THEME
-    st["appt_time"] = slot_time
-    _touch(st)
-
-    send_buttons(
-        chat_id,
-        "Укажите тему обращения (необязательно) — так сотрудник сможет заранее подготовиться.\n\n"
-        "Напишите тему текстом или нажмите «Пропустить».",
-        [[_cb("⏭ Пропустить", "appt_skip_theme")]]
-    )
+    """Compatibility wrapper for the optional appointment theme step."""
+    appointments.ask_theme(chat_id, slot_time, _appointment_dependencies())
 
 
 def _show_appointment_confirm(chat_id: int) -> None:
-    """Шаг 5: подтверждение перед сохранением."""
-    st = _get_state(chat_id)
-    branch = db.get_branch(st["appt_branch_id"])
-    theme = st.get("appt_theme")
-    theme_line = f"\nТема: {theme}" if theme else ""
-
-    st["state"] = S.APPOINTMENT_CONFIRM
-    _touch(st)
-
-    send_buttons(
-        chat_id,
-        f"Проверьте данные записи:\n\n"
-        f"📍 {branch['name']}\n"
-        f"🏠 {branch['address']}\n"
-        f"📅 {_format_date_label(st['appt_date'])}\n"
-        f"🕐 {st['appt_time']}"
-        f"{theme_line}",
-        [
-            [_cb("✅ Подтвердить запись", "appt_confirm")],
-            [_cb("❌ Отмена", "main_menu")],
-        ]
-    )
+    """Compatibility wrapper for rendering appointment confirmation."""
+    appointments.show_appointment_confirm(chat_id, _appointment_dependencies())
 
 
 def _finalize_appointment(chat_id: int) -> None:
-    """Финал флоу: сохраняем запись в БД."""
-    st = _get_state(chat_id)
-    aid, err = db.create_appointment(
-        ls=st["ls"],
-        branch_id=st["appt_branch_id"],
-        slot_date=st["appt_date"],
-        slot_time=st["appt_time"],
-        channel="max",
-        chat_id=chat_id,
-        theme=st.get("appt_theme"),
-    )
-
-    ls = st.get("ls")
-    _clear_flow(st)
-    _touch(st)
-
-    if err:
-        send_message(chat_id, f"⚠️ {err}")
-        log.warning("Запись не создана: ls=%s  ошибка=%s", ls, err)
-    else:
-        send_message(chat_id, "✅ Вы успешно записаны на приём! Напомним о визите заранее.")
-        log.info("Запись создана: id=%s  chat_id=%s", aid, chat_id)
-
-    send_main_menu(chat_id)
+    """Compatibility wrapper for persisting an appointment."""
+    appointments.finalize_appointment(chat_id, _appointment_dependencies())
 
 
 def _cancel_own_appointment(chat_id: int, appointment_id: int) -> None:
-    """Клиент отменяет свою запись (REQ-КЛ-06-07)."""
-    appointment = db.get_appointment(appointment_id)
-    if not appointment or appointment["status"] != "active":
-        send_message(chat_id, "Запись не найдена или уже отменена.")
-        send_main_menu(chat_id)
-        return
-
-    db.cancel_appointment(appointment_id, "client", "Отменено клиентом через бот")
-    send_message(chat_id, "Запись отменена.")
-    send_main_menu(chat_id)
+    """Compatibility wrapper for cancelling the caller's appointment."""
+    appointments.cancel_own_appointment(
+        chat_id, appointment_id, _appointment_dependencies()
+    )
 
 
 # ── PDF квитанция ─────────────────────────────────────────────────────────────
@@ -869,12 +769,8 @@ def _cb_select_meter(chat_id: int, st: dict, arg: str) -> None:
 
 
 def _cb_select_date(chat_id: int, st: dict, arg: str) -> None:
-    """Выбор даты записи на приём."""
-    branch_id = st.get("appt_branch_id")
-    if not branch_id:
-        send_main_menu(chat_id)
-        return
-    _show_time_select(chat_id, branch_id, arg)
+    """Compatibility wrapper for the appointment date callback."""
+    appointments.select_date(chat_id, st, arg, _appointment_dependencies())
 
 
 # Префикс payload → (обработчик, приводить ли аргумент к int)
@@ -903,14 +799,11 @@ def _cb_kvitanciya(chat_id: int, st: dict) -> None:
 
 
 def _cb_skip_theme(chat_id: int, st: dict) -> None:
-    st["appt_theme"] = None
-    _touch(st)
-    _show_appointment_confirm(chat_id)
+    appointments.skip_theme(chat_id, st, _appointment_dependencies())
 
 
 def _cb_appt_confirm(chat_id: int, st: dict) -> None:
-    if st.get("state") == S.APPOINTMENT_CONFIRM:
-        _finalize_appointment(chat_id)
+    appointments.confirm(chat_id, st, _appointment_dependencies())
 
 
 def _cb_main_menu(chat_id: int, st: dict) -> None:
@@ -1122,10 +1015,8 @@ def _on_reopen_comment(chat_id: int, st: dict, text: str) -> None:
 
 
 def _on_appointment_theme(chat_id: int, st: dict, text: str) -> None:
-    """Клиент ввёл тему приёма текстом вместо кнопки «Пропустить»."""
-    st["appt_theme"] = text[:200]   # защита от чрезмерно длинного текста
-    _touch(st)
-    _show_appointment_confirm(chat_id)
+    """Compatibility wrapper for typed appointment themes."""
+    appointments.on_theme(chat_id, st, text, _appointment_dependencies())
 
 
 def _on_value1(chat_id: int, st: dict, text: str) -> None:
