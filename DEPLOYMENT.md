@@ -36,11 +36,11 @@ bootstrap-пароли администраторов можно хранить 
 ## Первый запуск
 
 ```bash
-cp .env.example .env
 cp .env.example .env.test
 cp .env.runtime.example .env.test.runtime
+cp .env.example .env
 cp .env.runtime.example .env.prod.runtime
-chmod 600 .env .env.test .env.prod.runtime .env.test.runtime
+chmod 600 .env.test .env.test.runtime .env .env.prod.runtime
 ```
 
 В `.env.test` и `.env` задайте разные `TOKEN`, `SECRET_KEY` и
