@@ -20,7 +20,7 @@ import logging
 
 import httpx
 
-from config import TOKEN, API
+from config import API, TOKEN
 
 log = logging.getLogger("rso.api.notifier")
 
@@ -109,16 +109,17 @@ async def _notify_max(
             return True
 
         log.warning(
-            "MAX API вернул %s для chat_id=%s: %s",
-            resp.status_code, chat_id, resp.text[:200],
+            "MAX API вернул %s для chat_id=%s",
+            resp.status_code, chat_id,
         )
         return False
 
     except httpx.TimeoutException:
         log.warning("MAX API timeout: chat_id=%s", chat_id)
         return False
-    except Exception as exc:
-        log.error("MAX API ошибка: chat_id=%s  %s", chat_id, exc)
+    except Exception as exc:  # noqa: BLE001 - transport failures must not escape notifier
+        # Текст исключения может содержать URL, заголовки или токены транспорта.
+        log.error("MAX API ошибка: chat_id=%s  (%s)", chat_id, type(exc).__name__)
         return False
 
 
