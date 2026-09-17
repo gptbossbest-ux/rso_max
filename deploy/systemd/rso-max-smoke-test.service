@@ -15,6 +15,7 @@ ExecStart=/usr/bin/timeout --foreground --signal=TERM 115s /usr/bin/flock --no-f
 TimeoutStartSec=120
 NoNewPrivileges=true
 PrivateTmp=true
+Environment=DOCKER_CONFIG=/tmp/rso-max-docker-config
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/run/rso-max-smoke-test
