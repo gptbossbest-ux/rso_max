@@ -171,6 +171,14 @@ def test_excel_import_reports_missing_openpyxl(monkeypatch):
         db.import_from_excel("meters.xlsx")
 
 
+def test_web_healthz_is_public():
+    import web
+
+    response = web.app.test_client().get("/healthz")
+    assert response.status_code == 200
+    assert response.get_json() == {"status": "ok"}
+
+
 def test_upload_displays_excel_import_failure(clean_db, tmp_path, monkeypatch):
     import web
 
@@ -181,9 +189,11 @@ def test_upload_displays_excel_import_failure(clean_db, tmp_path, monkeypatch):
         "/login",
         data={"username": "upload-admin", "password": "initial-password"},
     )
-    monkeypatch.setattr(web.os, "getcwd", lambda: str(tmp_path))
+    monkeypatch.setattr(web, "DB_PATH", str(tmp_path / "database.sqlite"))
+    imported = {}
 
-    def fail_import(_filepath):
+    def fail_import(filepath):
+        imported["filepath"] = filepath
         raise RuntimeError("Для импорта Excel не установлен openpyxl")
 
     monkeypatch.setattr(web.db, "import_from_excel", fail_import)
@@ -193,11 +203,79 @@ def test_upload_displays_excel_import_failure(clean_db, tmp_path, monkeypatch):
         content_type="multipart/form-data",
     )
     assert response.status_code == 302
+    assert imported["filepath"] == str(tmp_path / "Данные_по_ЛС.xlsx")
+    assert (tmp_path / "Данные_по_ЛС.xlsx").is_file()
     with client.session_transaction() as session:
         assert (
             "error",
             "Ошибка импорта: Для импорта Excel не установлен openpyxl",
         ) in session["_flashes"]
+
+
+def test_upload_reports_file_save_failure(clean_db, tmp_path, monkeypatch):
+    from werkzeug.datastructures import FileStorage
+
+    import web
+
+    ok, _ = db.create_user("save-admin", "initial-password", "Admin", "admin")
+    assert ok
+    client = web.app.test_client()
+    client.post(
+        "/login",
+        data={"username": "save-admin", "password": "initial-password"},
+    )
+    monkeypatch.setattr(web, "DB_PATH", str(tmp_path / "database.sqlite"))
+
+    def fail_save(_self, _destination, _buffer_size=16384):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(FileStorage, "save", fail_save)
+    response = client.post(
+        "/upload",
+        data={"file": (io.BytesIO(b"not-an-xlsx"), "meters.xlsx")},
+        content_type="multipart/form-data",
+    )
+    assert response.status_code == 302
+    with client.session_transaction() as session:
+        assert ("error", "Ошибка импорта: read-only filesystem") in session["_flashes"]
+
+
+def test_bot_poll_heartbeat_is_written_atomically(tmp_path, monkeypatch):
+    import bot
+
+    heartbeat = tmp_path / "bot-heartbeat"
+    monkeypatch.setattr(bot, "BOT_HEALTH_FILE", str(heartbeat))
+    bot._mark_poll_healthy()
+    assert float(heartbeat.read_text(encoding="ascii")) > 0
+    assert not list(tmp_path.glob("bot-heartbeat.tmp.*"))
+
+
+def test_max_bot_identity_uses_token_without_printing_it(monkeypatch, capsys):
+    from scripts import max_bot_identity
+
+    secret = "test-secret-token"
+    monkeypatch.setenv("TOKEN", secret)
+    monkeypatch.setattr(
+        max_bot_identity,
+        "fetch_identity",
+        lambda token, _api_url: ("123", "test_bot") if token == secret else ("", ""),
+    )
+    assert max_bot_identity.main() == 0
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "123\ttest_bot"
+    assert secret not in captured.out + captured.err
+
+
+def test_deploy_stops_bot_before_resetting_heartbeat():
+    deploy_path = os.path.join(os.path.dirname(__file__), "..", "scripts", "deploy.sh")
+    with open(deploy_path, encoding="utf-8") as deploy_file:
+        script = deploy_file.read()
+
+    stop_at = script.index("dc --profile bot stop bot")
+    reset_at = script.index('rm -f -- "$runtime_dir/data/bot-heartbeat"')
+    start_at = script.index("dc --profile bot up -d --force-recreate api web bot")
+    assert stop_at < reset_at < start_at
+    assert "|| true" not in script[stop_at:start_at]
 
 
 def test_internal_api_missing_token_is_closed(monkeypatch):

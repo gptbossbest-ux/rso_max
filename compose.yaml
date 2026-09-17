@@ -1,0 +1,111 @@
+x-app: &app
+  build:
+    context: .
+    args:
+      APP_UID: ${APP_UID:-1000}
+      APP_GID: ${APP_GID:-1000}
+  image: ${IMAGE_NAME:-rso-max:local}
+  env_file:
+    - ${APP_ENV_FILE:-.env}
+    - ${APP_RUNTIME_ENV_FILE:-.env.runtime}
+  restart: unless-stopped
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  volumes:
+    - ${RUNTIME_DIR:-./runtime}/data:/app/data
+    - ${RUNTIME_DIR:-./runtime}/logs:/app/logs
+    - ${RUNTIME_DIR:-./runtime}/backups:/app/backups
+    - ${RUNTIME_DIR:-./runtime}/kv:/app/KV:ro
+  networks:
+    - backend
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+x-runtime-environment: &runtime-environment
+  APP_ENV: ${DEPLOY_APP_ENV:-production}
+
+services:
+  api:
+    <<: *app
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 1
+    environment:
+      <<: *runtime-environment
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      FASTAPI_BASE_URL: http://api:8000
+      DB_PATH: /app/data/database.sqlite
+      LOG_FILE: /app/logs/api.log
+    expose:
+      - "8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  web:
+    <<: *app
+    command: gunicorn --bind 0.0.0.0:5000 --workers 1 --threads 4 --timeout 60 web:app
+    environment:
+      <<: *runtime-environment
+      FASTAPI_BASE_URL: http://api:8000
+      DB_PATH: /app/data/database.sqlite
+      LOG_FILE: /app/logs/web.log
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${WEB_BIND_PORT:-5000}:5000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/healthz', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  bot:
+    <<: *app
+    profiles:
+      - bot
+    command: python bot.py
+    environment:
+      <<: *runtime-environment
+      FASTAPI_BASE_URL: http://api:8000
+      DB_PATH: /app/data/database.sqlite
+      LOG_FILE: /app/logs/bot.log
+      BOT_HEALTH_FILE: /app/data/bot-heartbeat
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,time; p='/app/data/bot-heartbeat'; assert os.path.exists(p) and time.time()-os.path.getmtime(p)<90"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+
+networks:
+  backend:
+    driver: bridge

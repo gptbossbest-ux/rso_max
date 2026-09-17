@@ -44,6 +44,7 @@ from werkzeug.security import check_password_hash
 import client_api
 import database as db
 from config import (
+    DB_PATH,
     ENABLE_1C_INTEGRATION,
     LOG_BACKUP_COUNT,
     LOG_FILE,
@@ -89,6 +90,12 @@ log = _setup_logger()
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
+
+
+@app.get("/healthz")
+def healthz():
+    """Lightweight health-check for the local reverse proxy and Docker."""
+    return {"status": "ok"}
 
 # ── Константы ─────────────────────────────────────────────────────────────────
 
@@ -534,10 +541,11 @@ def upload_file():
         flash("Допускается только .xlsx", "error")
         return redirect(url_for("upload_page"))
 
-    filepath = os.path.join(os.getcwd(), "Данные_по_ЛС.xlsx")
-    file.save(filepath)
-
+    upload_dir = os.path.dirname(os.path.abspath(DB_PATH))
+    filepath = os.path.join(upload_dir, "Данные_по_ЛС.xlsx")
     try:
+        os.makedirs(upload_dir, exist_ok=True)
+        file.save(filepath)
         db.import_from_excel(filepath)
     except Exception as exc:
         log.exception("Ошибка импорта Excel")

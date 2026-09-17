@@ -97,6 +97,7 @@ log = _setup_logger()
 # ── Константы ─────────────────────────────────────────────────────────────────
 
 _MAX_HEADERS = {"Authorization": TOKEN}  # без префикса Bearer — см. dev.max.ru/docs-api (обновление платформы)
+BOT_HEALTH_FILE = os.getenv("BOT_HEALTH_FILE", "")
 
 # Категории обращений — метка → значение для API
 CATEGORIES: dict[str, str] = {
@@ -1577,6 +1578,25 @@ def _handle_group_message(message: dict) -> None:
 
 # ── Polling ────────────────────────────────────────────────────────────────────
 
+def _mark_poll_healthy() -> None:
+    """Atomically update the optional polling heartbeat used by Docker."""
+    if not BOT_HEALTH_FILE:
+        return
+    temporary = f"{BOT_HEALTH_FILE}.tmp.{os.getpid()}"
+    try:
+        health_dir = os.path.dirname(BOT_HEALTH_FILE)
+        if health_dir:
+            os.makedirs(health_dir, exist_ok=True)
+        with open(temporary, "w", encoding="ascii") as heartbeat:
+            heartbeat.write(str(time.time()))
+        os.replace(temporary, BOT_HEALTH_FILE)
+    except OSError as exc:
+        log.warning("Не удалось обновить heartbeat polling: %s", exc)
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+
 def poll() -> None:
     marker = None
     log.info("Бот запущен (polling)")
@@ -1588,6 +1608,7 @@ def poll() -> None:
                 params={"marker": marker, "timeout": 25},
                 timeout=30,
             )
+            resp.raise_for_status()
             data = resp.json()
             for update in data.get("updates", []):
                 utype = update.get("update_type")
@@ -1607,6 +1628,7 @@ def poll() -> None:
                 except Exception as exc:
                     log.exception("Ошибка обработки update: %s", exc)
             marker = data.get("marker")
+            _mark_poll_healthy()
         except httpx.TimeoutException:
             log.debug("poll timeout — норма")
         except Exception as exc:
