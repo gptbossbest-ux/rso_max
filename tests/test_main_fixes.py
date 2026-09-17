@@ -310,6 +310,8 @@ def test_smoke_systemd_files_are_read_only_and_test_scoped():
     assert "/usr/local/libexec/rso-max-smoke test" in service
     assert "NoNewPrivileges=true" in service
     assert "PrivateTmp=true" in service and "ProtectSystem=strict" in service
+    assert "Environment=DOCKER_CONFIG=/tmp/rso-max-docker-config" in service
+    assert "ProtectHome=true" in service
     assert "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6" in service
     assert "OnUnitActiveSec=5min" in timer
     assert "RandomizedDelaySec=" in timer
