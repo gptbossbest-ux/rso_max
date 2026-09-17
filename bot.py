@@ -44,8 +44,9 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 import client_api
 import database as db
-from rso_bot import max_transport
+from rso_bot import max_transport, scheduler as bot_scheduler
 from rso_bot.flows import appeals, appointments, faq
+from rso_bot.jobs import appointment_reminders
 from config import (
     API,
     AUTH_BLOCK_MINUTES,
@@ -1144,14 +1145,19 @@ def _task_cleanup_user_states() -> None:
 
 
 def _format_appointment_reminder(appointment, when_label: str) -> str:
-    """Единый текст напоминания для обоих типов (24ч / день приёма)."""
-    theme_line = f"\nТема: {appointment['theme']}" if appointment["theme"] else ""
-    return (
-        f"⏰ Напоминаем: {when_label} у вас запись на приём.\n\n"
-        f"📍 {appointment['branch_name']}\n"
-        f"🏠 {appointment['branch_address']}\n"
-        f"📅 {appointment['slot_date']}  🕐 {appointment['slot_time']}"
-        f"{theme_line}"
+    """Совместимая обёртка форматирования напоминания."""
+    return appointment_reminders.format_appointment_reminder(appointment, when_label)
+
+
+def _appointment_reminder_dependencies(
+) -> appointment_reminders.AppointmentReminderDependencies:
+    """Resolve reminder dependencies at call time for runtime patch compatibility."""
+    return appointment_reminders.AppointmentReminderDependencies(
+        get_appointments_for_reminder_24h=db.get_appointments_for_reminder_24h,
+        get_appointments_for_reminder_day=db.get_appointments_for_reminder_day,
+        send_message=send_message,
+        mark_reminded=db.mark_reminded,
+        logger=log,
     )
 
 
@@ -1166,26 +1172,9 @@ def _task_appointment_reminder_24h() -> None:
     тот же принцип: не удалось отправить — логируем и идём дальше,
     а не ретраим бесконечно на каждом следующем прогоне).
     """
-    try:
-        appointments = db.get_appointments_for_reminder_24h()
-    except Exception as exc:
-        log.error("APScheduler appointment_reminder_24h: ошибка чтения БД: %s", exc)
-        return
-
-    for appt in appointments:
-        ok = send_message(
-            appt["chat_id"],
-            _format_appointment_reminder(appt, "завтра"),
-        )
-        if not ok:
-            log.warning(
-                "Напоминание за 24ч не доставлено: appointment_id=%s  chat_id=%s",
-                appt["id"], appt["chat_id"],
-            )
-        db.mark_reminded(appt["id"], "24h")
-
-    if appointments:
-        log.info("APScheduler appointment_reminder_24h: обработано %d записей", len(appointments))
+    appointment_reminders.task_appointment_reminder_24h(
+        _appointment_reminder_dependencies()
+    )
 
 
 def _task_appointment_reminder_day() -> None:
@@ -1193,26 +1182,21 @@ def _task_appointment_reminder_day() -> None:
     Задача APScheduler: напоминание в день приёма (REQ-АВТ-07-07).
     Запускается ежедневно в 09:00 по московскому времени (cron).
     """
-    try:
-        appointments = db.get_appointments_for_reminder_day()
-    except Exception as exc:
-        log.error("APScheduler appointment_reminder_day: ошибка чтения БД: %s", exc)
-        return
+    appointment_reminders.task_appointment_reminder_day(
+        _appointment_reminder_dependencies()
+    )
 
-    for appt in appointments:
-        ok = send_message(
-            appt["chat_id"],
-            _format_appointment_reminder(appt, "сегодня"),
-        )
-        if not ok:
-            log.warning(
-                "Напоминание в день приёма не доставлено: appointment_id=%s  chat_id=%s",
-                appt["id"], appt["chat_id"],
-            )
-        db.mark_reminded(appt["id"], "day")
 
-    if appointments:
-        log.info("APScheduler appointment_reminder_day: обработано %d записей", len(appointments))
+def _scheduler_dependencies() -> bot_scheduler.SchedulerDependencies:
+    """Resolve scheduler callbacks and runtime objects without importing bot.py."""
+    return bot_scheduler.SchedulerDependencies(
+        auto_resolve_pending=_task_auto_resolve_pending,
+        cleanup_user_states=_task_cleanup_user_states,
+        appointment_reminder_24h=_task_appointment_reminder_24h,
+        appointment_reminder_day=_task_appointment_reminder_day,
+        scheduler_factory=BackgroundScheduler,
+        logger=log,
+    )
 
 
 # ── Мониторинг домовых чатов (раздел 5, 7.4 ТЗ) ──────────────────────────────
@@ -1379,58 +1363,8 @@ if __name__ == "__main__":
     db.init_db()
 
     # ── APScheduler ───────────────────────────────────────────────────────────
-    scheduler = BackgroundScheduler(timezone="Europe/Moscow")
-
-    scheduler.add_job(
-        _task_auto_resolve_pending,
-        trigger="interval",
-        hours=1,
-        id="auto_resolve_pending",
-        max_instances=1,        # не запускать параллельно если предыдущий ещё работает
-        misfire_grace_time=300, # до 5 мин опоздания — всё равно выполнить
-    )
-    scheduler.add_job(
-        _task_cleanup_user_states,
-        trigger="interval",
-        hours=1,
-        id="cleanup_user_states",
-        max_instances=1,
-        misfire_grace_time=300,
-    )
-    scheduler.add_job(
-        _task_appointment_reminder_24h,
-        trigger="interval",
-        hours=1,
-        id="appointment_reminder_24h",
-        max_instances=1,
-        misfire_grace_time=300,
-    )
-    scheduler.add_job(
-        _task_appointment_reminder_day,
-        trigger="cron",
-        hour=9,
-        minute=0,
-        timezone="Europe/Moscow",
-        id="appointment_reminder_day",
-        max_instances=1,
-        misfire_grace_time=1800,  # до 30 мин опоздания (например, после рестарта сервера утром)
-    )
-    # Задача активируется в Этапе 4 после добавления колонки sent_to_1c:
-    # scheduler.add_job(
-    #     db.cleanup_old_cache,
-    #     trigger="interval",
-    #     hours=24,
-    #     id="cleanup_old_cache",
-    #     kwargs={"days": 90},
-    #     max_instances=1,
-    # )
-
-    scheduler.start()
-    log.info(
-        "APScheduler запущен: %d задач — %s",
-        len(scheduler.get_jobs()),
-        [j.id for j in scheduler.get_jobs()],
-    )
+    scheduler = bot_scheduler.create_scheduler(_scheduler_dependencies())
+    bot_scheduler.start_scheduler(scheduler, log)
 
     # ── Основной цикл (блокирует главный поток) ───────────────────────────────
     try:
@@ -1438,5 +1372,4 @@ if __name__ == "__main__":
     except (KeyboardInterrupt, SystemExit):
         log.info("Получен сигнал завершения")
     finally:
-        scheduler.shutdown(wait=False)
-        log.info("APScheduler остановлен, бот завершён")
+        bot_scheduler.shutdown_scheduler(scheduler, log)
