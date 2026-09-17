@@ -45,6 +45,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import client_api
 import database as db
 from rso_bot import max_transport
+from rso_bot.flows import faq
 from config import (
     API,
     AUTH_BLOCK_MINUTES,
@@ -521,106 +522,44 @@ def _show_my_appeals(chat_id: int) -> None:
     send_main_menu(chat_id)
 
 
-# ── Движок скриптов (раздел 6.3) ─────────────────────────────────────────────
+# ── Движок FAQ (раздел 6.3) ──────────────────────────────────────────────────
+
+def _faq_dependencies() -> faq.FaqDependencies:
+    """Build FAQ dependencies from runtime patch points in this entry point."""
+    return faq.FaqDependencies(
+        list_scripts=client_api.list_scripts,
+        get_script_tree=client_api.get_script_tree,
+        get_state=_get_state,
+        touch=_touch,
+        make_callback=_cb,
+        send_message=send_message,
+        send_buttons=send_buttons,
+        send_main_menu=send_main_menu,
+        logger=log,
+        script_list_state=S.SCRIPT_LIST,
+        script_node_state=S.SCRIPT_NODE,
+        menu_state=S.MENU,
+    )
+
 
 def _show_scripts_list(chat_id: int) -> None:
-    """Загружает список активных скриптов и показывает их кнопками."""
-    scripts, err = client_api.list_scripts()
-    if err or not scripts:
-        if err:
-            send_message(chat_id, "⚠️ Сервис временно недоступен.")
-        else:
-            send_message(chat_id, "📚 Раздел FAQ пуст.")
-        send_main_menu(chat_id)
-        return
-
-    st = _get_state(chat_id)
-    st["state"] = S.SCRIPT_LIST
-    _touch(st)
-
-    rows = [[_cb(s["title"], f"script:{s['id']}")] for s in scripts]
-    rows.append([_cb("🏠 Главное меню", "main_menu")])
-    send_buttons(chat_id, "📚 Выберите тему:", rows)
+    """Compatibility wrapper for the extracted FAQ flow."""
+    faq.show_scripts_list(chat_id, _faq_dependencies())
 
 
 def _open_script(chat_id: int, script_id: int) -> None:
-    """Загружает дерево скрипта и показывает корневой узел."""
-    tree, err = client_api.get_script_tree(script_id)
-    if err or not tree:
-        send_message(chat_id, "⚠️ Не удалось загрузить скрипт.")
-        send_main_menu(chat_id)
-        return
-
-    # Строим словари для быстрого доступа
-    nodes = {n["id"]: n for n in tree.get("nodes", [])}
-    edges_by_from: dict[int, list] = {}
-    for e in tree.get("edges", []):
-        edges_by_from.setdefault(e["from_node_id"], []).append(e)
-
-    if not nodes:
-        send_message(chat_id, "Скрипт пуст.")
-        send_main_menu(chat_id)
-        return
-
-    # Корневой узел = узел без входящих рёбер.
-    # min() вместо roots[0] — детерминированный выбор, если корней несколько.
-    all_to = {e["to_node_id"] for e in tree.get("edges", [])}
-    roots = [nid for nid in nodes if nid not in all_to]
-    if len(roots) > 1:
-        log.warning("Скрипт id=%s: найдено %d корневых узлов, берём минимальный",
-                    script_id, len(roots))
-    root_id = min(roots) if roots else min(nodes)
-
-    st = _get_state(chat_id)
-    st["state"] = S.SCRIPT_NODE
-    st["script"] = {
-        "nodes":         nodes,
-        "edges_by_from": edges_by_from,
-        "current":       root_id,
-    }
-    _touch(st)
-    _show_script_node(chat_id)
+    """Compatibility wrapper for opening an FAQ tree."""
+    faq.open_script(chat_id, script_id, _faq_dependencies())
 
 
 def _show_script_node(chat_id: int) -> None:
-    """Отображает текущий узел скрипта."""
-    st = _get_state(chat_id)
-    script = st.get("script", {})
-    nodes         = script.get("nodes", {})
-    edges_by_from = script.get("edges_by_from", {})
-    current_id    = script.get("current")
-
-    node = nodes.get(current_id)
-    if not node:
-        send_message(chat_id, "Скрипт завершён.")
-        send_main_menu(chat_id)
-        return
-
-    text = node["title"]
-    edges = edges_by_from.get(current_id, [])
-
-    if node.get("is_terminal") or not edges:
-        # Конечный узел — показываем текст и возвращаем в меню
-        send_message(chat_id, f"📌 {text}")
-        st["state"] = S.MENU
-        st.pop("script", None)
-        _touch(st)
-        send_main_menu(chat_id, "Выберите следующее действие:")
-    else:
-        rows = [[_cb(e["label"], f"script_node:{e['to_node_id']}")] for e in edges]
-        rows.append([_cb("🏠 Главное меню", "main_menu")])
-        send_buttons(chat_id, f"📌 {text}", rows)
+    """Compatibility wrapper for rendering the active FAQ node."""
+    faq.show_script_node(chat_id, _faq_dependencies())
 
 
 def _navigate_script_node(chat_id: int, node_id: int) -> None:
-    """Переходит к указанному узлу скрипта."""
-    st = _get_state(chat_id)
-    if "script" not in st:
-        send_main_menu(chat_id)
-        return
-    st["script"]["current"] = node_id
-    _touch(st)
-    _show_script_node(chat_id)
+    """Compatibility wrapper for moving through the active FAQ tree."""
+    faq.navigate_script_node(chat_id, node_id, _faq_dependencies())
 
 
 # ── Показания (адаптировано из предыдущей версии) ────────────────────────────
