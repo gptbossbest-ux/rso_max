@@ -1,5 +1,8 @@
 # Закрытый Docker-стенд
 
+Правила веток, Pull Request, CI и хранения секретов описаны в
+[GitHub-инфраструктуре](docs/GITHUB_INFRASTRUCTURE.md).
+
 Стенд запускает три независимых процесса из одного образа:
 
 - `api` — FastAPI, доступен только внутри Docker-сети;
@@ -16,40 +19,46 @@ SHA-256 отпечаток сертификата:
 
 На одном сервере используются независимые Compose-проекты:
 
-- `prod`: `.env` + `.env.prod.runtime`, данные в `runtime/prod`, веб-порт `5000`;
-- `test`: `.env.test` + `.env.test.runtime`, данные в `runtime/test`, веб-порт `5001`.
+- `test`: `.env.test` + `.env.test.runtime`, данные в `runtime/test`, веб-порт `5001`;
+- `prod`: `.env` + `.env.prod.runtime`, данные в `runtime/prod`, веб-порт `5000`.
 
 Для каждого контура также используется собственный каталог квитанций:
-`runtime/prod/kv` или `runtime/test/kv`. Он монтируется в контейнер как
+`runtime/test/kv` или `runtime/prod/kv`. Он монтируется в контейнер как
 `/app/KV` только для чтения. PDF-квитанции копируйте в нужный runtime-каталог;
 их нельзя добавлять в Git.
 
 Пользовательские `.env` не изменяются скриптами развёртывания. Одноразовые
 bootstrap-пароли администраторов можно хранить в соответствующем
 `.env.*.runtime`. Все эти файлы исключены из Git. Скрипт принудительно задаёт
-`APP_ENV=production` для `prod` и `APP_ENV=test` для `test`, независимо от
+`APP_ENV=test` для `test` и `APP_ENV=production` для `prod`, независимо от
 локального содержимого `.env`.
 
 ## Первый запуск
 
 ```bash
-cp .env.example .env
 cp .env.example .env.test
-cp .env.runtime.example .env.prod.runtime
 cp .env.runtime.example .env.test.runtime
-chmod 600 .env .env.test .env.prod.runtime .env.test.runtime
+cp .env.example .env
+cp .env.runtime.example .env.prod.runtime
+chmod 600 .env.test .env.test.runtime .env .env.prod.runtime
 ```
 
-В `.env` и `.env.test` задайте разные `TOKEN`, `SECRET_KEY` и
+В `.env.test` и `.env` задайте разные `TOKEN`, `SECRET_KEY` и
 `INTERNAL_API_TOKEN`. Настройки интеграции с 1С также задаются отдельно для
 каждого контура и не удаляются скриптами. При первом запуске с пустой базой в
 двух runtime-файлах задайте разные одноразовые значения
-`BOOTSTRAP_ADMIN_PASSWORD` длиной не менее 12 символов. После первого входа
-приложение потребует сменить пароль. Затем выполните нужную команду:
+`BOOTSTRAP_ADMIN_PASSWORD` длиной не менее 12 символов. После первого входа приложение потребует сменить пароль. Сначала разверните
+тестовый контур:
+
+```bash
+./scripts/deploy.sh test
+```
+
+Выполните health-check, smoke-тесты и приёмку. `prod` запускается только после
+успешной приёмки `test` **того же SHA**:
 
 ```bash
 ./scripts/deploy.sh prod
-./scripts/deploy.sh test
 ```
 
 Запускайте скрипты от непривилегированного владельца runtime-каталогов. При
@@ -60,11 +69,11 @@ chmod 600 .env .env.test .env.prod.runtime .env.test.runtime
 Перед запуском `deploy.sh` проверяет выбранный токен официальным MAX `GET /me`.
 Пустой или недействительный токен останавливает развёртывание. Если настроен
 второй контур, скрипт также запрещает запуск одного MAX-бота одновременно в
-prod и test. Значения токенов в вывод не попадают.
+test и prod. Значения токенов в вывод не попадают.
 
 После первого входа и смены bootstrap-пароля очистите
 `BOOTSTRAP_ADMIN_PASSWORD` в соответствующем `.env.*.runtime` и повторно
-выполните `deploy.sh prod` или `deploy.sh test`. Скрипт пересоздаёт контейнеры,
+выполните `deploy.sh test` или `deploy.sh prod`. Скрипт пересоздаёт контейнеры,
 чтобы одноразовый пароль исчез из их окружения.
 
 Панель намеренно не доступна из интернета. Откройте SSH-туннель с рабочего
@@ -90,35 +99,65 @@ ssh -L 5000:127.0.0.1:5000 -L 5001:127.0.0.1:5001 botadmin@SERVER_IP
 
 ## Проверки
 
+Для уже развёрнутых контуров проверьте health endpoints:
+
 ```bash
-./scripts/deploy.sh prod
-./scripts/deploy.sh test
-curl --fail http://127.0.0.1:5000/healthz
 curl --fail http://127.0.0.1:5001/healthz
+curl --fail http://127.0.0.1:5000/healthz
 ```
+
+Обязательный порядок нового релиза — `test`, приёмка и только затем `prod` того
+же SHA — описан в разделе [«Обновление только из `main`»](#обновление-только-из-main-сначала-test-затем-prod) ниже.
 
 ## Резервная копия SQLite
 
 ```bash
-./scripts/backup.sh prod
 ./scripts/backup.sh test
+./scripts/backup.sh prod
 ```
 
 Скрипт использует SQLite Backup API, поэтому копия согласована даже при работающих
 процессах. Сначала создаётся временный файл, затем выполняется
 `PRAGMA integrity_check` и только после успешной проверки файл атомарно получает
 итоговое имя. Копии старше 30 дней удаляются. Для автоматического запуска
-добавьте отдельные задания cron для `backup.sh prod` и `backup.sh test`.
+добавьте отдельные задания cron для `backup.sh test` и `backup.sh prod`.
 
-## Обновление только из `main`
+## Обновление только из `main`: сначала `test`, затем `prod`
+
+Получите актуальный `main` и зафиксируйте полный SHA кандидата. Не используйте
+плавающую ссылку `latest`: один и тот же принятый SHA должен пройти оба контура.
 
 ```bash
-./scripts/backup.sh prod
 git fetch origin main
-git pull --ff-only origin main
-./scripts/deploy.sh prod
+RELEASE_SHA="$(git rev-parse --verify origin/main^{commit})"
+printf 'Release candidate: %s\n' "$RELEASE_SHA"
+
+./scripts/backup.sh test
+git switch --detach "$RELEASE_SHA"
 ./scripts/deploy.sh test
+curl --fail http://127.0.0.1:5001/healthz
 ```
 
-Перед обновлением проверяйте новый commit. Не используйте `git reset --hard` на
-сервере: он может уничтожить локальные изменения стенда.
+После health-check выполните smoke-тесты и приёмку в `test`. Если кандидат не
+принят, не продвигайте его в `prod`: исправление оформляется новым commit в
+`main`, после чего процесс начинается заново с новым SHA.
+
+Только после успешной приёмки сделайте резервную копию production непосредственно
+перед его обновлением и разверните **тот же** SHA:
+
+```bash
+test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+./scripts/backup.sh prod
+./scripts/deploy.sh prod
+curl --fail http://127.0.0.1:5000/healthz
+```
+
+`git switch --detach` переводит сервер на уже полученный точный commit без
+перезаписи локальных файлов через `git reset --hard`. Рабочее дерево перед
+началом должно быть чистым; локальные изменения стенда храните вне Git.
+
+Для отката выберите полный SHA последнего успешно проверенного релиза, создайте
+актуальную резервную копию затронутого контура, переключитесь на этот SHA через
+`git switch --detach <SHA>` и повторите `deploy.sh`. Если неуспешный релиз
+изменил данные несовместимым образом, остановите сервисы и восстановите
+проверенную копию SQLite согласно плану восстановления данных.
