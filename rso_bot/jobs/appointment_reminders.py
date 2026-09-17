@@ -37,7 +37,7 @@ def task_appointment_reminder_24h(deps: AppointmentReminderDependencies) -> None
     """Send reminders for appointments in the existing 23–25 hour DB window."""
     try:
         appointments = deps.get_appointments_for_reminder_24h()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - scheduler boundary must contain DB failures.
         deps.logger.error(
             "APScheduler appointment_reminder_24h: ошибка чтения БД: %s", exc
         )
@@ -68,7 +68,7 @@ def task_appointment_reminder_day(deps: AppointmentReminderDependencies) -> None
     """Send reminders for appointments due today."""
     try:
         appointments = deps.get_appointments_for_reminder_day()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - scheduler boundary must contain DB failures.
         deps.logger.error(
             "APScheduler appointment_reminder_day: ошибка чтения БД: %s", exc
         )

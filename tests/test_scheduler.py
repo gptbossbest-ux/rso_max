@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from unittest.mock import Mock, call
 
-import bot
 from apscheduler.schedulers.background import BackgroundScheduler
+
+import bot
 from rso_bot import scheduler as scheduler_module
 
 
