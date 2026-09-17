@@ -45,7 +45,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import client_api
 import database as db
 from rso_bot import max_transport
-from rso_bot.flows import faq
+from rso_bot.flows import appeals, faq
 from config import (
     API,
     AUTH_BLOCK_MINUTES,
@@ -399,127 +399,66 @@ def _current_reading(ls: str, meter: dict, col: str, initial_key: str) -> float:
 
 # ── Флоу подачи обращения (раздел 6.4, шаги 1–4) ────────────────────────────
 
-def _start_appeal(chat_id: int) -> None:
-    """Шаг 1: предлагаем выбрать категорию."""
-    st = _get_state(chat_id)
-    st["state"] = S.APPEAL_CATEGORY
-    st.pop("appeal", None)
-    _touch(st)
+def _appeal_dependencies() -> appeals.AppealDependencies:
+    """Build appeal dependencies from runtime patch points in this entry point."""
+    return appeals.AppealDependencies(
+        create_appeal=client_api.create_appeal,
+        list_appeals_by_ls=client_api.list_appeals_by_ls,
+        confirm_appeal=client_api.confirm_appeal,
+        reopen_appeal=client_api.reopen_appeal,
+        get_state=_get_state,
+        touch=_touch,
+        get_saved_ls=_get_saved_ls,
+        request_ls=_request_ls,
+        check_ls_brute=_check_ls_brute,
+        validate_ls=_validate_ls,
+        fail_ls=_fail_ls,
+        reset_ls_brute=_reset_ls_brute,
+        save_ls=_save_ls,
+        submit_appeal=_submit_appeal,
+        make_callback=_cb,
+        send_message=send_message,
+        send_buttons=send_buttons,
+        send_main_menu=send_main_menu,
+        logger=log,
+        categories=CATEGORIES,
+        category_state=S.APPEAL_CATEGORY,
+        body_state=S.APPEAL_BODY,
+        reopen_comment_state=S.REOPEN_COMMENT,
+        menu_state=S.MENU,
+    )
 
-    rows = [[_cb(label, f"cat:{val}")] for label, val in CATEGORIES.items()]
-    rows.append([_cb("❌ Отмена", "cancel")])
-    send_buttons(chat_id, "Выберите категорию обращения:", rows)
+
+def _start_appeal(chat_id: int) -> None:
+    """Compatibility wrapper for starting the extracted appeal flow."""
+    appeals.start_appeal(chat_id, _appeal_dependencies())
 
 
 def _appeal_set_category(chat_id: int, category: str) -> None:
-    """Шаг 2: категория выбрана — просим описание."""
-    st = _get_state(chat_id)
-    st["state"] = S.APPEAL_BODY
-    st["appeal"] = {"category": category}
-    _touch(st)
-    send_message(chat_id, "Опишите вашу проблему или вопрос:")
+    """Compatibility wrapper for choosing an appeal category."""
+    appeals.set_category(chat_id, category, _appeal_dependencies())
 
 
 def _appeal_got_body(chat_id: int, text: str) -> None:
-    """Шаг 3: описание получено — проверяем ЛС."""
-    st = _get_state(chat_id)
-    st["appeal"]["body"] = text
-    _touch(st)
-
-    ls = _get_saved_ls(chat_id)
-    if ls:
-        _submit_appeal(chat_id, ls)
-    else:
-        _request_ls(chat_id, "appeal")
+    """Compatibility wrapper for accepting an appeal body."""
+    appeals.got_body(chat_id, text, _appeal_dependencies())
 
 
 def _appeal_got_ls(chat_id: int, ls_input: str) -> None:
-    """Шаг 4: ЛС введён — валидируем и отправляем."""
-    block_msg = _check_ls_brute(chat_id)
-    if block_msg:
-        send_message(chat_id, block_msg)
-        return
-
-    if not _validate_ls(ls_input):
-        send_message(chat_id, _fail_ls(chat_id))
-        send_message(chat_id, "Введите номер лицевого счёта повторно:")
-        return
-
-    _reset_ls_brute(chat_id)
-    _save_ls(chat_id, ls_input)
-    _submit_appeal(chat_id, ls_input)
+    """Compatibility wrapper for validating an appeal account number."""
+    appeals.got_ls(chat_id, ls_input, _appeal_dependencies())
 
 
 def _submit_appeal(chat_id: int, ls: str) -> None:
-    """Финал флоу: POST /api/v1/appeals → показываем ticket_no."""
-    st = _get_state(chat_id)
-    appeal = st.get("appeal", {})
-
-    data, err = client_api.create_appeal(
-        ls=ls,
-        channel="max",
-        category=appeal.get("category", "прочее"),
-        body=appeal.get("body", ""),
-        chat_id=chat_id,
-    )
-
-    st["state"] = S.MENU
-    st.pop("appeal", None)
-    _touch(st)
-
-    if err:
-        log.error("create_appeal chat_id=%s err=%s", chat_id, err)
-        send_message(chat_id, "⚠️ Сервис временно недоступен. Попробуйте позже.")
-    else:
-        ticket = data["ticket_no"]
-        send_message(chat_id,
-            f"✅ Обращение принято!\n"
-            f"Номер: {ticket}\n\n"
-            f"Мы свяжемся с вами в ближайшее время."
-        )
-        log.info("Создано обращение %s  chat_id=%s", ticket, chat_id)
-
-    send_main_menu(chat_id)
+    """Compatibility wrapper for submitting an extracted appeal flow."""
+    appeals.submit_appeal(chat_id, ls, _appeal_dependencies())
 
 
 # ── Флоу «Мои обращения» ─────────────────────────────────────────────────────
 
 def _show_my_appeals(chat_id: int) -> None:
-    ls = _get_saved_ls(chat_id)
-    if not ls:
-        _request_ls(chat_id, "my_appeals")
-        return
-
-    data, err = client_api.list_appeals_by_ls(ls)
-    if err:
-        send_message(chat_id, "⚠️ Сервис временно недоступен. Попробуйте позже.")
-        send_main_menu(chat_id)
-        return
-
-    appeals = data.get("appeals", [])
-    active = [a for a in appeals if a.get("status") not in ("resolved", "closed")]
-
-    if not active:
-        send_message(chat_id, "✅ У вас нет активных обращений.")
-    else:
-        status_labels = {
-            "new":                  "🆕 Новое",
-            "in_work":              "⚙️ В работе",
-            "pending_confirmation": "⏳ На подтверждении",
-        }
-        lines = ["📋 Ваши активные обращения:\n"]
-        for a in active:
-            body = a.get("body") or ""
-            preview = body[:60] + ("..." if len(body) > 60 else "")
-            status = a.get("status", "")
-            lines.append(
-                f"№ {a.get('ticket_no', '?')} — {status_labels.get(status, status)}\n"
-                f"📝 {preview}\n"
-                f"📅 {(a.get('created_at') or '')[:16]}\n"
-            )
-        send_message(chat_id, "\n".join(lines))
-
-    send_main_menu(chat_id)
+    """Compatibility wrapper for listing active appeals."""
+    appeals.show_my_appeals(chat_id, _appeal_dependencies())
 
 
 # ── Движок FAQ (раздел 6.3) ──────────────────────────────────────────────────
@@ -912,21 +851,13 @@ def _ack_callback(callback_id: str) -> None:
 # -- Обработчики callback с аргументом (payload вида "префикс:значение") -------
 
 def _cb_confirm_appeal(chat_id: int, st: dict, arg: str) -> None:
-    """Клиент подтверждает закрытие обращения."""
-    data, err = client_api.confirm_appeal(int(arg), "max", chat_id)
-    if err:
-        send_message(chat_id, f"⚠️ Не удалось подтвердить закрытие: {err}")
-    else:
-        send_message(chat_id, f"✅ Обращение №{data['ticket_no']} закрыто.\nСпасибо!")
-    send_main_menu(chat_id)
+    """Compatibility wrapper for confirming appeal closure."""
+    appeals.confirm_appeal(chat_id, st, arg, _appeal_dependencies())
 
 
 def _cb_reopen_appeal(chat_id: int, st: dict, arg: str) -> None:
-    """Клиент хочет вернуть обращение в работу — спрашиваем причину."""
-    st["state"] = S.REOPEN_COMMENT
-    st["reopen_appeal_id"] = int(arg)
-    _touch(st)
-    send_message(chat_id, "Опишите, пожалуйста, причину возврата обращения в работу:")
+    """Compatibility wrapper for starting appeal reopening."""
+    appeals.begin_reopen(chat_id, st, arg, _appeal_dependencies())
 
 
 def _cb_select_meter(chat_id: int, st: dict, arg: str) -> None:
@@ -1186,21 +1117,8 @@ def _on_await_code_1c(chat_id: int, st: dict, text: str) -> None:
 
 
 def _on_reopen_comment(chat_id: int, st: dict, text: str) -> None:
-    """Клиент написал причину возврата обращения в работу."""
-    appeal_id = st.pop("reopen_appeal_id", None)
-    st["state"] = S.MENU
-    _touch(st)
-
-    if appeal_id:
-        data, err = client_api.reopen_appeal(appeal_id, text)
-        if err:
-            send_message(chat_id, f"⚠️ Не удалось вернуть обращение: {err}")
-        else:
-            send_message(chat_id,
-                f"↩️ Обращение №{data['ticket_no']} возвращено в работу.\n"
-                f"Ваш комментарий: {text}"
-            )
-    send_main_menu(chat_id)
+    """Compatibility wrapper for submitting an appeal reopen comment."""
+    appeals.on_reopen_comment(chat_id, st, text, _appeal_dependencies())
 
 
 def _on_appointment_theme(chat_id: int, st: dict, text: str) -> None:
