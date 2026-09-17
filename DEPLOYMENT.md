@@ -113,15 +113,42 @@ curl --fail http://127.0.0.1:5001/healthz
 итоговое имя. Копии старше 30 дней удаляются. Для автоматического запуска
 добавьте отдельные задания cron для `backup.sh prod` и `backup.sh test`.
 
-## Обновление только из `main`
+## Обновление только из `main`: сначала `test`, затем `prod`
+
+Получите актуальный `main` и зафиксируйте полный SHA кандидата. Не используйте
+плавающую ссылку `latest`: один и тот же принятый SHA должен пройти оба контура.
 
 ```bash
-./scripts/backup.sh prod
 git fetch origin main
-git pull --ff-only origin main
-./scripts/deploy.sh prod
+RELEASE_SHA="$(git rev-parse --verify origin/main^{commit})"
+printf 'Release candidate: %s\n' "$RELEASE_SHA"
+
+./scripts/backup.sh test
+git switch --detach "$RELEASE_SHA"
 ./scripts/deploy.sh test
+curl --fail http://127.0.0.1:5001/healthz
 ```
 
-Перед обновлением проверяйте новый commit. Не используйте `git reset --hard` на
-сервере: он может уничтожить локальные изменения стенда.
+После health-check выполните smoke-тесты и приёмку в `test`. Если кандидат не
+принят, не продвигайте его в `prod`: исправление оформляется новым commit в
+`main`, после чего процесс начинается заново с новым SHA.
+
+Только после успешной приёмки сделайте резервную копию production непосредственно
+перед его обновлением и разверните **тот же** SHA:
+
+```bash
+test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+./scripts/backup.sh prod
+./scripts/deploy.sh prod
+curl --fail http://127.0.0.1:5000/healthz
+```
+
+`git switch --detach` переводит сервер на уже полученный точный commit без
+перезаписи локальных файлов через `git reset --hard`. Рабочее дерево перед
+началом должно быть чистым; локальные изменения стенда храните вне Git.
+
+Для отката выберите полный SHA последнего успешно проверенного релиза, создайте
+актуальную резервную копию затронутого контура, переключитесь на этот SHA через
+`git switch --detach <SHA>` и повторите `deploy.sh`. Если неуспешный релиз
+изменил данные несовместимым образом, остановите сервисы и восстановите
+проверенную копию SQLite согласно плану восстановления данных.
