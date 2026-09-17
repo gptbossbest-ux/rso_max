@@ -1221,22 +1221,42 @@ def get_1c_readings_by_batch(batch_id: str) -> list[sqlite3.Row]:
         conn.close()
 
 
-def apply_1c_reading_statuses(batch_id: str, statuses: list[dict]) -> list[dict]:
-    """Финализирует строки пакета и возвращает данные для уведомлений MAX."""
-    conn = get_conn()
+def _apply_1c_reading_statuses_conn(
+    conn: sqlite3.Connection,
+    batch_id: str,
+    statuses: list[dict],
+) -> list[dict]:
     updated: list[dict] = []
-    try:
-        for item in statuses:
-            status = item.get("status")
-            if status not in {"accepted", "rejected"}:
-                raise ValueError(f"Неизвестный статус показания: {status!r}")
-            row = conn.execute(
+    for item in statuses:
+        status = item.get("status")
+        if status not in {"accepted", "rejected"}:
+            raise ValueError(f"Неизвестный статус показания: {status!r}")
+        row = conn.execute(
+            """
+            SELECT * FROM pokazaniya
+            WHERE batch_id=? AND ls=? AND meter_number=? AND value1=?
+              AND ((value2 IS NULL AND ? IS NULL) OR value2=?)
+              AND created_at=? AND sent_to_1c=0
+            ORDER BY id LIMIT 1
+            """,
+            (
+                batch_id,
+                item.get("ls"),
+                item.get("meter_number"),
+                str(item.get("value1")),
+                item.get("value2"),
+                None if item.get("value2") is None else str(item.get("value2")),
+                item.get("submitted_at"),
+            ),
+        ).fetchone()
+        if row is None:
+            already_final = conn.execute(
                 """
-                SELECT * FROM pokazaniya
+                SELECT 1 FROM pokazaniya
                 WHERE batch_id=? AND ls=? AND meter_number=? AND value1=?
                   AND ((value2 IS NULL AND ? IS NULL) OR value2=?)
-                  AND created_at=? AND sent_to_1c=0
-                ORDER BY id LIMIT 1
+                  AND created_at=? AND sent_to_1c=1
+                LIMIT 1
                 """,
                 (
                     batch_id,
@@ -1248,17 +1268,27 @@ def apply_1c_reading_statuses(batch_id: str, statuses: list[dict]) -> list[dict]
                     item.get("submitted_at"),
                 ),
             ).fetchone()
-            if row is None:
-                log.error("Ответ 1С содержит неизвестное показание: batch_id=%s", batch_id)
+            if already_final is not None:
                 continue
-            conn.execute(
-                "UPDATE pokazaniya SET sent_to_1c=1, status_1c=? WHERE id=?",
-                (status, row["id"]),
+            raise ValueError(
+                f"Ответ 1С содержит неизвестное показание: batch_id={batch_id}"
             )
-            result = dict(row)
-            result["status_1c"] = status
-            result["sent_to_1c"] = 1
-            updated.append(result)
+        conn.execute(
+            "UPDATE pokazaniya SET sent_to_1c=1, status_1c=? WHERE id=?",
+            (status, row["id"]),
+        )
+        result = dict(row)
+        result["status_1c"] = status
+        result["sent_to_1c"] = 1
+        updated.append(result)
+    return updated
+
+
+def apply_1c_reading_statuses(batch_id: str, statuses: list[dict]) -> list[dict]:
+    """Финализирует строки пакета и возвращает данные для уведомлений MAX."""
+    conn = get_conn()
+    try:
+        updated = _apply_1c_reading_statuses_conn(conn, batch_id, statuses)
         conn.commit()
         return updated
     finally:
@@ -1352,38 +1382,80 @@ def upsert_1c_meters(ls: str, meters: list[dict]) -> None:
         conn.close()
 
 
+def _apply_1c_meter_changes_conn(
+    conn: sqlite3.Connection,
+    changes: list[dict],
+) -> None:
+    for change in changes:
+        action = change.get("action")
+        ls = change.get("ls")
+        meter_number = change.get("meter_number")
+        if not ls or not meter_number:
+            raise ValueError("Изменение счётчика без ls или meter_number")
+        if action == "removed":
+            conn.execute(
+                "DELETE FROM schetchiki WHERE ls=? AND meter_number=?",
+                (ls, meter_number),
+            )
+        elif action == "changed":
+            _validate_1c_meter(change)
+            conn.execute(
+                "UPDATE schetchiki SET resource_type=?, meter_type=? "
+                "WHERE ls=? AND meter_number=?",
+                (
+                    change.get("resource_type"),
+                    change.get("meter_type"),
+                    ls,
+                    meter_number,
+                ),
+            )
+        elif action == "added":
+            _validate_1c_meter(change)
+            _upsert_1c_meter_conn(conn, ls, change)
+        else:
+            raise ValueError(f"Неизвестное действие счётчика: {action!r}")
+
+
 def apply_1c_meter_changes(changes: list[dict]) -> None:
     conn = get_conn()
     try:
-        for change in changes:
-            action = change.get("action")
-            ls = change.get("ls")
-            meter_number = change.get("meter_number")
-            if not ls or not meter_number:
-                raise ValueError("Изменение счётчика без ls или meter_number")
-            if action == "removed":
-                conn.execute(
-                    "DELETE FROM schetchiki WHERE ls=? AND meter_number=?",
-                    (ls, meter_number),
-                )
-            elif action == "changed":
-                _validate_1c_meter(change)
-                conn.execute(
-                    "UPDATE schetchiki SET resource_type=?, meter_type=? "
-                    "WHERE ls=? AND meter_number=?",
-                    (
-                        change.get("resource_type"),
-                        change.get("meter_type"),
-                        ls,
-                        meter_number,
-                    ),
-                )
-            elif action == "added":
-                _validate_1c_meter(change)
-                _upsert_1c_meter_conn(conn, ls, change)
-            else:
-                raise ValueError(f"Неизвестное действие счётчика: {action!r}")
+        _apply_1c_meter_changes_conn(conn, changes)
         conn.commit()
+    finally:
+        conn.close()
+
+
+def apply_1c_sync_result(
+    batch_id: str,
+    attempt_at: str,
+    statuses: list[dict],
+    changes: list[dict],
+) -> list[dict] | None:
+    """Atomically apply a validated 1C result and finish its claimed batch."""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        state = conn.execute("SELECT * FROM sync_1c_state WHERE id=1").fetchone()
+        if (
+            state is None
+            or state["pending_batch_id"] != batch_id
+            or state["last_attempt_at"] != attempt_at
+        ):
+            conn.rollback()
+            return None
+
+        updated = _apply_1c_reading_statuses_conn(conn, batch_id, statuses)
+        _apply_1c_meter_changes_conn(conn, changes)
+        more = conn.execute(
+            "SELECT 1 FROM pokazaniya WHERE sent_to_1c=0 "
+            f"AND (batch_id IS NOT NULL OR {_CUSTOMER_READING_SQL}) LIMIT 1"
+        ).fetchone()
+        conn.execute(
+            "UPDATE sync_1c_state SET pending_batch_id=NULL, last_success_at=? WHERE id=1",
+            (state["last_success_at"] if more else attempt_at,),
+        )
+        conn.commit()
+        return updated
     finally:
         conn.close()
 
@@ -1559,7 +1631,7 @@ def get_bot_user(chat_id: int) -> sqlite3.Row | None:
 def upsert_bot_user(
     chat_id: int,
     ls: str,
-    fio: str,
+    fio: str | None,
     authorized_1c: bool | None = None,
 ) -> None:
     conn = get_conn()
@@ -1569,7 +1641,10 @@ def upsert_bot_user(
             "INSERT INTO bot_users (chat_id, ls, fio, last_seen, authorized_1c) "
             "VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT(chat_id) DO UPDATE SET "
-            "ls=excluded.ls, fio=excluded.fio, last_seen=excluded.last_seen, "
+            "ls=excluded.ls, "
+            "fio=CASE WHEN excluded.fio IS NULL OR excluded.fio='' "
+            "THEN bot_users.fio ELSE excluded.fio END, "
+            "last_seen=excluded.last_seen, "
             "authorized_1c=CASE WHEN ? IS NULL THEN bot_users.authorized_1c "
             "ELSE excluded.authorized_1c END",
             (chat_id, ls, fio, msk_now(), auth_value, authorized_1c),

@@ -51,26 +51,54 @@ def _reading_key(item: dict) -> tuple:
 
 
 def _valid_result(result: dict | None, batch_id: str, readings: list[dict]) -> bool:
-    if not isinstance(result, dict) or result.get("batch_id") != batch_id:
+    if (
+        not isinstance(result, dict)
+        or not isinstance(result.get("batch_id"), str)
+        or result["batch_id"] != batch_id
+    ):
         return False
     statuses = result.get("readings_status")
     changes = result.get("meters_changes")
     if not isinstance(statuses, list) or not isinstance(changes, list):
         return False
-    if any(item.get("status") not in {"accepted", "rejected"} for item in statuses):
-        return False
+    for item in statuses:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("ls"), str)
+            or not item["ls"]
+            or not isinstance(item.get("meter_number"), str)
+            or not item["meter_number"]
+            or not isinstance(item.get("value1"), str)
+            or not isinstance(item.get("value2"), (str, type(None)))
+            or not isinstance(item.get("submitted_at"), str)
+            or not item["submitted_at"]
+            or not isinstance(item.get("status"), str)
+            or item["status"] not in {"accepted", "rejected"}
+        ):
+            return False
     if Counter(_reading_key(item) for item in statuses) != Counter(
         _reading_key(item) for item in readings
     ):
         return False
     for change in changes:
-        if change.get("action") not in {"added", "changed", "removed"}:
+        if not isinstance(change, dict):
             return False
-        if not change.get("ls") or not change.get("meter_number"):
+        action = change.get("action")
+        if not isinstance(action, str) or action not in {"added", "changed", "removed"}:
             return False
-        if change["action"] != "removed" and change.get("meter_type") not in {
-            "Однотарифный", "Двухтарифный"
-        }:
+        if (
+            not isinstance(change.get("ls"), str)
+            or not change["ls"]
+            or not isinstance(change.get("meter_number"), str)
+            or not change["meter_number"]
+        ):
+            return False
+        if action != "removed" and (
+            not isinstance(change.get("resource_type"), str)
+            or not change["resource_type"]
+            or not isinstance(change.get("meter_type"), str)
+            or change["meter_type"] not in {"Однотарифный", "Двухтарифный"}
+        ):
             return False
     return True
 
@@ -125,9 +153,19 @@ def sync_1c_job(now: datetime | None = None) -> str:
             log.warning("Повтор синхронизации 1С неуспешен: batch_id=%s", batch_id)
         return "failed"
 
-    updated = db.apply_1c_reading_statuses(batch_id, result["readings_status"])
-    db.apply_1c_meter_changes(result["meters_changes"])
-    db.complete_1c_sync_batch(batch_id, claim["attempt_at"])
+    try:
+        updated = db.apply_1c_sync_result(
+            batch_id,
+            claim["attempt_at"],
+            result["readings_status"],
+            result["meters_changes"],
+        )
+    except ValueError:
+        log.error("Ответ 1С не удалось атомарно применить: batch_id=%s", batch_id)
+        return "failed"
+    if updated is None:
+        log.warning("Устаревший ответ 1С не применён: batch_id=%s", batch_id)
+        return "failed"
     for reading in updated:
         _notify_reading(reading)
     log.info(

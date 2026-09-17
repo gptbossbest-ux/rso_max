@@ -209,6 +209,37 @@ class Database1CTests(unittest.TestCase):
         self.assertEqual(meters[0]["resource_type"], "Холодная вода")
         self.assertEqual(meters[0]["meter_type"], "Двухтарифный")
 
+    def test_atomic_sync_result_rolls_back_status_and_earlier_meter_change(self) -> None:
+        db.add_pokazaniya(11, "100001", "Электроэнергия", "M-1", "10")
+        claim = self.claim("batch-atomic")
+        reading = claim["rows"][0]
+        statuses = [{
+            "ls": reading["ls"],
+            "meter_number": reading["meter_number"],
+            "value1": reading["value1"],
+            "value2": reading["value2"],
+            "submitted_at": reading["created_at"],
+            "status": "accepted",
+        }]
+        changes = [
+            {"action": "added", "ls": "100001", "meter_number": "M-2",
+             "resource_type": "Вода", "meter_type": "Однотарифный"},
+            {"action": "added", "ls": "100001", "meter_number": "M-3",
+             "resource_type": "Вода", "meter_type": "invalid"},
+        ]
+
+        with self.assertRaises(ValueError):
+            db.apply_1c_sync_result(
+                claim["batch_id"], claim["attempt_at"], statuses, changes
+            )
+
+        stored = db.get_1c_readings_by_batch("batch-atomic")[0]
+        self.assertEqual((stored["sent_to_1c"], stored["status_1c"]), (0, None))
+        self.assertEqual(db.get_schetchiki("100001"), [])
+        self.assertEqual(
+            db.get_1c_sync_state()["pending_batch_id"], "batch-atomic"
+        )
+
     def test_sync_state_persists_pending_batch(self) -> None:
         db.update_1c_sync_state(
             pending_batch_id="batch-1",

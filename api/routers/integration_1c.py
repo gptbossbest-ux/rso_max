@@ -42,10 +42,35 @@ def _raise_transport_error(error: str | None) -> None:
 def _validated_result(data: dict | None, error: str | None, allowed: set[str]) -> dict:
     if error or data is None:
         _raise_transport_error(error)
-    if data.get("status") not in allowed or not isinstance(data.get("message", ""), str):
+    if (
+        not isinstance(data, dict)
+        or not isinstance(data.get("status"), str)
+        or data["status"] not in allowed
+        or not isinstance(data.get("message"), str)
+    ):
         log.error("1С вернула неизвестный бизнес-статус")
         _raise_transport_error("invalid_response")
     return data
+
+
+def _validated_meters(result: dict) -> list[dict]:
+    """Validate the complete nested success payload before any database write."""
+    meters = result.get("meters")
+    if not isinstance(meters, list):
+        _raise_transport_error("invalid_response")
+    for meter in meters:
+        if (
+            not isinstance(meter, dict)
+            or not isinstance(meter.get("meter_number"), str)
+            or not meter["meter_number"]
+            or not isinstance(meter.get("resource_type"), str)
+            or not meter["resource_type"]
+            or not isinstance(meter.get("meter_type"), str)
+            or meter["meter_type"] not in {"Однотарифный", "Двухтарифный"}
+        ):
+            log.error("1С вернула некорректный список счётчиков")
+            _raise_transport_error("invalid_response")
+    return meters
 
 
 @router.post("/auth/request-code")
@@ -61,9 +86,7 @@ def verify_code(payload: Integration1CVerifyRequest) -> dict:
     data, error = client_1c.verify_auth_code(payload.ls, payload.chat_id, payload.code)
     result = _validated_result(data, error, _VERIFY_STATUSES)
     if result["status"] == "ok":
-        meters = result.get("meters")
-        if not isinstance(meters, list):
-            _raise_transport_error("invalid_response")
+        meters = _validated_meters(result)
         try:
             db.upsert_1c_meters(payload.ls, meters)
         except ValueError:

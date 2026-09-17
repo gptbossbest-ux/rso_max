@@ -12,6 +12,7 @@ get_operator_id — извлекает operator_id из тела запроса 
 from __future__ import annotations
 
 import logging
+import secrets
 
 from fastapi import HTTPException, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -47,7 +48,9 @@ def verify_token(
             detail="Внутренняя API-аутентификация не настроена",
         )
 
-    if credentials is None or credentials.credentials != INTERNAL_API_TOKEN:
+    if credentials is None or not secrets.compare_digest(
+        credentials.credentials, INTERNAL_API_TOKEN
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Неверный или отсутствующий Bearer-токен",

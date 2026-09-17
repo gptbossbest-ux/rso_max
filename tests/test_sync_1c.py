@@ -182,6 +182,76 @@ class Sync1CTests(unittest.TestCase):
 
         self.assertFalse(valid)
 
+    def test_nested_non_object_and_non_string_values_are_invalid(self) -> None:
+        reading = {
+            "chat_id": 42,
+            "ls": "100001",
+            "meter_number": "M-1",
+            "value1": "10",
+            "value2": None,
+            "submitted_at": "2026-08-19 12:00",
+        }
+        valid_status = {**reading, "status": "accepted"}
+        malformed = (
+            {"readings_status": [None], "meters_changes": []},
+            {"readings_status": [[valid_status]], "meters_changes": []},
+            {"readings_status": [{**valid_status, "ls": None}], "meters_changes": []},
+            {"readings_status": [{**valid_status, "value1": ["10"]}], "meters_changes": []},
+            {"readings_status": [valid_status], "meters_changes": [None]},
+            {"readings_status": [valid_status], "meters_changes": [{
+                "action": "added", "ls": "100001", "meter_number": "M-2",
+                "resource_type": {"name": "Вода"}, "meter_type": "Однотарифный",
+            }]},
+        )
+
+        for body in malformed:
+            with self.subTest(body=body):
+                response = {"batch_id": "batch-1", **body}
+                self.assertFalse(self.sync._valid_result(response, "batch-1", [reading]))
+
+    def test_partially_invalid_meter_delta_changes_nothing_and_can_retry(self) -> None:
+        db.add_pokazaniya(42, "100001", "Электроэнергия", "M-1", "10")
+
+        def response(batch_id, readings):
+            status = {**readings[0], "status": "accepted"}
+            return ({
+                "batch_id": batch_id,
+                "readings_status": [status],
+                "meters_changes": [
+                    {"action": "added", "ls": "100001", "meter_number": "M-2",
+                     "resource_type": "Вода", "meter_type": "Однотарифный"},
+                    {"action": "changed", "ls": "100001", "meter_number": "M-3",
+                     "resource_type": "Вода", "meter_type": ["Двухтарифный"]},
+                ],
+            }, None)
+
+        with patch.object(self.sync, "ENABLE_1C_INTEGRATION", True), \
+             patch.object(self.sync, "_generate_batch_id", return_value="batch-atomic"), \
+             patch.object(self.sync.client_1c, "sync_readings", side_effect=response):
+            failed = self.sync.sync_1c_job(self.now)
+
+        row = db.get_pokazaniya()[0]
+        self.assertEqual(failed, "failed")
+        self.assertEqual((row["sent_to_1c"], row["status_1c"]), (0, None))
+        self.assertEqual(db.get_schetchiki("100001"), [])
+        self.assertEqual(db.get_1c_sync_state()["pending_batch_id"], "batch-atomic")
+
+        def corrected(batch_id, readings):
+            return ({
+                "batch_id": batch_id,
+                "readings_status": [{**readings[0], "status": "accepted"}],
+                "meters_changes": [],
+            }, None)
+
+        with patch.object(self.sync, "ENABLE_1C_INTEGRATION", True), \
+             patch.object(self.sync.client_1c, "sync_readings", side_effect=corrected), \
+             patch.object(self.sync, "_notify_reading"):
+            retried = self.sync.sync_1c_job(self.now + timedelta(hours=1))
+
+        self.assertEqual(retried, "success")
+        self.assertEqual(db.get_pokazaniya()[0]["sent_to_1c"], 1)
+        self.assertIsNone(db.get_1c_sync_state()["pending_batch_id"])
+
     def test_queue_larger_than_batch_continues_on_next_hour(self) -> None:
         db.add_pokazaniya(42, "100001", "Электроэнергия", "M-1", "10")
         db.add_pokazaniya(43, "100002", "Холодная вода", "M-2", "20")

@@ -114,6 +114,69 @@ class Integration1CApiTests(unittest.TestCase):
         self.assertEqual(db.get_bot_user(42)["ls"], "100001")
         self.assertEqual(db.get_schetchiki("100001")[0]["meter_number"], "M-1")
 
+    def test_verify_success_preserves_existing_fio(self) -> None:
+        db.upsert_bot_user(42, "old-ls", "Иванов Иван", authorized_1c=False)
+        result = {"status": "ok", "message": "Готово", "meters": []}
+
+        with patch.object(client_1c, "verify_auth_code", return_value=(result, None)):
+            response = self.client.post(
+                "/api/v1/integrations/1c/auth/verify-code",
+                headers=self.headers,
+                json={"ls": "100001", "chat_id": 42, "code": "123456"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        user = db.get_bot_user(42)
+        self.assertEqual(user["ls"], "100001")
+        self.assertEqual(user["fio"], "Иванов Иван")
+        self.assertEqual(user["authorized_1c"], 1)
+
+    def test_malformed_auth_payload_is_rejected_before_any_write(self) -> None:
+        invalid_meters = (
+            None,
+            [None],
+            [{"meter_number": ["M-1"], "resource_type": "Электроэнергия",
+              "meter_type": "Однотарифный"}],
+            [{"meter_number": "M-1", "resource_type": {"name": "Электроэнергия"},
+              "meter_type": "Однотарифный"}],
+            [
+                {"meter_number": "M-1", "resource_type": "Электроэнергия",
+                 "meter_type": "Однотарифный"},
+                {"meter_number": "M-2", "resource_type": "Электроэнергия",
+                 "meter_type": ["Двухтарифный"]},
+            ],
+        )
+        for meters in invalid_meters:
+            with self.subTest(meters=meters):
+                result = {"status": "ok", "message": "Готово", "meters": meters}
+                with patch.object(
+                    client_1c, "verify_auth_code", return_value=(result, None)
+                ):
+                    response = self.client.post(
+                        "/api/v1/integrations/1c/auth/verify-code",
+                        headers=self.headers,
+                        json={"ls": "100001", "chat_id": 42, "code": "123456"},
+                    )
+
+                self.assertEqual(response.status_code, 502)
+                self.assertIsNone(db.get_bot_user(42))
+                self.assertEqual(db.get_schetchiki("100001"), [])
+
+    def test_internal_token_uses_constant_time_comparison(self) -> None:
+        with patch.object(
+            deps.secrets,
+            "compare_digest",
+            wraps=deps.secrets.compare_digest,
+        ) as compare:
+            response = self.client.post(
+                "/api/v1/integrations/1c/auth/request-code",
+                headers={"Authorization": "Bearer wrong-token"},
+                json={"ls": "100001", "chat_id": 42},
+            )
+
+        self.assertEqual(response.status_code, 401)
+        compare.assert_called_once_with("wrong-token", "internal-test-token")
+
     def test_timeout_maps_to_gateway_timeout(self) -> None:
         with patch.object(client_1c, "verify_auth_code", return_value=(None, "timeout")):
             response = self.client.post(
