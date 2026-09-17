@@ -150,7 +150,9 @@ def show_my_appeals(chat_id: int, deps: AppealDependencies) -> None:
         return
 
     items = data.get("appeals", [])
-    active = [item for item in items if item.get("status") not in ("resolved", "closed")]
+    active = [
+        item for item in items if item.get("status") not in ("resolved", "closed")
+    ]
 
     if not active:
         deps.send_message(chat_id, "✅ У вас нет активных обращений.")
@@ -187,7 +189,9 @@ def confirm_appeal(
     if error:
         deps.send_message(chat_id, f"⚠️ Не удалось подтвердить закрытие: {error}")
     else:
-        deps.send_message(chat_id, f"✅ Обращение №{data['ticket_no']} закрыто.\nСпасибо!")
+        deps.send_message(
+            chat_id, f"✅ Обращение №{data['ticket_no']} закрыто.\nСпасибо!"
+        )
     deps.send_main_menu(chat_id)
 
 
@@ -201,7 +205,9 @@ def begin_reopen(
     state["state"] = deps.reopen_comment_state
     state["reopen_appeal_id"] = int(arg)
     deps.touch(state)
-    deps.send_message(chat_id, "Опишите, пожалуйста, причину возврата обращения в работу:")
+    deps.send_message(
+        chat_id, "Опишите, пожалуйста, причину возврата обращения в работу:"
+    )
 
 
 def on_reopen_comment(

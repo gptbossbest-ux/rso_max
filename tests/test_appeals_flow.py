@@ -6,7 +6,9 @@ import bot
 from rso_bot.flows import appeals
 
 
-def _dependencies(*, saved_ls: str | None = None) -> tuple[appeals.AppealDependencies, dict]:
+def _dependencies(
+    *, saved_ls: str | None = None
+) -> tuple[appeals.AppealDependencies, dict]:
     state: dict = {"state": "menu"}
     deps = appeals.AppealDependencies(
         create_appeal=Mock(return_value=({"ticket_no": "A-42"}, None)),
@@ -111,7 +113,9 @@ def test_got_ls_preserves_block_invalid_and_valid_paths():
 
 def test_submit_success_preserves_api_contract_and_clears_flow():
     deps, state = _dependencies()
-    state.update({"state": "appeal_body", "appeal": {"category": "авария", "body": "Нет воды"}})
+    state.update(
+        {"state": "appeal_body", "appeal": {"category": "авария", "body": "Нет воды"}}
+    )
 
     appeals.submit_appeal(42, "100001", deps)
 
@@ -138,8 +142,12 @@ def test_submit_error_preserves_cleanup_logging_and_user_response():
     appeals.submit_appeal(42, "100001", deps)
 
     assert state == {"state": "menu"}
-    deps.logger.error.assert_called_once_with("create_appeal chat_id=%s err=%s", 42, "timeout")
-    deps.send_message.assert_called_once_with(42, "⚠️ Сервис временно недоступен. Попробуйте позже.")
+    deps.logger.error.assert_called_once_with(
+        "create_appeal chat_id=%s err=%s", 42, "timeout"
+    )
+    deps.send_message.assert_called_once_with(
+        42, "⚠️ Сервис временно недоступен. Попробуйте позже."
+    )
     deps.send_main_menu.assert_called_once_with(42)
 
 
@@ -151,7 +159,9 @@ def test_my_appeals_requests_ls_and_handles_service_error():
     failed, _ = _dependencies(saved_ls="100001")
     failed.list_appeals_by_ls.return_value = (None, "timeout")
     appeals.show_my_appeals(42, failed)
-    failed.send_message.assert_called_once_with(42, "⚠️ Сервис временно недоступен. Попробуйте позже.")
+    failed.send_message.assert_called_once_with(
+        42, "⚠️ Сервис временно недоступен. Попробуйте позже."
+    )
     failed.send_main_menu.assert_called_once_with(42)
 
 
@@ -160,8 +170,18 @@ def test_my_appeals_filters_closed_items_and_formats_statuses():
     deps.list_appeals_by_ls.return_value = (
         {
             "appeals": [
-                {"ticket_no": "N-1", "status": "new", "body": "Коротко", "created_at": "2026-09-17T10:11:12"},
-                {"ticket_no": "N-2", "status": "in_work", "body": "x" * 61, "created_at": None},
+                {
+                    "ticket_no": "N-1",
+                    "status": "new",
+                    "body": "Коротко",
+                    "created_at": "2026-09-17T10:11:12",
+                },
+                {
+                    "ticket_no": "N-2",
+                    "status": "in_work",
+                    "body": "x" * 61,
+                    "created_at": None,
+                },
                 {"ticket_no": "N-3", "status": "resolved", "body": "Скрыто"},
             ]
         },
@@ -189,13 +209,17 @@ def test_confirm_success_and_error_preserve_responses():
     success, state = _dependencies()
     appeals.confirm_appeal(42, state, "7", success)
     success.confirm_appeal.assert_called_once_with(7, "max", 42)
-    success.send_message.assert_called_once_with(42, "✅ Обращение №A-42 закрыто.\nСпасибо!")
+    success.send_message.assert_called_once_with(
+        42, "✅ Обращение №A-42 закрыто.\nСпасибо!"
+    )
     success.send_main_menu.assert_called_once_with(42)
 
     failed, state = _dependencies()
     failed.confirm_appeal.return_value = (None, "conflict")
     appeals.confirm_appeal(42, state, "7", failed)
-    failed.send_message.assert_called_once_with(42, "⚠️ Не удалось подтвердить закрытие: conflict")
+    failed.send_message.assert_called_once_with(
+        42, "⚠️ Не удалось подтвердить закрытие: conflict"
+    )
 
 
 def test_begin_reopen_and_comment_success_preserve_state_and_text():
@@ -224,7 +248,9 @@ def test_reopen_error_and_missing_context_still_return_to_menu():
     state["reopen_appeal_id"] = 7
     failed.reopen_appeal.return_value = (None, "timeout")
     appeals.on_reopen_comment(42, state, "Причина", failed)
-    failed.send_message.assert_called_once_with(42, "⚠️ Не удалось вернуть обращение: timeout")
+    failed.send_message.assert_called_once_with(
+        42, "⚠️ Не удалось вернуть обращение: timeout"
+    )
     assert state == {"state": "menu"}
 
     missing, state = _dependencies()
@@ -253,14 +279,22 @@ def test_bot_wrappers_delegate_and_keep_runtime_patch_points(monkeypatch):
 
 def test_all_bot_appeal_wrappers_delegate(monkeypatch):
     names_and_calls = [
-        ("set_category", lambda: bot._appeal_set_category(42, "авария"), (42, "авария")),
+        (
+            "set_category",
+            lambda: bot._appeal_set_category(42, "авария"),
+            (42, "авария"),
+        ),
         ("got_body", lambda: bot._appeal_got_body(42, "Текст"), (42, "Текст")),
         ("got_ls", lambda: bot._appeal_got_ls(42, "100001"), (42, "100001")),
         ("submit_appeal", lambda: bot._submit_appeal(42, "100001"), (42, "100001")),
         ("show_my_appeals", lambda: bot._show_my_appeals(42), (42,)),
         ("confirm_appeal", lambda: bot._cb_confirm_appeal(42, {}, "7"), (42, {}, "7")),
         ("begin_reopen", lambda: bot._cb_reopen_appeal(42, {}, "7"), (42, {}, "7")),
-        ("on_reopen_comment", lambda: bot._on_reopen_comment(42, {}, "Причина"), (42, {}, "Причина")),
+        (
+            "on_reopen_comment",
+            lambda: bot._on_reopen_comment(42, {}, "Причина"),
+            (42, {}, "Причина"),
+        ),
     ]
     for name, call, expected in names_and_calls:
         delegated = Mock()
