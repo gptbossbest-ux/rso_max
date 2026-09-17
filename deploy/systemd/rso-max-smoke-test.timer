@@ -1,0 +1,12 @@
+[Unit]
+Description=Run RSO MAX test smoke checks every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Persistent=true
+Unit=rso-max-smoke-test.service
+
+[Install]
+WantedBy=timers.target

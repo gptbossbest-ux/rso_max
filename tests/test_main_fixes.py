@@ -278,6 +278,153 @@ def test_deploy_stops_bot_before_resetting_heartbeat():
     assert "|| true" not in script[stop_at:start_at]
 
 
+def test_smoke_systemd_files_are_read_only_and_test_scoped():
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    with open(os.path.join(root, "scripts", "smoke.sh"), encoding="utf-8") as source:
+        smoke = source.read()
+    with open(
+        os.path.join(root, "deploy", "systemd", "rso-max-smoke-test.service"),
+        encoding="utf-8",
+    ) as source:
+        service = source.read()
+    with open(
+        os.path.join(root, "deploy", "systemd", "rso-max-smoke-test.timer"),
+        encoding="utf-8",
+    ) as source:
+        timer = source.read()
+
+    assert "file:/app/data/database.sqlite?mode=ro" in smoke
+    assert "PRAGMA quick_check" in smoke
+    assert "http://127.0.0.1:${web_port}/healthz" in smoke
+    assert "SMOKE_RESTART_INTERVAL_SECONDS:-5" in smoke
+    assert "threshold_percent=15" in smoke
+    assert all(forbidden not in smoke for forbidden in ("/messages", "/updates", "/me"))
+    assert all(
+        forbidden not in smoke
+        for forbidden in ("rso-max-prod", "runtime/prod", 'web_port="5000"')
+    )
+    assert 'if [[ "$stack" != "test" ]]' in smoke
+    assert "WorkingDirectory=/srv/bot-sandbox/current/test" in service
+    assert "User=botadmin" in service and "Group=botadmin" in service
+    assert "/usr/bin/timeout" in service and "/usr/bin/flock" in service
+    assert "/usr/local/libexec/rso-max-smoke test" in service
+    assert "NoNewPrivileges=true" in service
+    assert "PrivateTmp=true" in service and "ProtectSystem=strict" in service
+    assert "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6" in service
+    assert "OnUnitActiveSec=5min" in timer
+    assert "RandomizedDelaySec=" in timer
+
+
+def test_smoke_installer_validates_release_and_installs_root_owned_copy():
+    installer_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "scripts", "install-smoke-systemd.sh")
+    )
+    with open(installer_path, encoding="utf-8") as source:
+        installer = source.read()
+
+    assert "realpath -e" in installer
+    assert "/srv/bot-sandbox/releases/*" in installer
+    assert '"$release_dir/compose.yaml"' in installer
+    assert "/usr/local/libexec/rso-max-smoke" in installer
+    assert "-o root -g root" in installer
+    assert "mv -Tf" in installer
+    assert "/srv/bot-sandbox/current/test" in installer
+    assert "sudo " not in installer
+
+    with open(os.path.join(os.path.dirname(installer_path), "..", "DEPLOYMENT.md"), encoding="utf-8") as source:
+        deployment = source.read()
+    assert "/srv/bot-sandbox/releases/rso_max-2973d64" in deployment
+    assert "smoke.sh prod" not in deployment
+
+
+def test_smoke_script_with_fake_read_only_commands(tmp_path):
+    if os.name == "nt":
+        pytest.skip("behavioral smoke command test runs in Linux CI")
+
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    smoke = os.path.join(root, "scripts", "smoke.sh")
+    work = tmp_path / "release"
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir()
+    (work / "runtime" / "test" / "data").mkdir(parents=True)
+    (work / "compose.yaml").write_text("services: {}\n", encoding="utf-8")
+    (work / ".env.test").write_text("TOKEN=\n", encoding="utf-8")
+    (work / ".env.test.runtime").write_text("", encoding="utf-8")
+    (work / "runtime" / "test" / "data" / "bot-heartbeat").write_text(
+        "healthy\n", encoding="ascii"
+    )
+
+    commands = {
+        "docker": """#!/usr/bin/env bash
+echo "$*" >> "$FAKE_COMMAND_LOG"
+if [[ "$1" == "compose" ]]; then
+  service="${@: -1}"
+  echo "cid-$service"
+elif [[ "$1" == "inspect" ]]; then
+  cid="${@: -1}"
+  service="${cid#cid-}"
+  if [[ "$*" == *".State.Status"* ]]; then
+    health="healthy"
+    [[ "$service" == "bot" && "${FAKE_BOT_HEALTH:-}" == "unhealthy" ]] && health="unhealthy"
+    echo "running|$health|0|rso-max-test|$service|sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  elif [[ "$*" == *".RestartCount"* ]]; then
+    echo "0"
+  else
+    echo "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  fi
+elif [[ "$1" == "exec" ]]; then
+  echo "ok"
+fi
+""",
+        "curl": """#!/usr/bin/env bash
+echo '{"status":"ok"}'
+""",
+        "df": """#!/usr/bin/env bash
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\n'
+printf 'fake 100 80 20 80%% /\\n'
+""",
+        "git": """#!/usr/bin/env bash
+echo 2973d64abcde
+""",
+    }
+    for name, body in commands.items():
+        path = fakebin / name
+        path.write_text(body, encoding="utf-8")
+        os.chmod(path, 0o755)
+
+    command_log = tmp_path / "commands.log"
+    env = os.environ.copy()
+    env.update(
+        PATH=f"{fakebin}{os.pathsep}{env['PATH']}",
+        SMOKE_WORKING_DIRECTORY=str(work),
+        SMOKE_RESTART_INTERVAL_SECONDS="0",
+        FAKE_COMMAND_LOG=str(command_log),
+    )
+    success = subprocess.run(
+        ["bash", smoke, "test"],
+        cwd=work,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert success.returncode == 0, success.stdout + success.stderr
+    assert "SUMMARY stack=test result=PASS failures=0" in success.stdout
+    assert "rso-max-prod" not in command_log.read_text(encoding="utf-8")
+
+    env["FAKE_BOT_HEALTH"] = "unhealthy"
+    failure = subprocess.run(
+        ["bash", smoke, "test"],
+        cwd=work,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert failure.returncode != 0
+    assert "FAIL stack=test check=container service=bot reason=not-healthy" in failure.stdout
+
+
 def test_internal_api_missing_token_is_closed(monkeypatch):
     import api.deps as deps
 
