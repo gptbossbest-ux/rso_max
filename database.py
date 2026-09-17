@@ -24,6 +24,7 @@ import os
 import sqlite3
 from datetime import datetime, timezone, timedelta
 from logging.handlers import RotatingFileHandler
+from zoneinfo import ZoneInfo
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from config import (
@@ -2191,7 +2192,21 @@ def get_appointment(appointment_id: int) -> sqlite3.Row | None:
 
 # -- Напоминания (для APScheduler) --------------------------------------------
 
-def get_appointments_for_reminder_24h() -> list[sqlite3.Row]:
+MOSCOW_TIMEZONE = ZoneInfo("Europe/Moscow")
+
+
+def _as_moscow_time(current_time: datetime | None = None) -> datetime:
+    """Return an aware Moscow datetime while accepting legacy no-arg calls."""
+    if current_time is None:
+        return datetime.now(MOSCOW_TIMEZONE)
+    if current_time.tzinfo is None:
+        return current_time.replace(tzinfo=MOSCOW_TIMEZONE)
+    return current_time.astimezone(MOSCOW_TIMEZONE)
+
+
+def get_appointments_for_reminder_24h(
+    current_time: datetime | None = None,
+) -> list[sqlite3.Row]:
     """
     Возвращает активные записи для напоминания за 24ч (REQ-АВТ-07-06).
 
@@ -2203,7 +2218,7 @@ def get_appointments_for_reminder_24h() -> list[sqlite3.Row]:
         записавшийся на завтра прямо сейчас, получил бы "напоминание за 24ч"
         почти сразу после подтверждения записи — бессмысленно и раздражает.
     """
-    now = datetime.now()
+    now = _as_moscow_time(current_time)
     window_from = (now + timedelta(hours=23)).strftime("%Y-%m-%d %H:%M")
     window_to   = (now + timedelta(hours=25)).strftime("%Y-%m-%d %H:%M")
 
@@ -2220,22 +2235,26 @@ def get_appointments_for_reminder_24h() -> list[sqlite3.Row]:
     return rows
 
 
-def get_appointments_for_reminder_day() -> list[sqlite3.Row]:
+def get_appointments_for_reminder_day(
+    current_time: datetime | None = None,
+) -> list[sqlite3.Row]:
     """
     Возвращает активные записи для напоминания в день приёма в 09:00 (REQ-АВТ-07-07).
-    Условие: slot_date = сегодня И reminded_day=0.
+    Условие: slot_date = сегодня, слот ещё не наступил И reminded_day=0.
     Задача APScheduler запускается ровно в 09:00 по московскому времени.
-    Для приёмов раньше 09:00 — отдельная проверка в задаче (REQ-АВТ-07-09).
+    Прошедшие и текущие слоты исключаются самим запросом (REQ-АВТ-07-09).
     """
-    tz = timezone(timedelta(hours=TIMEZONE_OFFSET))
-    today = datetime.now(tz).strftime("%Y-%m-%d")
+    now = _as_moscow_time(current_time)
+    today = now.strftime("%Y-%m-%d")
+    current_slot = now.strftime("%Y-%m-%d %H:%M")
 
     conn = get_conn()
     rows = conn.execute(
         """SELECT a.*, b.name AS branch_name, b.address AS branch_address
            FROM appointments a JOIN branches b ON b.id = a.branch_id
-           WHERE a.status='active' AND a.reminded_day=0 AND a.slot_date=?""",
-        (today,)
+           WHERE a.status='active' AND a.reminded_day=0 AND a.slot_date=?
+             AND (a.slot_date || ' ' || a.slot_time) > ?""",
+        (today, current_slot)
     ).fetchall()
     conn.close()
     return rows
