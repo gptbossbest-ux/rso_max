@@ -14,7 +14,8 @@ Appointment = Mapping[str, Any]
 MOSCOW_TIMEZONE = ZoneInfo("Europe/Moscow")
 
 
-def _moscow_now() -> datetime:
+def moscow_now() -> datetime:
+    """Return the current timezone-aware Moscow time."""
     return datetime.now(MOSCOW_TIMEZONE)
 
 
@@ -27,12 +28,11 @@ def _default_retry_backoff(failed_attempt: int) -> float:
 class AppointmentReminderDependencies:
     """Database and delivery operations required by reminder jobs."""
 
-    get_appointments_for_reminder_24h: Callable[..., Sequence[Appointment]]
-    get_appointments_for_reminder_day: Callable[..., Sequence[Appointment]]
+    get_appointments_for_reminder_24h: Callable[[], Sequence[Appointment]]
+    get_appointments_for_reminder_day: Callable[[], Sequence[Appointment]]
     send_message: Callable[[int, str], bool]
     mark_reminded: Callable[[int, str], None]
     logger: logging.Logger
-    now: Callable[[], datetime] = _moscow_now
     max_delivery_attempts: int = 3
     retry_backoff: Callable[[int], float] = _default_retry_backoff
     sleep: Callable[[float], None] = time.sleep
@@ -97,15 +97,18 @@ def _process_appointment(
     reminder_type: str,
     reminder_label: str,
 ) -> None:
-    appointment_id = appointment.get("id", "unknown")
-    chat_id = appointment.get("chat_id", "unknown")
     try:
+        # sqlite3.Row deliberately implements subscription, but not Mapping.get().
+        # Read all required identifiers inside the per-record boundary so a broken
+        # row can never abort the rest of the batch.
+        appointment_id = appointment["id"]
+        chat_id = appointment["chat_id"]
         message = format_appointment_reminder(appointment, when_label)
         delivered = _send_with_retry(deps, appointment, message, reminder_label)
         if not delivered:
             return
         try:
-            deps.mark_reminded(appointment["id"], reminder_type)
+            deps.mark_reminded(appointment_id, reminder_type)
         except Exception as exc:  # noqa: BLE001 - isolate DB write per record.
             # Delivery has already happened. Retrying this write in-process risks
             # hiding an uncertain commit. Leaving it unmarked can duplicate the
@@ -119,6 +122,8 @@ def _process_appointment(
                 exc,
             )
     except Exception as exc:  # noqa: BLE001 - malformed record must not stop batch.
+        appointment_id = _safe_record_value(appointment, "id")
+        chat_id = _safe_record_value(appointment, "chat_id")
         deps.logger.error(
             "%s: ошибка обработки записи: appointment_id=%s chat_id=%s: %s",
             reminder_label,
@@ -128,10 +133,18 @@ def _process_appointment(
         )
 
 
+def _safe_record_value(appointment: object, key: str) -> object:
+    """Read a diagnostic field without trusting a malformed DB record."""
+    try:
+        return appointment[key]  # type: ignore[index]
+    except Exception:  # noqa: BLE001 - diagnostics must never break batch isolation.
+        return "unknown"
+
+
 def task_appointment_reminder_24h(deps: AppointmentReminderDependencies) -> None:
     """Send reminders for appointments in the existing 23–25 hour DB window."""
     try:
-        appointments = deps.get_appointments_for_reminder_24h(deps.now())
+        appointments = deps.get_appointments_for_reminder_24h()
     except Exception as exc:  # noqa: BLE001 - scheduler boundary must contain DB failures.
         deps.logger.error(
             "APScheduler appointment_reminder_24h: ошибка чтения БД: %s", exc
@@ -157,7 +170,7 @@ def task_appointment_reminder_24h(deps: AppointmentReminderDependencies) -> None
 def task_appointment_reminder_day(deps: AppointmentReminderDependencies) -> None:
     """Send reminders for appointments due today."""
     try:
-        appointments = deps.get_appointments_for_reminder_day(deps.now())
+        appointments = deps.get_appointments_for_reminder_day()
     except Exception as exc:  # noqa: BLE001 - scheduler boundary must contain DB failures.
         deps.logger.error(
             "APScheduler appointment_reminder_day: ошибка чтения БД: %s", exc

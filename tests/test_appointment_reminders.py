@@ -37,7 +37,6 @@ def _dependencies(
         send_message=Mock(return_value=True),
         mark_reminded=Mock(),
         logger=Mock(),
-        now=Mock(return_value=FIXED_NOW),
         retry_backoff=Mock(side_effect=lambda failed_attempt: float(failed_attempt)),
         sleep=Mock(),
     )
@@ -85,7 +84,7 @@ def test_reminder_tasks_send_mark_and_log_each_due_record(
 
     task(deps)
 
-    getattr(deps, query_name).assert_called_once_with(FIXED_NOW)
+    getattr(deps, query_name).assert_called_once_with()
     assert deps.send_message.call_args_list == [
         call(
             record["chat_id"],
@@ -164,6 +163,18 @@ def test_all_false_stops_at_max_attempts_and_does_not_mark():
     assert deps.sleep.call_args_list == [call(1.0), call(2.0)]
 
 
+def test_custom_attempt_limit_and_negative_backoff_are_honoured():
+    deps = _dependencies()
+    deps.send_message.return_value = False
+    object.__setattr__(deps, "max_delivery_attempts", 2)
+    deps.retry_backoff.side_effect = None
+    deps.retry_backoff.return_value = -10
+    appointment_reminders.task_appointment_reminder_day(deps)
+    assert deps.send_message.call_count == 2
+    deps.sleep.assert_called_once_with(0.0)
+    deps.mark_reminded.assert_not_called()
+
+
 def test_send_exception_is_retried_then_success_is_marked():
     deps = _dependencies()
     deps.send_message.side_effect = [RuntimeError("temporary failure"), True]
@@ -211,6 +222,49 @@ def test_legacy_bot_wrapper_still_accepts_no_arguments(monkeypatch):
     )
 
 
+def test_bot_adapter_injects_explicit_moscow_now_into_database(monkeypatch):
+    query = Mock(return_value=[])
+    monkeypatch.setattr(bot.db, "get_appointments_for_reminder_24h", query)
+    deps = bot._appointment_reminder_dependencies(now=lambda: FIXED_NOW)
+    appointment_reminders.task_appointment_reminder_24h(deps)
+    query.assert_called_once_with(FIXED_NOW)
+
+
+def test_real_sqlite_row_is_processed_and_marked():
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute(
+        """CREATE TABLE due (
+            id INTEGER, chat_id INTEGER, branch_name TEXT, branch_address TEXT,
+            slot_date TEXT, slot_time TEXT, theme TEXT
+        )"""
+    )
+    connection.execute(
+        "INSERT INTO due VALUES (7, 49, 'Офис', 'Адрес', '2026-09-18', '12:30', NULL)"
+    )
+    row = connection.execute("SELECT * FROM due").fetchone()
+    deps = _dependencies([])
+    deps.get_appointments_for_reminder_24h.return_value = [row]
+    appointment_reminders.task_appointment_reminder_24h(deps)
+    deps.send_message.assert_called_once()
+    deps.mark_reminded.assert_called_once_with(7, "24h")
+    connection.close()
+
+
+def test_malformed_row_does_not_block_later_sqlite_row():
+    class BrokenRow:
+        def __getitem__(self, key):
+            raise RuntimeError(f"broken {key}")
+
+    valid = _appointment(8)
+    deps = _dependencies([])
+    deps.get_appointments_for_reminder_day.return_value = [BrokenRow(), valid]
+    appointment_reminders.task_appointment_reminder_day(deps)
+    deps.send_message.assert_called_once()
+    deps.mark_reminded.assert_called_once_with(8, "day")
+    assert deps.logger.error.call_args_list[0].args[2:4] == ("unknown", "unknown")
+
+
 def test_database_24h_window_converts_explicit_now_to_moscow(monkeypatch):
     cursor = Mock()
     cursor.fetchall.return_value = []
@@ -223,6 +277,52 @@ def test_database_24h_window_converts_explicit_now_to_moscow(monkeypatch):
     assert "BETWEEN ? AND ?" in query
     assert parameters == ("2026-09-18 11:30", "2026-09-18 13:30")
     connection.close.assert_called_once_with()
+
+
+def test_naive_database_now_is_interpreted_as_moscow_wall_time():
+    naive = datetime.fromisoformat("2026-09-17 12:30")
+    converted = db._as_moscow_time(naive)
+    assert converted.replace(tzinfo=None) == naive
+    assert converted.tzinfo == MOSCOW
+
+
+def test_database_24h_window_includes_boundaries_and_applies_created_cutoff(
+    monkeypatch,
+):
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.executescript(
+        """
+        CREATE TABLE branches (id INTEGER PRIMARY KEY, name TEXT, address TEXT);
+        CREATE TABLE appointments (
+            id INTEGER PRIMARY KEY, branch_id INTEGER, chat_id INTEGER,
+            status TEXT, reminded_24h INTEGER, slot_date TEXT, slot_time TEXT,
+            theme TEXT, created_at TEXT
+        );
+        INSERT INTO branches VALUES (1, 'Офис', 'Адрес');
+        INSERT INTO appointments VALUES
+            (1, 1, 101, 'active', 0, '2026-09-18', '11:30', NULL, '2026-09-17 11:30'),
+            (2, 1, 102, 'active', 0, '2026-09-18', '13:30', NULL, '2026-09-17 13:30'),
+            (3, 1, 103, 'active', 0, '2026-09-18', '11:29', NULL, '2026-09-17 10:00'),
+            (4, 1, 104, 'active', 0, '2026-09-18', '13:31', NULL, '2026-09-17 10:00'),
+            (5, 1, 105, 'active', 0, '2026-09-18', '12:30', NULL, '2026-09-17 12:31'),
+            (6, 1, 106, 'cancelled', 0, '2026-09-18', '12:30', NULL, '2026-09-17 10:00'),
+            (7, 1, 107, 'active', 1, '2026-09-18', '12:30', NULL, '2026-09-17 10:00');
+        """
+    )
+    connection.commit()
+
+    class ConnectionWithoutClose:
+        def execute(self, *args, **kwargs):
+            return connection.execute(*args, **kwargs)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(db, "get_conn", ConnectionWithoutClose)
+    rows = db.get_appointments_for_reminder_24h(FIXED_NOW)
+    assert [row["id"] for row in rows] == [1, 2]
+    connection.close()
 
 
 def test_database_day_query_excludes_past_and_equal_slots(monkeypatch):
