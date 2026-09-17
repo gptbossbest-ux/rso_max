@@ -106,6 +106,13 @@
     </div>
 </div>
 
+{% if appeal.reopen_reason %}
+<div class="card">
+    <div class="card-header"><strong>Причина возврата клиентом</strong></div>
+    <div class="card-body"><div class="appeal-body">{{ appeal.reopen_reason }}</div></div>
+</div>
+{% endif %}
+
 <div class="card">
     <div class="card-header"><strong>SLA</strong></div>
     <div class="card-body">

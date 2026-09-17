@@ -37,18 +37,22 @@ import os
 from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 
+from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import (
     API_HOST,
     API_PORT,
+    ENABLE_1C_INTEGRATION,
+    INTEGRATION_1C_SYNC_RETRY_HOURS,
     LOG_BACKUP_COUNT,
     LOG_FILE,
     LOG_LEVEL,
     LOG_MAX_BYTES,
 )
 from database import init_db
+from sync_1c import sync_1c_job
 
 # ── Логгер ────────────────────────────────────────────────────────────────────
 
@@ -97,7 +101,23 @@ async def lifespan(app: FastAPI):
     log.info("FastAPI запускается на %s:%s", API_HOST, API_PORT)
     init_db()
     log.info("БД инициализирована")
+    scheduler = None
+    if ENABLE_1C_INTEGRATION:
+        scheduler = BackgroundScheduler(timezone="Europe/Moscow")
+        scheduler.add_job(
+            sync_1c_job,
+            trigger="interval",
+            hours=INTEGRATION_1C_SYNC_RETRY_HOURS,
+            id="sync_1c",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1800,
+        )
+        scheduler.start()
+        log.info("Планировщик синхронизации 1С запущен")
     yield
+    if scheduler is not None:
+        scheduler.shutdown(wait=False)
     log.info("FastAPI завершает работу")
 
 
@@ -129,13 +149,14 @@ app.add_middleware(
 # ── Роутеры ───────────────────────────────────────────────────────────────────
 
 from api.routers.appeals import router as appeals_router  # noqa: E402
+from api.routers.house_chats import router as house_chats_router  # noqa: E402
+from api.routers.integration_1c import router as integration_1c_router  # noqa: E402
 from api.routers.scripts import router as scripts_router  # noqa: E402
 
 app.include_router(appeals_router, prefix="/api/v1")
+app.include_router(integration_1c_router, prefix="/api/v1")
 app.include_router(scripts_router, prefix="/api/v1")
-
-# TODO Этап 7:  from api.routers.house_chats  import router as house_chats_router
-#               app.include_router(house_chats_router, prefix="/api/v1")
+app.include_router(house_chats_router, prefix="/api/v1")
 # TODO Этап 8:  from api.routers.broadcast    import router as broadcast_router
 #               app.include_router(broadcast_router, prefix="/api/v1")
 

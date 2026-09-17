@@ -32,7 +32,7 @@ import logging
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 import database as db
 from api.deps import verify_token
@@ -40,7 +40,7 @@ from config import TOKEN, API
 
 log = logging.getLogger("rso.api.house_chats")
 
-router = APIRouter(tags=["house_chats"])
+router = APIRouter(tags=["house_chats"], dependencies=[Depends(verify_token)])
 
 _MAX_HEADERS = {"Authorization": TOKEN}
 _MAX_TIMEOUT = 5
@@ -71,6 +71,22 @@ class ScenarioCreate(BaseModel):
     response_text: str = Field(..., min_length=1)
     suggest_appeal: bool = False
 
+    @field_validator("title", "response_text")
+    @classmethod
+    def normalize_required_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Поле не может быть пустым")
+        return value
+
+    @field_validator("keywords")
+    @classmethod
+    def normalize_keywords(cls, value: list[str]) -> list[str]:
+        normalized = [keyword.strip() for keyword in value if keyword.strip()]
+        if not normalized:
+            raise ValueError("Нужно указать хотя бы одно ключевое слово")
+        return normalized
+
 
 class ScenarioUpdate(BaseModel):
     title: str = Field(..., min_length=1, max_length=255)
@@ -78,6 +94,16 @@ class ScenarioUpdate(BaseModel):
     response_text: str = Field(..., min_length=1)
     suggest_appeal: bool = False
     is_active: bool = True
+
+    @field_validator("title", "response_text")
+    @classmethod
+    def normalize_required_text(cls, value: str) -> str:
+        return ScenarioCreate.normalize_required_text(value)
+
+    @field_validator("keywords")
+    @classmethod
+    def normalize_keywords(cls, value: list[str]) -> list[str]:
+        return ScenarioCreate.normalize_keywords(value)
 
 
 # ── Вспомогательные функции ───────────────────────────────────────────────────
@@ -241,7 +267,10 @@ def link_scenario(house_chat_id: int, scenario_id: int):
     conn.close()
     if not sc:
         raise HTTPException(status_code=404, detail="Сценарий не найден")
-    db.link_scenario_to_chat(house_chat_id, scenario_id)
+    db.link_scenario_to_chat(
+        scenario_id=scenario_id,
+        house_chat_id=house_chat_id,
+    )
     return {"ok": True, "house_chat_id": house_chat_id, "scenario_id": scenario_id}
 
 
@@ -252,7 +281,10 @@ def link_scenario(house_chat_id: int, scenario_id: int):
 def unlink_scenario(house_chat_id: int, scenario_id: int):
     """Отвязать сценарий мониторинга от домового чата."""
     _get_chat_or_404(house_chat_id)
-    db.unlink_scenario_from_chat(house_chat_id, scenario_id)
+    db.unlink_scenario_from_chat(
+        scenario_id=scenario_id,
+        house_chat_id=house_chat_id,
+    )
     return {"ok": True}
 
 
@@ -345,13 +377,10 @@ def list_scenarios():
 @router.post("/scenarios", status_code=201, dependencies=[Depends(verify_token)])
 def create_scenario(body: ScenarioCreate):
     """Создать сценарий мониторинга. is_active=1 по умолчанию."""
-    keywords_json = json.dumps(
-        [kw.strip() for kw in body.keywords if kw.strip()],
-        ensure_ascii=False,
-    )
+    keywords = [kw.strip() for kw in body.keywords if kw.strip()]
     row_id = db.create_scenario(
         title=body.title,
-        keywords_json=keywords_json,
+        keywords=keywords,
         response_text=body.response_text,
         suggest_appeal=body.suggest_appeal,
     )
@@ -365,14 +394,11 @@ def update_scenario(scenario_id: int, body: ScenarioUpdate):
     if row is None:
         raise HTTPException(status_code=404, detail="Сценарий не найден")
 
-    keywords_json = json.dumps(
-        [kw.strip() for kw in body.keywords if kw.strip()],
-        ensure_ascii=False,
-    )
+    keywords = [kw.strip() for kw in body.keywords if kw.strip()]
     db.update_scenario(
         scenario_id=scenario_id,
         title=body.title,
-        keywords_json=keywords_json,
+        keywords=keywords,
         response_text=body.response_text,
         suggest_appeal=body.suggest_appeal,
         is_active=body.is_active,

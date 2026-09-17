@@ -21,6 +21,33 @@ Priority = Literal["normal", "high"]
 Status   = Literal["new", "in_work", "pending_confirmation", "resolved", "closed"]
 
 
+# ── Интеграция с 1С ──────────────────────────────────────────────────────────
+
+class Integration1CAuthRequest(BaseModel):
+    ls: str = Field(..., min_length=1, max_length=64)
+    chat_id: int
+
+    @field_validator("ls")
+    @classmethod
+    def normalize_ls(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("ls не может быть пустым")
+        return value
+
+
+class Integration1CVerifyRequest(Integration1CAuthRequest):
+    code: str = Field(..., min_length=1, max_length=32)
+
+    @field_validator("code")
+    @classmethod
+    def normalize_code(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("code не может быть пустым")
+        return value
+
+
 # ── POST /api/v1/appeals ──────────────────────────────────────────────────────
 
 class AppealCreate(BaseModel):
@@ -91,6 +118,22 @@ class AppealStatusUpdate(BaseModel):
         description="ID оператора из Flask-сессии. "
                     "Null для внутренних системных вызовов.",
     )
+    reason: str | None = Field(
+        None,
+        min_length=1,
+        max_length=2000,
+        description="Причина возврата обращения клиентом в работу.",
+    )
+
+    @field_validator("reason")
+    @classmethod
+    def reason_not_blank(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("reason не может быть пустым")
+        return value
 
 
 class AppealStatusUpdateOut(BaseModel):
