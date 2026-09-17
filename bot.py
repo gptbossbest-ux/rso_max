@@ -44,6 +44,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 import client_api
 import database as db
+from rso_bot import max_transport
 from config import (
     API,
     AUTH_BLOCK_MINUTES,
@@ -196,25 +197,18 @@ def cleanup_user_states(
 # ── Низкоуровневые функции отправки ──────────────────────────────────────────
 
 def _send_raw(chat_id: int, body: dict) -> bool:
-    try:
-        r = httpx.post(
-            f"{API}/messages",
-            headers=_MAX_HEADERS,
-            params={"chat_id": chat_id},
-            json=body,
-            timeout=5,
-        )
-        if r.status_code != 200:
-            log.warning("MAX API %s для chat_id=%s", r.status_code, chat_id)
-            return False
-        return True
-    except Exception as exc:
-        log.error("_send_raw chat_id=%s: %s", chat_id, exc)
-        return False
+    return max_transport.send_raw(
+        API,
+        _MAX_HEADERS,
+        chat_id,
+        body,
+        http_client=httpx,
+        logger=log,
+    )
 
 
 def send_message(chat_id: int, text: str) -> bool:
-    return _send_raw(chat_id, {"text": text})
+    return max_transport.send_message(chat_id, text, sender=_send_raw)
 
 
 def send_buttons(
@@ -227,13 +221,7 @@ def send_buttons(
       [  [btn1, btn2],   ← ряд 1
          [btn3],         ← ряд 2  ]
     """
-    return _send_raw(chat_id, {
-        "text": text,
-        "attachments": [{
-            "type": "inline_keyboard",
-            "payload": {"buttons": buttons},
-        }],
-    })
+    return max_transport.send_buttons(chat_id, text, buttons, sender=_send_raw)
 
 
 def _cb(label: str, payload: str) -> dict:
@@ -973,12 +961,13 @@ def _send_pdf(chat_id: int, ls: str) -> None:
 
 def _ack_callback(callback_id: str) -> None:
     """Убирает «часики» на нажатой кнопке. Ошибка не критична."""
-    try:
-        httpx.post(f"{API}/answers", headers=_MAX_HEADERS,
-                   json={"callback_id": callback_id, "notification": ""},
-                   timeout=3)
-    except Exception as exc:
-        log.debug("_ack_callback %s: %s", callback_id, exc)
+    max_transport.ack_callback(
+        API,
+        _MAX_HEADERS,
+        callback_id,
+        http_client=httpx,
+        logger=log,
+    )
 
 
 # -- Обработчики callback с аргументом (payload вида "префикс:значение") -------
