@@ -109,6 +109,46 @@ curl --fail http://127.0.0.1:5000/healthz
 Обязательный порядок нового релиза — `test`, приёмка и только затем `prod` того
 же SHA — описан в разделе [«Обновление только из `main`»](#обновление-только-из-main-сначала-test-затем-prod) ниже.
 
+### Read-only smoke test
+
+`scripts/smoke.sh test` только читает состояние test-контура. Другие аргументы
+отклоняются. Скрипт не отправляет сообщения в MAX, не вызывает 1С и не выводит
+окружение. Он проверяет:
+
+- принадлежность контейнеров Compose-проекту, running/healthy и restart count;
+- loopback `/healthz` с ограниченным timeout и свежесть heartbeat бота;
+- SQLite `PRAGMA quick_check` через URI `mode=ro`;
+- не менее 15% свободного места;
+- commit и безопасный сокращённый image ID без конфигурации и секретов.
+
+Ручной запуск из активного release:
+
+```bash
+./scripts/smoke.sh test
+```
+
+Для test-контура предусмотрен systemd timer раз в пять минут. Installer должен
+запускаться от root и принимает абсолютный путь существующего release строго
+внутри `/srv/bot-sandbox/releases`. Например, для текущего release:
+
+```bash
+sudo ./scripts/install-smoke-systemd.sh \
+  /srv/bot-sandbox/releases/rso_max-2973d64
+```
+
+Installer проверяет `compose.yaml`, атомарно обновляет стабильную ссылку
+`/srv/bot-sandbox/current/test`, копирует smoke в root-owned
+`/usr/local/libexec/rso-max-smoke` и устанавливает только test unit/timer.
+Smoke запускается от `botadmin` с `timeout`, `flock` и systemd hardening.
+Результаты доступны без вывода секретов:
+
+```bash
+systemctl status rso-max-smoke-test.timer
+journalctl -u rso-max-smoke-test.service --since today
+```
+
+Prod-контур намеренно не входит в область этого smoke-monitoring.
+
 ## Резервная копия SQLite
 
 ```bash
