@@ -47,6 +47,8 @@ import database as db
 from rso_bot import max_transport, scheduler as bot_scheduler
 from rso_bot.flows import appeals, appointments, faq
 from rso_bot.jobs import appointment_reminders
+from rso_bot.session import SessionManager
+from rso_bot import states as session_states
 from config import (
     API,
     AUTH_BLOCK_MINUTES,
@@ -97,6 +99,11 @@ def _setup_logger() -> logging.Logger:
 
 log = _setup_logger()
 
+# Compatibility exports used by handlers and existing integrations.
+S = session_states.S
+_FLOW_KEYS = session_states.FLOW_KEYS
+_METER_INPUT_KEYS = session_states.METER_INPUT_KEYS
+
 # ── Константы ─────────────────────────────────────────────────────────────────
 
 _MAX_HEADERS = {"Authorization": TOKEN}  # без префикса Bearer — см. dev.max.ru/docs-api (обновление платформы)
@@ -109,37 +116,6 @@ CATEGORIES: dict[str, str] = {
     "📉 Качество услуг":         "качество",
     "💬 Прочее":                  "прочее",
 }
-
-# Состояния сессии
-class S:
-    MENU    = "menu"
-
-    # Флоу обращения
-    APPEAL_CATEGORY = "appeal_category"
-    APPEAL_BODY     = "appeal_body"
-    AWAIT_LS        = "await_ls"        # универсальное ожидание ЛС (см. _AFTER_LS_ACTIONS)
-    AWAIT_LS_1C     = "await_ls_1c"
-    AWAIT_CODE_1C   = "await_code_1c"
-
-    # Возврат обращения из pending_confirmation
-    REOPEN_COMMENT  = "reopen_comment"
-
-    # Движок скриптов
-    SCRIPT_LIST = "script_list"
-    SCRIPT_NODE = "script_node"
-
-    # Показания
-    METER_SELECT        = "meter_select"
-    WAITING_VALUE1      = "waiting_value1"
-    WAITING_VALUE2      = "waiting_value2"
-    CONFIRM_POKAZANIYA  = "confirm_pokazaniya"
-
-    # Запись на приём (Этап C, раздел 6-7 ТЗ)
-    APPOINTMENT_BRANCH   = "appointment_branch"    # выбор филиала
-    APPOINTMENT_DATE     = "appointment_date"      # выбор даты
-    APPOINTMENT_TIME     = "appointment_time"      # выбор времени
-    APPOINTMENT_THEME    = "appointment_theme"     # ввод темы (опционально)
-    APPOINTMENT_CONFIRM  = "appointment_confirm"   # подтверждение записи
 
 # ── Хранилище сессий и защита от брутфорса ───────────────────────────────────
 
@@ -154,17 +130,25 @@ def _now() -> datetime:
     return datetime.now(timezone(timedelta(hours=TIMEZONE_OFFSET)))
 
 
+_session_manager = SessionManager(user_states, clock=lambda: _now())
+
+
+def _get_session_manager() -> SessionManager:
+    """Return a manager bound to the current ``user_states`` object."""
+    global _session_manager
+    if _session_manager.states is not user_states:
+        _session_manager = SessionManager(user_states, clock=lambda: _now())
+    return _session_manager
+
+
 def _touch(state: dict) -> dict:
     """Обновляет last_active и возвращает state."""
-    state["last_active"] = _now()
-    return state
+    return _get_session_manager().touch(state)
 
 
 def _get_state(chat_id: int) -> dict:
     """Возвращает состояние сессии, создаёт пустое если нет."""
-    if chat_id not in user_states:
-        user_states[chat_id] = _touch({"state": S.MENU})
-    return user_states[chat_id]
+    return _get_session_manager().get_state(chat_id)
 
 
 def cleanup_user_states(
@@ -180,20 +164,10 @@ def cleanup_user_states(
     не указано напрямую, чтобы не привязываться к объекту на момент
     определения функции).
     """
-    if states is None:
-        states = user_states
-
-    cutoff = _now() - timedelta(minutes=ttl_minutes)
-    to_remove = [
-        cid for cid, st in states.items()
-        if isinstance(st, dict)
-        and st.get("last_active", _now()) < cutoff
-    ]
-    for cid in to_remove:
-        del states[cid]
-    if to_remove:
-        log.info("cleanup_user_states: удалено %d устаревших сессий", len(to_remove))
-    return len(to_remove)
+    removed = _get_session_manager().cleanup(states, ttl_minutes)
+    if removed:
+        log.info("cleanup_user_states: удалено %d устаревших сессий", removed)
+    return removed
 
 
 # ── Низкоуровневые функции отправки ──────────────────────────────────────────
@@ -319,30 +293,14 @@ def _reset_ls_brute(chat_id: int) -> None:
 
 # ── Управление состоянием сессии ──────────────────────────────────────────────
 
-# Ключи, относящиеся к незавершённым флоу. Сбрасываются при возврате в меню.
-_FLOW_KEYS = (
-    "appeal", "script", "after_ls", "reopen_appeal_id",
-    "meters", "meter_idx", "new_value1", "new_value2",
-    "appt_branch_id", "appt_date", "appt_time", "appt_theme",
-    "pending_1c_ls", "after_1c_auth",
-)
-
-# Ключи ввода показаний — сбрасываются при переходе к следующему счётчику.
-_METER_INPUT_KEYS = ("new_value1", "new_value2")
-
-
 def _clear_flow(st: dict) -> None:
     """Сбрасывает состояние всех незавершённых флоу и возвращает в меню."""
-    for key in _FLOW_KEYS:
-        st.pop(key, None)
-    st["state"] = S.MENU
+    _get_session_manager().clear_flow(st)
 
 
 def _reset_meter_input(st: dict) -> None:
     """Сбрасывает введённые значения показаний, ставит ожидание Т1."""
-    for key in _METER_INPUT_KEYS:
-        st.pop(key, None)
-    st["state"] = S.WAITING_VALUE1
+    _get_session_manager().reset_meter_input(st)
 
 
 def _request_ls(chat_id: int, after: str) -> None:
