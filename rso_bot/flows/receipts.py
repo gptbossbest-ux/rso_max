@@ -13,7 +13,9 @@ a local host allow-list would break the provider's dynamic upload contract.
 from __future__ import annotations
 
 import logging
+import os
 import re
+import stat
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -25,8 +27,7 @@ from typing import Any, BinaryIO
 class ReceiptUploadDependencies:
     """Filesystem and MAX API dependencies for uploading one PDF receipt."""
 
-    receipt_path: Callable[[str], Path]
-    open_binary: Callable[[Path], AbstractContextManager[BinaryIO]]
+    open_receipt: Callable[[str], AbstractContextManager[BinaryIO]]
     http_client: Any
     api_base: str
     headers: Mapping[str, str]
@@ -49,61 +50,197 @@ class ReceiptFlowDependencies:
     deliver_receipt: Callable[[int, str], None]
 
 
-def local_receipt_path(root: Path, account: str) -> Path:
-    """Return a regular receipt file contained directly under ``root``.
+_WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{number}" for number in range(1, 10)),
+    *(f"LPT{number}" for number in range(1, 10)),
+}
 
-    Account identifiers used by the bot are ASCII decimal strings with the
-    same 1..64 length accepted by the authorization API.  Restricting the
-    filename before touching the filesystem also rejects Windows drives,
-    alternate data streams and reserved/dot names on every platform.
+
+def validate_receipt_account(account: str) -> str:
+    """Validate an account as one safe, portable filename stem.
+
+    The billing API accepts identifiers such as ``TEST-LS-001``.  Keep those
+    identifiers compatible while rejecting Unicode confusables and every
+    character with path or alternate-data-stream semantics.
     """
-    if re.fullmatch(r"[0-9]{1,64}", account, flags=re.ASCII) is None:
+    if (
+        re.fullmatch(r"[A-Za-z0-9_-]{1,64}", account, flags=re.ASCII) is None
+        or account.upper() in _WINDOWS_RESERVED_NAMES
+    ):
         raise FileNotFoundError
+    return account
 
+
+def _open_posix_receipt(root: Path, filename: str) -> BinaryIO:
+    """Atomically open a regular file relative to a non-symlink directory."""
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        directory_flags |= os.O_CLOEXEC
+        file_flags |= os.O_CLOEXEC
+
+    root_fd = -1
+    file_fd = -1
     try:
-        if root.is_symlink():
+        root_fd = os.open(root, directory_flags)
+        file_fd = os.open(filename, file_flags, dir_fd=root_fd)
+        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
             raise FileNotFoundError
-        resolved_root = root.resolve(strict=True)
-        if not resolved_root.is_dir():
-            raise FileNotFoundError
-
-        candidate = resolved_root / f"{account}.pdf"
-        # Reject links themselves even when they happen to resolve back into
-        # the receipt directory.  Existing link parents are rejected too.
-        current = candidate
-        while current != resolved_root:
-            if current.is_symlink():
-                raise FileNotFoundError
-            current = current.parent
-
-        resolved_candidate = candidate.resolve(strict=True)
-        resolved_candidate.relative_to(resolved_root)
-        if not resolved_candidate.is_file():
-            raise FileNotFoundError
-        return resolved_candidate
-    except (OSError, RuntimeError, ValueError):
-        # Do not expose storage layout or platform-specific path errors.
+        document = os.fdopen(file_fd, "rb")
+        file_fd = -1  # ownership transferred to the Python file object
+        return document
+    except (OSError, ValueError):
         raise FileNotFoundError from None
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+
+
+def _open_windows_receipt(root: Path, filename: str) -> BinaryIO:
+    """Open a non-reparse regular file while preventing root/file replacement."""
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class FileInformation(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", wintypes.DWORD),
+            ("ftCreationTime", wintypes.FILETIME),
+            ("ftLastAccessTime", wintypes.FILETIME),
+            ("ftLastWriteTime", wintypes.FILETIME),
+            ("dwVolumeSerialNumber", wintypes.DWORD),
+            ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD),
+            ("nNumberOfLinks", wintypes.DWORD),
+            ("nFileIndexHigh", wintypes.DWORD),
+            ("nFileIndexLow", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    get_information = kernel32.GetFileInformationByHandle
+    get_information.argtypes = [wintypes.HANDLE, ctypes.POINTER(FileInformation)]
+    get_information.restype = wintypes.BOOL
+    get_final_path = kernel32.GetFinalPathNameByHandleW
+    get_final_path.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    get_final_path.restype = wintypes.DWORD
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    generic_read = 0x80000000
+    share_read = 0x00000001
+    share_write = 0x00000002
+    open_existing = 3
+    attribute_directory = 0x00000010
+    attribute_reparse_point = 0x00000400
+    flag_backup_semantics = 0x02000000
+    flag_open_reparse_point = 0x00200000
+    flag_sequential_scan = 0x08000000
+    invalid_handle = wintypes.HANDLE(-1).value
+
+    def final_path(handle: int) -> str:
+        length = get_final_path(handle, None, 0, 0)
+        if not length:
+            raise FileNotFoundError
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        written = get_final_path(handle, buffer, len(buffer), 0)
+        if not written or written >= len(buffer):
+            raise FileNotFoundError
+        return os.path.normcase(os.path.normpath(buffer.value))
+
+    root_path = Path(os.path.abspath(root))
+    root_handle = create_file(
+        str(root_path),
+        0,
+        share_read | share_write,  # deliberately omit FILE_SHARE_DELETE
+        None,
+        open_existing,
+        flag_backup_semantics | flag_open_reparse_point,
+        None,
+    )
+    file_handle = invalid_handle
+    try:
+        root_info = FileInformation()
+        if root_handle == invalid_handle or not get_information(
+            root_handle, ctypes.byref(root_info)
+        ):
+            raise FileNotFoundError
+        if not root_info.dwFileAttributes & attribute_directory:
+            raise FileNotFoundError
+        if root_info.dwFileAttributes & attribute_reparse_point:
+            raise FileNotFoundError
+
+        # Holding root_handle without FILE_SHARE_DELETE prevents the directory
+        # from being replaced between its validation and this file open.
+        file_handle = create_file(
+            str(root_path / filename),
+            generic_read,
+            share_read,  # prevent rename/delete until the upload closes it
+            None,
+            open_existing,
+            flag_open_reparse_point | flag_sequential_scan,
+            None,
+        )
+        file_info = FileInformation()
+        if file_handle == invalid_handle or not get_information(
+            file_handle, ctypes.byref(file_info)
+        ):
+            raise FileNotFoundError
+        if file_info.dwFileAttributes & (attribute_directory | attribute_reparse_point):
+            raise FileNotFoundError
+        # Confirm the handle actually belongs to the directory handle we kept
+        # locked, including when an ancestor contains a junction/reparse point.
+        if os.path.dirname(final_path(file_handle)) != final_path(root_handle):
+            raise FileNotFoundError
+
+        descriptor = msvcrt.open_osfhandle(
+            int(file_handle), os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        )
+        file_handle = invalid_handle  # ownership transferred to descriptor
+        return os.fdopen(descriptor, "rb")
+    except (OSError, ValueError):
+        raise FileNotFoundError from None
+    finally:
+        if file_handle != invalid_handle:
+            close_handle(file_handle)
+        if root_handle != invalid_handle:
+            close_handle(root_handle)
+
+
+def open_local_receipt(root: Path, account: str) -> BinaryIO:
+    """Validate and securely open one receipt without a check/open race."""
+    filename = f"{validate_receipt_account(account)}.pdf"
+    if os.name == "nt":
+        return _open_windows_receipt(root, filename)
+    return _open_posix_receipt(root, filename)
 
 
 def send_pdf(chat_id: int, account: str, deps: ReceiptUploadDependencies) -> None:
     """Upload a receipt PDF and send its attachment token to the MAX chat."""
     try:
-        document_path = deps.receipt_path(account)
-    except FileNotFoundError:
-        deps.send_message(chat_id, f"Квитанция для ЛС {account} не найдена.")
-        return
-    except OSError:
-        deps.logger.error("PDF: не удалось прочитать файл квитанции")
-        deps.send_message(chat_id, "Не удалось отправить квитанцию. Попробуйте позже.")
-        return
-    except Exception:  # noqa: BLE001 - injected storage adapters may be non-standard
-        deps.logger.error("PDF: ошибка хранилища квитанций")
-        deps.send_message(chat_id, "Не удалось отправить квитанцию. Попробуйте позже.")
-        return
-
-    try:
-        with deps.open_binary(document_path) as document:
+        with deps.open_receipt(account) as document:
             metadata_response = deps.http_client.post(
                 f"{deps.api_base}/uploads",
                 headers=dict(deps.headers),
@@ -150,7 +287,9 @@ def send_pdf(chat_id: int, account: str, deps: ReceiptUploadDependencies) -> Non
             )
             return
         deps.logger.info("PDF-квитанция отправлена")
-    except Exception as exc:  # noqa: BLE001 - HTTP adapters may raise custom errors
+    except FileNotFoundError:
+        deps.send_message(chat_id, f"Квитанция для ЛС {account} не найдена.")
+    except Exception as exc:  # noqa: BLE001 - injected adapters may be non-standard
         status_code = getattr(getattr(exc, "response", None), "status_code", None)
         if status_code is not None:
             deps.logger.error("PDF: MAX API вернул статус %s", status_code)

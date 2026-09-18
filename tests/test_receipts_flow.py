@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -27,9 +28,8 @@ def response(payload: object, *, status: int = 200, url: str = "https://max.test
 
 def make_upload_deps(**overrides) -> receipts.ReceiptUploadDependencies:
     defaults = {
-        "receipt_path": MagicMock(return_value=Path("KV/100001.pdf")),
-        "open_binary": MagicMock(
-            side_effect=lambda _path: BytesIO(b"%PDF-1.7\x00binary")
+        "open_receipt": MagicMock(
+            side_effect=lambda _account: BytesIO(b"%PDF-1.7\x00binary")
         ),
         "http_client": MagicMock(),
         "api_base": "https://max.test",
@@ -103,7 +103,7 @@ def test_deliver_preserves_messages_order_and_menu() -> None:
 
 
 def test_missing_receipt_returns_exact_not_found_message() -> None:
-    deps = make_upload_deps(receipt_path=MagicMock(side_effect=FileNotFoundError))
+    deps = make_upload_deps(open_receipt=MagicMock(side_effect=FileNotFoundError))
 
     receipts.send_pdf(7, "100001", deps)
 
@@ -112,7 +112,7 @@ def test_missing_receipt_returns_exact_not_found_message() -> None:
 
 
 def test_read_error_reports_failure_without_calling_max() -> None:
-    deps = make_upload_deps(open_binary=MagicMock(side_effect=OSError("private path")))
+    deps = make_upload_deps(open_receipt=MagicMock(side_effect=OSError("private path")))
 
     receipts.send_pdf(7, "100001", deps)
 
@@ -128,7 +128,7 @@ def test_nonstandard_storage_exception_is_contained_without_sensitive_log(
     secret = "PRIVATE-STORAGE-DETAIL"
     logger = logging.getLogger("test.receipts.storage-error")
     deps = make_upload_deps(
-        receipt_path=MagicMock(side_effect=RuntimeError(secret)), logger=logger
+        open_receipt=MagicMock(side_effect=RuntimeError(secret)), logger=logger
     )
 
     with caplog.at_level(logging.ERROR, logger=logger.name):
@@ -144,7 +144,7 @@ def test_nonstandard_storage_exception_is_contained_without_sensitive_log(
 def test_valid_pdf_preserves_two_step_upload_and_attachment_contract() -> None:
     document = b"%PDF-1.7\x00\xffbinary"
     stream = BytesIO(document)
-    deps = make_upload_deps(open_binary=MagicMock(return_value=stream))
+    deps = make_upload_deps(open_receipt=MagicMock(return_value=stream))
     uploaded_bytes = b""
 
     def post(url, **kwargs):
@@ -214,7 +214,7 @@ def test_large_binary_document_is_streamed_in_bounded_reads() -> None:
     document = bytes(range(256)) * 16_384
     stream = GuardedStream(document)
     captured = bytearray()
-    deps = make_upload_deps(open_binary=MagicMock(return_value=stream))
+    deps = make_upload_deps(open_receipt=MagicMock(return_value=stream))
 
     def post(url, **kwargs):
         if "files" not in kwargs:
@@ -263,7 +263,7 @@ def test_non_200_from_either_http_step_reports_failure(failed_step: int) -> None
 )
 def test_document_stream_is_closed_on_every_http_failure(replies: list[object]) -> None:
     stream = BytesIO(b"%PDF-1.7")
-    deps = make_upload_deps(open_binary=MagicMock(return_value=stream))
+    deps = make_upload_deps(open_receipt=MagicMock(return_value=stream))
     deps.http_client.post.side_effect = replies
 
     receipts.send_pdf(7, "100001", deps)
@@ -319,8 +319,7 @@ def test_errors_do_not_log_account_path_token_body_or_document_bytes(
     bytes_secret = b"BYTES-SECRET-675849"
     logger = logging.getLogger("test.receipts.private")
     deps = make_upload_deps(
-        receipt_path=MagicMock(return_value=Path(path_secret)),
-        open_binary=MagicMock(return_value=BytesIO(bytes_secret)),
+        open_receipt=MagicMock(return_value=BytesIO(bytes_secret)),
         logger=logger,
     )
     deps.http_client.post.side_effect = RuntimeError(
@@ -344,10 +343,8 @@ def test_bot_upload_wrapper_resolves_runtime_patch_points() -> None:
     fake_client = object()
     fake_logger = object()
     fake_open = MagicMock(return_value=BytesIO(b"pdf"))
-    fake_path = MagicMock(return_value=Path("receipt.pdf"))
     with (
         patch.object(bot.receipts, "send_pdf", delegated),
-        patch.object(bot, "_receipt_path", fake_path),
         patch.object(bot, "_open_receipt_binary", fake_open),
         patch.object(bot, "httpx", fake_client),
         patch.object(bot, "API", "https://patched.test"),
@@ -361,8 +358,7 @@ def test_bot_upload_wrapper_resolves_runtime_patch_points() -> None:
 
     deps = delegated.call_args.args[2]
     assert delegated.call_args.args[:2] == (7, "100001")
-    assert deps.receipt_path is fake_path
-    assert deps.open_binary is fake_open
+    assert deps.open_receipt is fake_open
     assert deps.http_client is fake_client
     assert deps.api_base == "https://patched.test"
     assert deps.headers == {"Authorization": "patched"}
@@ -402,13 +398,13 @@ def test_after_ls_receipt_continuation_keeps_legacy_wrapper() -> None:
     assert bot._AFTER_LS_ACTIONS["kvitanciya"] is bot._deliver_kvitanciya
 
 
-def test_default_receipt_path_preserves_runtime_adapter() -> None:
-    expected = Path("KV/100001.pdf")
+def test_default_receipt_open_preserves_runtime_adapter() -> None:
+    expected = BytesIO(b"pdf")
     with patch.object(
-        bot.receipts, "local_receipt_path", return_value=expected
-    ) as resolve:
-        assert bot._receipt_path("100001") == expected
-    resolve.assert_called_once_with(Path("KV"), "100001")
+        bot.receipts, "open_local_receipt", return_value=expected
+    ) as open_receipt:
+        assert bot._open_receipt_binary("TEST-LS-001") is expected
+    open_receipt.assert_called_once_with(Path("KV"), "TEST-LS-001")
 
 
 @pytest.mark.parametrize(
@@ -426,27 +422,34 @@ def test_default_receipt_path_preserves_runtime_adapter() -> None:
         "C:/secret",
         "foo:bar",
         "CON",
+        "con",
+        "LPT1",
+        "name.",
+        "name ",
+        "name.ext",
         "１２３４５６",
         "1" * 65,
     ],
 )
-def test_receipt_path_rejects_unsafe_account(tmp_path: Path, account: str) -> None:
-    root = tmp_path / "KV"
-    root.mkdir()
+def test_receipt_account_rejects_unsafe_basename(account: str) -> None:
     with pytest.raises(FileNotFoundError):
-        receipts.local_receipt_path(root, account)
+        receipts.validate_receipt_account(account)
 
 
-def test_receipt_path_accepts_existing_regular_ascii_digit_file(tmp_path: Path) -> None:
+@pytest.mark.parametrize("account", ["100001", "TEST-LS-001", "test_account-2"])
+def test_receipt_open_accepts_supported_safe_accounts(
+    tmp_path: Path, account: str
+) -> None:
     root = tmp_path / "KV"
     root.mkdir()
-    document = root / "100001.pdf"
-    document.write_bytes(b"pdf")
+    document = root / f"{account}.pdf"
+    document.write_bytes(b"exact-pdf")
 
-    assert receipts.local_receipt_path(root, "100001") == document.resolve()
+    with receipts.open_local_receipt(root, account) as opened:
+        assert opened.read() == b"exact-pdf"
 
 
-def test_receipt_path_rejects_missing_file_and_sibling_prefix(tmp_path: Path) -> None:
+def test_receipt_open_rejects_missing_file_and_sibling_prefix(tmp_path: Path) -> None:
     root = tmp_path / "KV"
     sibling = tmp_path / "KV_evil"
     root.mkdir()
@@ -454,7 +457,7 @@ def test_receipt_path_rejects_missing_file_and_sibling_prefix(tmp_path: Path) ->
     (sibling / "100001.pdf").write_bytes(b"private")
 
     with pytest.raises(FileNotFoundError):
-        receipts.local_receipt_path(root, "100001")
+        receipts.open_local_receipt(root, "100001")
 
 
 def test_receipt_path_rejects_symlink_file_to_outside(tmp_path: Path) -> None:
@@ -469,7 +472,7 @@ def test_receipt_path_rejects_symlink_file_to_outside(tmp_path: Path) -> None:
         pytest.skip(f"symlinks unavailable: {exc}")
 
     with pytest.raises(FileNotFoundError):
-        receipts.local_receipt_path(root, "100001")
+        receipts.open_local_receipt(root, "100001")
 
 
 def test_receipt_path_rejects_symlink_root_to_outside(tmp_path: Path) -> None:
@@ -483,4 +486,36 @@ def test_receipt_path_rejects_symlink_root_to_outside(tmp_path: Path) -> None:
         pytest.skip(f"symlinks unavailable: {exc}")
 
     with pytest.raises(FileNotFoundError):
-        receipts.local_receipt_path(root, "100001")
+        receipts.open_local_receipt(root, "100001")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX openat/O_NOFOLLOW race test")
+def test_posix_open_rejects_file_swapped_to_outside_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "KV"
+    root.mkdir()
+    document = root / "TEST-LS-001.pdf"
+    document.write_bytes(b"expected")
+    outside = tmp_path / "outside.pdf"
+    outside.write_bytes(b"must-not-upload")
+    original_open = os.open
+
+    def racing_open(path, flags, *args, **kwargs):
+        if kwargs.get("dir_fd") is not None:
+            document.unlink()
+            document.symlink_to(outside)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(receipts.os, "open", racing_open)
+    deps = make_upload_deps(
+        open_receipt=lambda account: receipts.open_local_receipt(root, account)
+    )
+
+    receipts.send_pdf(7, "TEST-LS-001", deps)
+
+    deps.http_client.post.assert_not_called()
+    deps.send_message.assert_called_once_with(
+        7, "Квитанция для ЛС TEST-LS-001 не найдена."
+    )
+    assert outside.read_bytes() == b"must-not-upload"

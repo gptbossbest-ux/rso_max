@@ -569,21 +569,15 @@ def _cancel_own_appointment(chat_id: int, appointment_id: int) -> None:
 
 # ── PDF квитанция ─────────────────────────────────────────────────────────────
 
-def _receipt_path(ls: str) -> Path:
-    """Return the runtime path used for an account's PDF receipt."""
-    return receipts.local_receipt_path(Path("KV"), ls)
-
-
-def _open_receipt_binary(path: Path):
-    """Open a receipt for streaming by the synchronous MAX HTTP client."""
-    return path.open("rb")
+def _open_receipt_binary(ls: str):
+    """Validate and atomically open an account receipt for streaming."""
+    return receipts.open_local_receipt(Path("KV"), ls)
 
 
 def _receipt_upload_dependencies() -> receipts.ReceiptUploadDependencies:
     """Resolve filesystem and MAX collaborators at call time."""
     return receipts.ReceiptUploadDependencies(
-        receipt_path=_receipt_path,
-        open_binary=_open_receipt_binary,
+        open_receipt=_open_receipt_binary,
         http_client=httpx,
         api_base=API,
         headers=_MAX_HEADERS,
