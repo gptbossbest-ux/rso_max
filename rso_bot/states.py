@@ -18,6 +18,8 @@ class S:
     SCRIPT_LIST = "script_list"
     SCRIPT_NODE = "script_node"
 
+    AI_QUESTION = "ai_question"
+
     METER_SELECT = "meter_select"
     WAITING_VALUE1 = "waiting_value1"
     WAITING_VALUE2 = "waiting_value2"
@@ -46,6 +48,8 @@ FLOW_KEYS = (
     # Cleans sessions left by deployments that still used the OTP flow.
     "pending_1c_ls",
     "after_1c_auth",
+    "ai_last_exchange",
+    "ai_faq_context",
 )
 
 METER_INPUT_KEYS = ("new_value1", "new_value2")

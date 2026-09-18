@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 JobCallback = Callable[[], None]
@@ -21,6 +22,7 @@ class SchedulerDependencies:
     appointment_reminder_day: JobCallback
     scheduler_factory: SchedulerFactory
     logger: logging.Logger
+    cleanup_ai_sessions: JobCallback | None = None
 
 
 def register_jobs(scheduler: Any, deps: SchedulerDependencies) -> None:
@@ -59,6 +61,17 @@ def register_jobs(scheduler: Any, deps: SchedulerDependencies) -> None:
         max_instances=1,
         misfire_grace_time=1800,
     )
+    if deps.cleanup_ai_sessions is not None:
+        scheduler.add_job(
+            deps.cleanup_ai_sessions,
+            trigger="cron",
+            hour=0,
+            minute=0,
+            timezone=datetime.now().astimezone().tzinfo,
+            id="cleanup_ai_sessions",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
 
 
 def create_scheduler(deps: SchedulerDependencies) -> Any:

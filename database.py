@@ -325,6 +325,43 @@ def init_db() -> None:
             to_node_id   INTEGER NOT NULL REFERENCES script_nodes(id)
         )
     """)
+
+    # Настройки ИИ-помощника. API-ключа здесь нет: он читается
+    # только из окружения процесса.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ai_settings (
+            id                INTEGER PRIMARY KEY CHECK (id = 1),
+            enabled           INTEGER NOT NULL DEFAULT 0,
+            model             TEXT NOT NULL DEFAULT 'yandexgpt/latest',
+            system_prompt     TEXT NOT NULL,
+            daily_limit       INTEGER NOT NULL DEFAULT 5 CHECK (daily_limit BETWEEN 1 AND 100),
+            temperature       REAL NOT NULL DEFAULT 0.3 CHECK (temperature BETWEEN 0 AND 1),
+            max_output_tokens INTEGER NOT NULL DEFAULT 800 CHECK (max_output_tokens BETWEEN 1 AND 8000)
+        )
+    """)
+    default_ai_prompt = (
+        "Ты — ИИ-помощник РСО по вопросам ЖКХ. Отвечай только по теме ЖКХ, "
+        "кратко и понятно. Не выдумывай тарифы, нормы, адреса или факты. "
+        "Если не уверен в ответе или нужны данные клиента, прямо скажи об этом и "
+        "предложи оформить обращение. Не запрашивай персональные данные."
+    )
+    c.execute(
+        "INSERT OR IGNORE INTO ai_settings (id, system_prompt) VALUES (1, ?)",
+        (default_ai_prompt,),
+    )
+
+    # Это не журнал: ровно одна обезличенная текущая сессия на MAX ID.
+    # При первом доступе в новую дату старая строка заменяется.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ai_daily_sessions (
+            chat_id        INTEGER PRIMARY KEY,
+            session_date   TEXT NOT NULL,
+            question_count INTEGER NOT NULL DEFAULT 0,
+            history_json   TEXT NOT NULL DEFAULT '[]',
+            faq_context    TEXT,
+            updated_at     TEXT NOT NULL
+        )
+    """)
     # TODO Этап 10 (табличный редактор скриптов): при сохранении рёбер
     # добавить валидацию на отсутствие циклов в графе (DFS/топологическая сортировка).
     # Цикл в скрипте приведёт к бесконечному навигационному циклу в боте.
@@ -2767,3 +2804,199 @@ def delete_script_edge(edge_id: int) -> None:
     conn.execute("DELETE FROM script_edges WHERE id=?", (edge_id,))
     conn.commit()
     conn.close()
+
+
+# ── ИИ-помощник: настройки и однодневные сессии ────────────────────────────────────
+
+def get_ai_settings() -> dict:
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT * FROM ai_settings WHERE id=1").fetchone()
+        if row is None:
+            raise RuntimeError("ai_settings is not initialized")
+        result = dict(row)
+        result["enabled"] = bool(result["enabled"])
+        return result
+    finally:
+        conn.close()
+
+
+def update_ai_settings(
+    *,
+    enabled: bool,
+    model: str,
+    system_prompt: str,
+    daily_limit: int,
+    temperature: float,
+    max_output_tokens: int,
+) -> None:
+    model = model.strip()
+    system_prompt = system_prompt.strip()
+    if not model or len(model) > 256:
+        raise ValueError("Модель должна содержать от 1 до 256 символов")
+    if not system_prompt or len(system_prompt) > 8000:
+        raise ValueError("Системный промпт должен содержать от 1 до 8000 символов")
+    if not 1 <= daily_limit <= 100:
+        raise ValueError("Дневной лимит должен быть от 1 до 100")
+    if not 0 <= temperature <= 1:
+        raise ValueError("Температура должна быть от 0 до 1")
+    if not 1 <= max_output_tokens <= 8000:
+        raise ValueError("Максимум токенов должен быть от 1 до 8000")
+    conn = get_conn()
+    try:
+        conn.execute(
+            """UPDATE ai_settings
+               SET enabled=?, model=?, system_prompt=?, daily_limit=?,
+                   temperature=?, max_output_tokens=? WHERE id=1""",
+            (int(enabled), model, system_prompt, daily_limit, temperature, max_output_tokens),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _server_date() -> str:
+    return datetime.now().astimezone().date().isoformat()
+
+
+def get_ai_session(chat_id: int, *, session_date: str | None = None) -> dict:
+    """Return today's sanitized session, replacing any expired daily data."""
+    today = session_date or _server_date()
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM ai_daily_sessions WHERE chat_id=?", (chat_id,)
+        ).fetchone()
+        if row is None or row["session_date"] != today:
+            conn.execute(
+                """INSERT INTO ai_daily_sessions
+                   (chat_id, session_date, question_count, history_json, faq_context, updated_at)
+                   VALUES (?, ?, 0, '[]', NULL, ?)
+                   ON CONFLICT(chat_id) DO UPDATE SET
+                     session_date=excluded.session_date, question_count=0,
+                     history_json='[]', faq_context=NULL, updated_at=excluded.updated_at""",
+                (chat_id, today, now),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM ai_daily_sessions WHERE chat_id=?", (chat_id,)
+            ).fetchone()
+        result = dict(row)
+        try:
+            result["history"] = json.loads(result.pop("history_json"))
+        except (TypeError, ValueError):
+            result["history"] = []
+        return result
+    finally:
+        conn.close()
+
+
+def set_ai_context(chat_id: int, context: str | None, *, session_date: str | None = None) -> None:
+    get_ai_session(chat_id, session_date=session_date)
+    conn = get_conn()
+    try:
+        conn.execute(
+            "UPDATE ai_daily_sessions SET faq_context=?, updated_at=? WHERE chat_id=?",
+            (context or None, datetime.now().astimezone().isoformat(timespec="seconds"), chat_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def reserve_ai_question(
+    chat_id: int,
+    daily_limit: int,
+    *,
+    session_date: str | None = None,
+) -> bool:
+    """Atomically reserve one request from the shared daily allowance."""
+    today = session_date or _server_date()
+    get_ai_session(chat_id, session_date=today)
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            """UPDATE ai_daily_sessions
+               SET question_count=question_count+1, updated_at=?
+               WHERE chat_id=? AND session_date=? AND question_count < ?""",
+            (datetime.now().astimezone().isoformat(timespec="seconds"), chat_id, today, daily_limit),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+    finally:
+        conn.close()
+
+
+def release_ai_question(chat_id: int, *, session_date: str | None = None) -> None:
+    today = session_date or _server_date()
+    conn = get_conn()
+    try:
+        conn.execute(
+            """UPDATE ai_daily_sessions
+               SET question_count=MAX(question_count-1, 0), updated_at=?
+               WHERE chat_id=? AND session_date=?""",
+            (datetime.now().astimezone().isoformat(timespec="seconds"), chat_id, today),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def append_ai_exchange(
+    chat_id: int,
+    question: str,
+    answer: str,
+    *,
+    session_date: str | None = None,
+    max_messages: int = 20,
+) -> None:
+    session = get_ai_session(chat_id, session_date=session_date)
+    history = list(session["history"])
+    history.extend(
+        ({"role": "user", "text": question}, {"role": "assistant", "text": answer})
+    )
+    history = history[-max_messages:]
+    conn = get_conn()
+    try:
+        conn.execute(
+            "UPDATE ai_daily_sessions SET history_json=?, updated_at=? WHERE chat_id=?",
+            (
+                json.dumps(history, ensure_ascii=False),
+                datetime.now().astimezone().isoformat(timespec="seconds"),
+                chat_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_ai_history(chat_id: int, *, session_date: str | None = None) -> None:
+    """Clear context without resetting today's used-question counter."""
+    get_ai_session(chat_id, session_date=session_date)
+    conn = get_conn()
+    try:
+        conn.execute(
+            """UPDATE ai_daily_sessions SET history_json='[]', faq_context=NULL, updated_at=?
+               WHERE chat_id=?""",
+            (datetime.now().astimezone().isoformat(timespec="seconds"), chat_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def cleanup_expired_ai_sessions(*, session_date: str | None = None) -> int:
+    """Delete all temporary AI sessions from earlier server-local dates."""
+    today = session_date or _server_date()
+    conn = get_conn()
+    try:
+        cursor = conn.execute(
+            "DELETE FROM ai_daily_sessions WHERE session_date <> ?", (today,)
+        )
+        conn.commit()
+        return cursor.rowcount
+    finally:
+        conn.close()

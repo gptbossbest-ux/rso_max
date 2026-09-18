@@ -92,6 +92,8 @@ def open_script(chat_id: int, script_id: int, deps: FaqDependencies) -> None:
         "nodes": nodes,
         "edges_by_from": edges_by_from,
         "current": root_id,
+        "title": tree.get("title", "FAQ"),
+        "path": [tree.get("title", "FAQ"), nodes[root_id]["title"]],
     }
     deps.touch(state)
     show_script_node(chat_id, deps)
@@ -115,11 +117,19 @@ def show_script_node(chat_id: int, deps: FaqDependencies) -> None:
     edges = edges_by_from.get(current_id, [])
 
     if node.get("is_terminal") or not edges:
-        deps.send_message(chat_id, f"📌 {text}")
+        path = list(script.get("path", []))
+        state["ai_faq_context"] = " → ".join(str(item) for item in path if item)
         state["state"] = deps.menu_state
         state.pop("script", None)
         deps.touch(state)
-        deps.send_main_menu(chat_id, "Выберите следующее действие:")
+        deps.send_buttons(
+            chat_id,
+            f"📌 {text}",
+            [
+                [deps.make_callback("🤖 Спросить у ИИ-помощника", "ai_from_faq")],
+                [deps.make_callback("🏠 Главное меню", "main_menu")],
+            ],
+        )
     else:
         rows = [
             [deps.make_callback(edge["label"], f"script_node:{edge['to_node_id']}")]
@@ -139,6 +149,21 @@ def navigate_script_node(
     if "script" not in state:
         deps.send_main_menu(chat_id)
         return
-    state["script"]["current"] = node_id
+    script = state["script"]
+    current_id = script.get("current")
+    selected_label = next(
+        (
+            edge.get("label")
+            for edge in script.get("edges_by_from", {}).get(current_id, [])
+            if edge.get("to_node_id") == node_id
+        ),
+        None,
+    )
+    if selected_label:
+        script.setdefault("path", []).append(selected_label)
+    target = script.get("nodes", {}).get(node_id)
+    if target:
+        script.setdefault("path", []).append(target.get("title", ""))
+    script["current"] = node_id
     deps.touch(state)
     show_script_node(chat_id, deps)
