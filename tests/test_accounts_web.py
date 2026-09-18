@@ -118,8 +118,10 @@ def test_invalid_account_number_is_rejected(accounts_db, number, message) -> Non
     [
         ("fio", "x" * 257, "Поле «ФИО» не должно превышать 256 символов"),
         ("fio", "Иван\nИванов", "Поле «ФИО» содержит недопустимые символы"),
+        ("fio", "Иван\u200bИванов", "Поле «ФИО» содержит недопустимые символы"),
         ("address", "x" * 513, "Поле «Адрес» не должно превышать 512 символов"),
         ("address", "Дом\t1", "Поле «Адрес» содержит недопустимые символы"),
+        ("address", "Дом\u202e1", "Поле «Адрес» содержит недопустимые символы"),
     ],
 )
 def test_invalid_optional_account_fields_are_rejected(
@@ -158,6 +160,27 @@ def test_canonical_account_formats_work_for_create_and_lookup(
 ) -> None:
     assert db.create_lschet(f"  {number}  ")
     assert db.get_ls(number)["number"] == number
+
+
+def test_optional_fields_accept_cyrillic_and_are_normalized_to_nfc(accounts_db) -> None:
+    assert db.create_lschet("100001", "Иваи\u0306лов Иван", "улица Ленина, дом 1")
+
+    account = db.get_ls("100001")
+    assert account["fio"] == "Ивайлов Иван"
+    assert account["address"] == "улица Ленина, дом 1"
+
+
+@pytest.mark.parametrize(
+    ("fio", "address"),
+    [("Иван\u200bИванов", "Адрес"), ("Иван Иванов", "Дом\u202e1")],
+)
+def test_direct_database_create_rejects_format_controls(
+    accounts_db, fio, address
+) -> None:
+    with pytest.raises(ValueError, match="недопустимые символы"):
+        db.create_lschet("100001", fio, address)
+
+    assert db.list_lschet() == []
 
 
 @pytest.mark.parametrize(
@@ -343,3 +366,27 @@ def test_excel_import_accepts_canonical_hyphen_and_underscore(
     db.import_from_excel(str(path))
 
     assert db.get_ls("TEST-LS_001") is not None
+
+
+@pytest.mark.parametrize(
+    ("fio", "address"),
+    [("Иван\u200bИванов", "Адрес"), ("Иван Иванов", "Дом\u202e1")],
+)
+def test_excel_import_rolls_back_on_invalid_optional_field(
+    accounts_db, tmp_path, fio, address
+) -> None:
+    assert db.create_lschet("EXISTING", "До импорта", "Старый адрес")
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "ЛС и ФИО"
+    sheet.append(["ЛС", "ФИО", "Адрес"])
+    sheet.append(["VALID-1", "Обычное ФИО", "Обычный адрес"])
+    sheet.append(["VALID-2", fio, address])
+    path = tmp_path / "invalid-optional.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    with pytest.raises(ValueError, match="недопустимые символы"):
+        db.import_from_excel(str(path))
+
+    assert [row["number"] for row in db.list_lschet()] == ["EXISTING"]

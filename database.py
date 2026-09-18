@@ -1358,12 +1358,12 @@ def _normalize_optional_lschet_field(
     label: str,
     max_length: int,
 ) -> str | None:
-    normalized = value.strip() if value else ""
+    normalized = unicodedata.normalize("NFC", value.strip()) if value else ""
     if not normalized:
         return None
     if len(normalized) > max_length:
         raise ValueError(f"Поле «{label}» не должно превышать {max_length} символов")
-    if any(unicodedata.category(char) == "Cc" for char in normalized):
+    if any(unicodedata.category(char).startswith("C") for char in normalized):
         raise ValueError(f"Поле «{label}» содержит недопустимые символы")
     return normalized
 
