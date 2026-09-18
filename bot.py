@@ -574,15 +574,16 @@ def _receipt_path(ls: str) -> Path:
     return receipts.local_receipt_path(Path("KV"), ls)
 
 
-def _read_receipt_bytes(path: Path) -> bytes:
-    return path.read_bytes()
+def _open_receipt_binary(path: Path):
+    """Open a receipt for streaming by the synchronous MAX HTTP client."""
+    return path.open("rb")
 
 
 def _receipt_upload_dependencies() -> receipts.ReceiptUploadDependencies:
     """Resolve filesystem and MAX collaborators at call time."""
     return receipts.ReceiptUploadDependencies(
         receipt_path=_receipt_path,
-        read_bytes=_read_receipt_bytes,
+        open_binary=_open_receipt_binary,
         http_client=httpx,
         api_base=API,
         headers=_MAX_HEADERS,

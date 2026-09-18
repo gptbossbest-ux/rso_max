@@ -3,15 +3,22 @@
 All filesystem, transport, account and session collaborators are supplied by
 the entry point.  The module therefore remains independent from ``bot.py`` and
 can be exercised without reading real customer documents or calling MAX.
+
+The upload URL returned by MAX is intentionally treated as a trusted,
+provider-controlled pre-signed endpoint.  If the configured MAX API itself is
+compromised it could still redirect an upload to an unintended host; enforcing
+a local host allow-list would break the provider's dynamic upload contract.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 
 @dataclass(frozen=True)
@@ -19,7 +26,7 @@ class ReceiptUploadDependencies:
     """Filesystem and MAX API dependencies for uploading one PDF receipt."""
 
     receipt_path: Callable[[str], Path]
-    read_bytes: Callable[[Path], bytes]
+    open_binary: Callable[[Path], AbstractContextManager[BinaryIO]]
     http_client: Any
     api_base: str
     headers: Mapping[str, str]
@@ -43,23 +50,46 @@ class ReceiptFlowDependencies:
 
 
 def local_receipt_path(root: Path, account: str) -> Path:
-    """Build a receipt path without allowing an account to escape its root."""
-    if (
-        not account
-        or account in {".", ".."}
-        or "/" in account
-        or "\\" in account
-        or "\x00" in account
-    ):
+    """Return a regular receipt file contained directly under ``root``.
+
+    Account identifiers used by the bot are ASCII decimal strings with the
+    same 1..64 length accepted by the authorization API.  Restricting the
+    filename before touching the filesystem also rejects Windows drives,
+    alternate data streams and reserved/dot names on every platform.
+    """
+    if re.fullmatch(r"[0-9]{1,64}", account, flags=re.ASCII) is None:
         raise FileNotFoundError
-    return root / f"{account}.pdf"
+
+    try:
+        if root.is_symlink():
+            raise FileNotFoundError
+        resolved_root = root.resolve(strict=True)
+        if not resolved_root.is_dir():
+            raise FileNotFoundError
+
+        candidate = resolved_root / f"{account}.pdf"
+        # Reject links themselves even when they happen to resolve back into
+        # the receipt directory.  Existing link parents are rejected too.
+        current = candidate
+        while current != resolved_root:
+            if current.is_symlink():
+                raise FileNotFoundError
+            current = current.parent
+
+        resolved_candidate = candidate.resolve(strict=True)
+        resolved_candidate.relative_to(resolved_root)
+        if not resolved_candidate.is_file():
+            raise FileNotFoundError
+        return resolved_candidate
+    except (OSError, RuntimeError, ValueError):
+        # Do not expose storage layout or platform-specific path errors.
+        raise FileNotFoundError from None
 
 
 def send_pdf(chat_id: int, account: str, deps: ReceiptUploadDependencies) -> None:
     """Upload a receipt PDF and send its attachment token to the MAX chat."""
     try:
         document_path = deps.receipt_path(account)
-        document = deps.read_bytes(document_path)
     except FileNotFoundError:
         deps.send_message(chat_id, f"Квитанция для ЛС {account} не найдена.")
         return
@@ -73,26 +103,29 @@ def send_pdf(chat_id: int, account: str, deps: ReceiptUploadDependencies) -> Non
         return
 
     try:
-        metadata_response = deps.http_client.post(
-            f"{deps.api_base}/uploads",
-            headers=dict(deps.headers),
-            params={"type": "file"},
-            timeout=10,
-        )
-        metadata_response.raise_for_status()
-        metadata = metadata_response.json()
-        if not isinstance(metadata, dict):
-            raise TypeError("invalid upload metadata")
-        upload_url = metadata.get("url")
-        if not isinstance(upload_url, str) or not upload_url:
-            raise ValueError("missing upload URL")
+        with deps.open_binary(document_path) as document:
+            metadata_response = deps.http_client.post(
+                f"{deps.api_base}/uploads",
+                headers=dict(deps.headers),
+                params={"type": "file"},
+                timeout=10,
+            )
+            metadata_response.raise_for_status()
+            metadata = metadata_response.json()
+            if not isinstance(metadata, dict):
+                raise TypeError("invalid upload metadata")
+            upload_url = metadata.get("url")
+            if not isinstance(upload_url, str) or not upload_url:
+                raise ValueError("missing upload URL")
 
-        upload_response = deps.http_client.post(
-            upload_url,
-            headers=dict(deps.headers),
-            files={"data": (f"{account}.pdf", document, "application/pdf")},
-            timeout=30,
-        )
+            # httpx streams file objects instead of buffering the full
+            # receipt in application memory.
+            upload_response = deps.http_client.post(
+                upload_url,
+                headers=dict(deps.headers),
+                files={"data": (f"{account}.pdf", document, "application/pdf")},
+                timeout=30,
+            )
         upload_response.raise_for_status()
         upload_payload = upload_response.json()
         if not isinstance(upload_payload, dict):

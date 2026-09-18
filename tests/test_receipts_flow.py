@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -27,7 +28,9 @@ def response(payload: object, *, status: int = 200, url: str = "https://max.test
 def make_upload_deps(**overrides) -> receipts.ReceiptUploadDependencies:
     defaults = {
         "receipt_path": MagicMock(return_value=Path("KV/100001.pdf")),
-        "read_bytes": MagicMock(return_value=b"%PDF-1.7\x00binary"),
+        "open_binary": MagicMock(
+            side_effect=lambda _path: BytesIO(b"%PDF-1.7\x00binary")
+        ),
         "http_client": MagicMock(),
         "api_base": "https://max.test",
         "headers": {"Authorization": "secret"},
@@ -100,7 +103,7 @@ def test_deliver_preserves_messages_order_and_menu() -> None:
 
 
 def test_missing_receipt_returns_exact_not_found_message() -> None:
-    deps = make_upload_deps(read_bytes=MagicMock(side_effect=FileNotFoundError))
+    deps = make_upload_deps(receipt_path=MagicMock(side_effect=FileNotFoundError))
 
     receipts.send_pdf(7, "100001", deps)
 
@@ -109,7 +112,7 @@ def test_missing_receipt_returns_exact_not_found_message() -> None:
 
 
 def test_read_error_reports_failure_without_calling_max() -> None:
-    deps = make_upload_deps(read_bytes=MagicMock(side_effect=OSError("private path")))
+    deps = make_upload_deps(open_binary=MagicMock(side_effect=OSError("private path")))
 
     receipts.send_pdf(7, "100001", deps)
 
@@ -125,7 +128,7 @@ def test_nonstandard_storage_exception_is_contained_without_sensitive_log(
     secret = "PRIVATE-STORAGE-DETAIL"
     logger = logging.getLogger("test.receipts.storage-error")
     deps = make_upload_deps(
-        read_bytes=MagicMock(side_effect=RuntimeError(secret)), logger=logger
+        receipt_path=MagicMock(side_effect=RuntimeError(secret)), logger=logger
     )
 
     with caplog.at_level(logging.ERROR, logger=logger.name):
@@ -140,24 +143,36 @@ def test_nonstandard_storage_exception_is_contained_without_sensitive_log(
 
 def test_valid_pdf_preserves_two_step_upload_and_attachment_contract() -> None:
     document = b"%PDF-1.7\x00\xffbinary"
-    deps = make_upload_deps(read_bytes=MagicMock(return_value=document))
+    stream = BytesIO(document)
+    deps = make_upload_deps(open_binary=MagicMock(return_value=stream))
+    uploaded_bytes = b""
+
+    def post(url, **kwargs):
+        nonlocal uploaded_bytes
+        if "files" not in kwargs:
+            return response({"url": "https://upload.test/file"})
+        uploaded_bytes = kwargs["files"]["data"][1].read()
+        return response({"token": "attachment-token"})
+
+    deps.http_client.post.side_effect = post
 
     receipts.send_pdf(7, "100001", deps)
 
-    assert deps.http_client.post.call_args_list == [
-        call(
-            "https://max.test/uploads",
-            headers={"Authorization": "secret"},
-            params={"type": "file"},
-            timeout=10,
-        ),
-        call(
-            "https://upload.test/file",
-            headers={"Authorization": "secret"},
-            files={"data": ("100001.pdf", document, "application/pdf")},
-            timeout=30,
-        ),
-    ]
+    assert deps.http_client.post.call_args_list[0] == call(
+        "https://max.test/uploads",
+        headers={"Authorization": "secret"},
+        params={"type": "file"},
+        timeout=10,
+    )
+    upload = deps.http_client.post.call_args_list[1]
+    assert upload.args == ("https://upload.test/file",)
+    assert upload.kwargs["headers"] == {"Authorization": "secret"}
+    assert upload.kwargs["timeout"] == 30
+    name, uploaded_stream, content_type = upload.kwargs["files"]["data"]
+    assert (name, content_type) == ("100001.pdf", "application/pdf")
+    assert uploaded_stream is stream
+    assert uploaded_bytes == document
+    assert stream.closed
     deps.sleep.assert_called_once_with(2)
     deps.send_raw.assert_called_once_with(
         7,
@@ -185,15 +200,37 @@ def test_failed_attachment_send_is_not_reported_as_success(
     assert "PDF-квитанция отправлена" not in caplog.text
 
 
-def test_large_binary_document_is_forwarded_without_text_decoding() -> None:
+def test_large_binary_document_is_streamed_in_bounded_reads() -> None:
+    class GuardedStream(BytesIO):
+        def __init__(self, payload: bytes) -> None:
+            super().__init__(payload)
+            self.read_sizes: list[int] = []
+
+        def read(self, size: int = -1) -> bytes:
+            assert 0 <= size <= 64 * 1024
+            self.read_sizes.append(size)
+            return super().read(size)
+
     document = bytes(range(256)) * 16_384
-    deps = make_upload_deps(read_bytes=MagicMock(return_value=document))
+    stream = GuardedStream(document)
+    captured = bytearray()
+    deps = make_upload_deps(open_binary=MagicMock(return_value=stream))
+
+    def post(url, **kwargs):
+        if "files" not in kwargs:
+            return response({"url": "https://upload.test/file"})
+        uploaded = kwargs["files"]["data"][1]
+        while chunk := uploaded.read(64 * 1024):
+            captured.extend(chunk)
+        return response({"token": "attachment-token"})
+
+    deps.http_client.post.side_effect = post
 
     receipts.send_pdf(7, "100001", deps)
 
-    uploaded = deps.http_client.post.call_args_list[1].kwargs["files"]["data"][1]
-    assert uploaded is document
-    assert len(uploaded) == 4_194_304
+    assert captured == document
+    assert len(stream.read_sizes) > 1
+    assert stream.closed
 
 
 @pytest.mark.parametrize("failed_step", [0, 1])
@@ -212,6 +249,29 @@ def test_non_200_from_either_http_step_reports_failure(failed_step: int) -> None
         7, "Не удалось отправить квитанцию. Попробуйте позже."
     )
     deps.send_raw.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "replies",
+    [
+        [response({}, status=503)],
+        [response({"url": "https://upload.test/file"}), response({}, status=503)],
+        [response({"url": "https://upload.test/file"}), RuntimeError("network")],
+        [response({"url": "https://upload.test/file"}), response([])],
+    ],
+    ids=["metadata-non-200", "upload-non-200", "upload-exception", "bad-payload"],
+)
+def test_document_stream_is_closed_on_every_http_failure(replies: list[object]) -> None:
+    stream = BytesIO(b"%PDF-1.7")
+    deps = make_upload_deps(open_binary=MagicMock(return_value=stream))
+    deps.http_client.post.side_effect = replies
+
+    receipts.send_pdf(7, "100001", deps)
+
+    assert stream.closed
+    deps.send_message.assert_called_once_with(
+        7, "Не удалось отправить квитанцию. Попробуйте позже."
+    )
 
 
 @pytest.mark.parametrize(
@@ -260,7 +320,7 @@ def test_errors_do_not_log_account_path_token_body_or_document_bytes(
     logger = logging.getLogger("test.receipts.private")
     deps = make_upload_deps(
         receipt_path=MagicMock(return_value=Path(path_secret)),
-        read_bytes=MagicMock(return_value=bytes_secret),
+        open_binary=MagicMock(return_value=BytesIO(bytes_secret)),
         logger=logger,
     )
     deps.http_client.post.side_effect = RuntimeError(
@@ -283,12 +343,12 @@ def test_bot_upload_wrapper_resolves_runtime_patch_points() -> None:
     delegated = MagicMock()
     fake_client = object()
     fake_logger = object()
-    fake_read = MagicMock(return_value=b"pdf")
+    fake_open = MagicMock(return_value=BytesIO(b"pdf"))
     fake_path = MagicMock(return_value=Path("receipt.pdf"))
     with (
         patch.object(bot.receipts, "send_pdf", delegated),
         patch.object(bot, "_receipt_path", fake_path),
-        patch.object(bot, "_read_receipt_bytes", fake_read),
+        patch.object(bot, "_open_receipt_binary", fake_open),
         patch.object(bot, "httpx", fake_client),
         patch.object(bot, "API", "https://patched.test"),
         patch.object(bot, "_MAX_HEADERS", {"Authorization": "patched"}),
@@ -302,7 +362,7 @@ def test_bot_upload_wrapper_resolves_runtime_patch_points() -> None:
     deps = delegated.call_args.args[2]
     assert delegated.call_args.args[:2] == (7, "100001")
     assert deps.receipt_path is fake_path
-    assert deps.read_bytes is fake_read
+    assert deps.open_binary is fake_open
     assert deps.http_client is fake_client
     assert deps.api_base == "https://patched.test"
     assert deps.headers == {"Authorization": "patched"}
@@ -342,13 +402,85 @@ def test_after_ls_receipt_continuation_keeps_legacy_wrapper() -> None:
     assert bot._AFTER_LS_ACTIONS["kvitanciya"] is bot._deliver_kvitanciya
 
 
-def test_default_receipt_path_preserves_runtime_contract() -> None:
-    assert bot._receipt_path("100001") == Path("KV/100001.pdf")
+def test_default_receipt_path_preserves_runtime_adapter() -> None:
+    expected = Path("KV/100001.pdf")
+    with patch.object(
+        bot.receipts, "local_receipt_path", return_value=expected
+    ) as resolve:
+        assert bot._receipt_path("100001") == expected
+    resolve.assert_called_once_with(Path("KV"), "100001")
 
 
 @pytest.mark.parametrize(
-    "account", ["", ".", "..", "../secret", "..\\secret", "dir/receipt"]
+    "account",
+    [
+        "",
+        ".",
+        "..",
+        "../secret",
+        "..\\secret",
+        "dir/receipt",
+        "/absolute",
+        "C:",
+        "D:",
+        "C:/secret",
+        "foo:bar",
+        "CON",
+        "１２３４５６",
+        "1" * 65,
+    ],
 )
-def test_receipt_path_rejects_directory_traversal(account: str) -> None:
+def test_receipt_path_rejects_unsafe_account(tmp_path: Path, account: str) -> None:
+    root = tmp_path / "KV"
+    root.mkdir()
     with pytest.raises(FileNotFoundError):
-        receipts.local_receipt_path(Path("KV"), account)
+        receipts.local_receipt_path(root, account)
+
+
+def test_receipt_path_accepts_existing_regular_ascii_digit_file(tmp_path: Path) -> None:
+    root = tmp_path / "KV"
+    root.mkdir()
+    document = root / "100001.pdf"
+    document.write_bytes(b"pdf")
+
+    assert receipts.local_receipt_path(root, "100001") == document.resolve()
+
+
+def test_receipt_path_rejects_missing_file_and_sibling_prefix(tmp_path: Path) -> None:
+    root = tmp_path / "KV"
+    sibling = tmp_path / "KV_evil"
+    root.mkdir()
+    sibling.mkdir()
+    (sibling / "100001.pdf").write_bytes(b"private")
+
+    with pytest.raises(FileNotFoundError):
+        receipts.local_receipt_path(root, "100001")
+
+
+def test_receipt_path_rejects_symlink_file_to_outside(tmp_path: Path) -> None:
+    root = tmp_path / "KV"
+    root.mkdir()
+    outside = tmp_path / "outside.pdf"
+    outside.write_bytes(b"private")
+    link = root / "100001.pdf"
+    try:
+        link.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    with pytest.raises(FileNotFoundError):
+        receipts.local_receipt_path(root, "100001")
+
+
+def test_receipt_path_rejects_symlink_root_to_outside(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "100001.pdf").write_bytes(b"private")
+    root = tmp_path / "KV"
+    try:
+        root.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    with pytest.raises(FileNotFoundError):
+        receipts.local_receipt_path(root, "100001")
