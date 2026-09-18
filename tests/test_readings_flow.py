@@ -431,22 +431,16 @@ def test_1c_auth_continues_deferred_readings_flow() -> None:
     state = bot._get_state(chat_id)
     state.update(
         {
-            "state": bot.S.AWAIT_CODE_1C,
-            "pending_1c_ls": "100001",
+            "state": bot.S.AWAIT_LS_1C,
             "after_1c_auth": "pokazaniya",
         }
     )
-    result = {"status": "ok", "message": "Авторизация выполнена"}
     with (
-        patch.object(
-            bot.client_api, "verify_1c_auth_code", return_value=(result, None)
-        ),
+        patch.object(bot, "_validate_ls", return_value=True),
         patch.object(bot, "_save_ls"),
-        patch.object(bot, "send_message"),
         patch.object(bot, "_show_meter_select") as show_meter_select,
     ):
-        bot._on_await_code_1c(chat_id, state, "123456")
+        bot._on_await_ls_1c(chat_id, state, "100001")
     show_meter_select.assert_called_once_with(chat_id, "100001")
     assert state["state"] == bot.S.MENU
     assert "after_1c_auth" not in state
-    assert "pending_1c_ls" not in state

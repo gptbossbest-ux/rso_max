@@ -56,12 +56,6 @@ def _flow_deps(**overrides: object) -> auth.AuthFlowDependencies:
         "reset_ls_brute": MagicMock(),
         "save_ls": MagicMock(),
         "start_1c_auth": MagicMock(),
-        "request_1c_auth_code": MagicMock(
-            return_value=({"status": "ok", "message": "Код отправлен"}, None)
-        ),
-        "verify_1c_auth_code": MagicMock(
-            return_value=({"status": "ok", "message": "Успешно"}, None)
-        ),
         "continuations": {},
         "integration_enabled": False,
         "logger": logging.getLogger("test.auth.flow"),
@@ -114,6 +108,19 @@ def test_get_saved_ls_rejects_non_authorized_persisted_1c_account() -> None:
 
     assert auth.get_saved_ls(42, deps) is None
     assert state == {}
+
+
+def test_authorized_account_is_restored_after_process_session_restart(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "auth-restart.sqlite"))
+    db.init_db()
+    db.upsert_bot_user(42, "100001", "Иванов", authorized_1c=True)
+    bot.user_states.clear()
+    monkeypatch.setattr(bot, "ENABLE_1C_INTEGRATION", True)
+
+    assert bot._get_saved_ls(42) == "100001"
+    assert bot.user_states[42]["authorized_1c"] is True
 
 
 def test_get_saved_ls_database_failure_does_not_log_account_or_fio(
@@ -308,6 +315,16 @@ def test_validate_ls_database_failure_is_safe_and_does_not_log_account(
     assert "SECRET-LS" not in caplog.text
 
 
+@pytest.mark.parametrize(
+    "number",
+    ["СЧЕТ-1", "ＴＥＳＴ-1", "TEST\u200b-1", "TEST\u202e-1", "TEST/1"],
+)
+def test_validate_ls_treats_noncanonical_bot_input_as_invalid(number) -> None:
+    deps = _account_deps(get_ls=db.get_ls)
+
+    assert auth.validate_ls(number, deps) is auth.LsValidation.INVALID
+
+
 def test_database_outage_does_not_consume_attempts_or_lose_deferred_flow() -> None:
     state = {"state": S.AWAIT_LS, "after_ls": "appeal", "appeal": {"body": "x"}}
     attempts: dict = {}
@@ -390,7 +407,7 @@ def test_bot_default_attempt_registry_is_owned_by_auth_module() -> None:
 
 @pytest.mark.parametrize(
     "message_state",
-    [S.AWAIT_LS, S.AWAIT_LS_1C, S.AWAIT_CODE_1C, S.APPEAL_BODY, S.MENU],
+    [S.AWAIT_LS, S.AWAIT_LS_1C, S.APPEAL_BODY, S.MENU],
 )
 def test_handle_message_redacts_all_user_input_from_debug_log(
     message_state: str,
@@ -500,10 +517,9 @@ def test_manual_account_without_known_continuation_confirms_and_opens_menu() -> 
     assert state == {"state": S.MENU}
 
 
-def test_start_deferred_auth_preserves_flow_but_clears_stale_account() -> None:
+def test_start_deferred_auth_preserves_flow() -> None:
     state = {
         "appeal": {"body": "Нет воды"},
-        "pending_1c_ls": "old",
         "after_ls": "appeal",
     }
     deps = _flow_deps(get_state=MagicMock(return_value=state))
@@ -526,240 +542,102 @@ def test_start_standalone_auth_clears_previous_flow() -> None:
     assert state == {"state": S.AWAIT_LS_1C}
 
 
-def test_request_code_strips_account_and_waits_for_code() -> None:
+def test_local_auth_strips_account_saves_and_opens_emoji_menu() -> None:
     state = {"state": S.AWAIT_LS_1C}
-    request = MagicMock(
-        return_value=({"status": "ok", "message": "Код отправлен"}, None)
-    )
-    deps = _flow_deps(request_1c_auth_code=request)
+    deps = _flow_deps()
 
     auth.on_await_ls_1c(42, state, " 100001 ", deps)
 
-    request.assert_called_once_with("100001", 42)
-    assert state["pending_1c_ls"] == "100001"
-    assert state["state"] == S.AWAIT_CODE_1C
-
-
-@pytest.mark.parametrize("response", [(None, "offline"), (["ok"], None)])
-def test_request_code_handles_error_and_malformed_payload(response: tuple) -> None:
-    state = {"state": S.AWAIT_LS_1C, "appeal": {}}
-    deps = _flow_deps(request_1c_auth_code=MagicMock(return_value=response))
-
-    auth.on_await_ls_1c(42, state, "100001", deps)
-
+    deps.validate_ls.assert_called_once_with("100001")  # type: ignore[attr-defined]
+    deps.save_ls.assert_called_once_with(42, "100001")  # type: ignore[attr-defined]
+    deps.reset_ls_brute.assert_called_once_with(42)  # type: ignore[attr-defined]
     assert state == {"state": S.MENU}
-    deps.send_main_menu.assert_called_once_with(42)  # type: ignore[attr-defined]
+    deps.send_main_menu.assert_called_once_with(  # type: ignore[attr-defined]
+        42, "✅ Авторизация выполнена. Выберите действие:"
+    )
 
 
-def test_request_code_rejects_wrong_status_and_message_types() -> None:
+def test_local_auth_block_stops_before_validation() -> None:
     state = {"state": S.AWAIT_LS_1C}
+    validate = MagicMock()
     deps = _flow_deps(
-        request_1c_auth_code=MagicMock(
-            return_value=({"status": ["ok"], "message": {"secret": "value"}}, None)
-        )
+        check_ls_brute=MagicMock(return_value="Подождите"),
+        validate_ls=validate,
     )
 
     auth.on_await_ls_1c(42, state, "100001", deps)
 
-    deps.send_message.assert_called_once_with(  # type: ignore[attr-defined]
-        42, "⚠️ Сервис авторизации временно недоступен. Попробуйте позже."
-    )
-    assert state == {"state": S.MENU}
+    validate.assert_not_called()
+    deps.send_message.assert_called_once_with(42, "Подождите")  # type: ignore[attr-defined]
+    assert state == {"state": S.AWAIT_LS_1C}
 
 
-@pytest.mark.parametrize("bad_message", [None, "", "   ", {"secret": "SECRET-LS"}])
-def test_request_success_with_malformed_message_fails_closed(
-    bad_message: object,
-) -> None:
-    state = {"state": S.AWAIT_LS_1C, "appeal": {"body": "context"}}
-    deps = _flow_deps(
-        request_1c_auth_code=MagicMock(
-            return_value=({"status": "ok", "message": bad_message}, None)
-        )
-    )
-
-    auth.on_await_ls_1c(42, state, "100001", deps)
-
-    assert state == {"state": S.MENU}
-    assert "pending_1c_ls" not in state
-    deps.send_main_menu.assert_called_once_with(42)  # type: ignore[attr-defined]
-
-
-def test_request_code_rejects_empty_account_without_calling_api() -> None:
+def test_invalid_local_auth_records_failure_and_reprompts() -> None:
     state = {"state": S.AWAIT_LS_1C}
-    request = MagicMock()
-    deps = _flow_deps(request_1c_auth_code=request)
+    deps = _flow_deps(validate_ls=MagicMock(return_value=False))
+
+    auth.on_await_ls_1c(42, state, "missing", deps)
+
+    deps.fail_ls.assert_called_once_with(42)  # type: ignore[attr-defined]
+    assert deps.send_message.call_args_list == [  # type: ignore[attr-defined]
+        call(42, "bad account"),
+        call(42, "Введите номер лицевого счёта повторно:"),
+    ]
+    assert state == {"state": S.AWAIT_LS_1C}
+
+
+def test_local_auth_rejects_empty_account_without_validation() -> None:
+    state = {"state": S.AWAIT_LS_1C}
+    validate = MagicMock()
+    deps = _flow_deps(validate_ls=validate)
 
     auth.on_await_ls_1c(42, state, "   ", deps)
 
-    request.assert_not_called()
+    validate.assert_not_called()
     deps.send_message.assert_called_once_with(  # type: ignore[attr-defined]
         42, "Введите номер лицевого счёта."
     )
     assert state == {"state": S.AWAIT_LS_1C}
 
 
-def test_request_code_api_exception_uses_fallback_without_logging_account(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+def test_local_auth_unavailable_is_safe_and_keeps_prompt() -> None:
     state = {"state": S.AWAIT_LS_1C}
-    logger = logging.getLogger("test.auth.request.exception")
-    deps = _flow_deps(
-        request_1c_auth_code=MagicMock(side_effect=RuntimeError("upstream failed")),
-        logger=logger,
-    )
+    deps = _flow_deps(validate_ls=MagicMock(return_value=auth.LsValidation.UNAVAILABLE))
 
-    with caplog.at_level(logging.ERROR, logger=logger.name):
-        auth.on_await_ls_1c(42, state, "SECRET-LS-100001", deps)
-
-    assert "SECRET-LS-100001" not in caplog.text
-    assert state == {"state": S.MENU}
-
-
-def test_wrong_code_keeps_pending_authorization() -> None:
-    state = {"state": S.AWAIT_CODE_1C, "pending_1c_ls": "100001"}
-    deps = _flow_deps(
-        verify_1c_auth_code=MagicMock(
-            return_value=({"status": "wrong_code", "message": "Неверный код"}, None)
-        )
-    )
-
-    auth.on_await_code_1c(42, state, "000000", deps)
-
-    assert state == {"state": S.AWAIT_CODE_1C, "pending_1c_ls": "100001"}
-
-
-@pytest.mark.parametrize("response", [(None, "offline"), (["ok"], None)])
-def test_verify_code_handles_error_and_malformed_payload(response: tuple) -> None:
-    state = {"state": S.AWAIT_CODE_1C, "pending_1c_ls": "100001"}
-    deps = _flow_deps(verify_1c_auth_code=MagicMock(return_value=response))
-
-    auth.on_await_code_1c(42, state, "123456", deps)
-
-    assert state == {"state": S.MENU}
-    deps.send_main_menu.assert_called_once_with(42)  # type: ignore[attr-defined]
-
-
-def test_verify_code_rejects_wrong_status_and_message_types() -> None:
-    state = {"state": S.AWAIT_CODE_1C, "pending_1c_ls": "100001"}
-    deps = _flow_deps(
-        verify_1c_auth_code=MagicMock(
-            return_value=({"status": {"ok": True}, "message": ["secret"]}, None)
-        )
-    )
-
-    auth.on_await_code_1c(42, state, "123456", deps)
+    auth.on_await_ls_1c(42, state, "100001", deps)
 
     deps.send_message.assert_called_once_with(  # type: ignore[attr-defined]
-        42, "⚠️ Сервис авторизации временно недоступен. Попробуйте позже."
+        42, "⚠️ Сервис временно недоступен. Попробуйте позже."
     )
-    assert state == {"state": S.MENU}
-
-
-@pytest.mark.parametrize("bad_message", [None, "", "   ", ["SECRET-CODE"]])
-def test_verify_success_with_malformed_message_fails_closed(
-    bad_message: object,
-) -> None:
-    continuation = MagicMock()
-    state = {
-        "state": S.AWAIT_CODE_1C,
-        "pending_1c_ls": "100001",
-        "after_1c_auth": "appeal",
-    }
-    deps = _flow_deps(
-        verify_1c_auth_code=MagicMock(
-            return_value=({"status": "ok", "message": bad_message}, None)
-        ),
-        continuations={"appeal": continuation},
-    )
-
-    auth.on_await_code_1c(42, state, "123456", deps)
-
-    deps.save_ls.assert_not_called()  # type: ignore[attr-defined]
-    continuation.assert_not_called()
-    assert state == {"state": S.MENU}
-    deps.send_main_menu.assert_called_once_with(42)  # type: ignore[attr-defined]
-
-
-def test_missing_pending_account_restarts_authorization_without_api_call() -> None:
-    state = {"state": S.AWAIT_CODE_1C}
-    verify = MagicMock()
-    deps = _flow_deps(verify_1c_auth_code=verify)
-
-    auth.on_await_code_1c(42, state, "123456", deps)
-
-    verify.assert_not_called()
-    deps.send_main_menu.assert_called_once_with(  # type: ignore[attr-defined]
-        42, "Начнём авторизацию заново."
-    )
-    assert state == {"state": S.MENU}
-
-
-@pytest.mark.parametrize("status", ["expired_code", "rejected", None])
-def test_non_success_code_status_clears_flow(status: str | None) -> None:
-    state = {
-        "state": S.AWAIT_CODE_1C,
-        "pending_1c_ls": "100001",
-        "appeal": {},
-    }
-    deps = _flow_deps(
-        verify_1c_auth_code=MagicMock(
-            return_value=({"status": status, "message": "Не принято"}, None)
-        )
-    )
-
-    auth.on_await_code_1c(42, state, "000000", deps)
-
-    assert state == {"state": S.MENU}
+    assert state == {"state": S.AWAIT_LS_1C}
 
 
 @pytest.mark.parametrize(
     "after",
     ["appeal", "pokazaniya", "appointment", "kvitanciya", "my_appeals"],
 )
-def test_success_saves_account_and_resumes_every_supported_flow(after: str) -> None:
+def test_local_auth_saves_account_and_resumes_every_supported_flow(after: str) -> None:
     continuation = MagicMock()
     state = {
-        "state": S.AWAIT_CODE_1C,
-        "pending_1c_ls": "100001",
+        "state": S.AWAIT_LS_1C,
         "after_1c_auth": after,
         "appeal": {"body": "context"},
     }
     deps = _flow_deps(continuations={after: continuation})
 
-    auth.on_await_code_1c(42, state, "123456", deps)
+    auth.on_await_ls_1c(42, state, "100001", deps)
 
     deps.save_ls.assert_called_once_with(42, "100001")  # type: ignore[attr-defined]
     continuation.assert_called_once_with(42, "100001")
     assert state["appeal"] == {"body": "context"}
     assert state["state"] == S.MENU
-    assert "pending_1c_ls" not in state
     assert "after_1c_auth" not in state
-
-
-def test_verify_api_exception_clears_flow_without_logging_code_or_account(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    state = {"state": S.AWAIT_CODE_1C, "pending_1c_ls": "SECRET-LS"}
-    logger = logging.getLogger("test.auth.verify.exception")
-    deps = _flow_deps(
-        verify_1c_auth_code=MagicMock(side_effect=RuntimeError("upstream failed")),
-        logger=logger,
-    )
-
-    with caplog.at_level(logging.ERROR, logger=logger.name):
-        auth.on_await_code_1c(42, state, "SECRET-CODE", deps)
-
-    assert "SECRET-LS" not in caplog.text
-    assert "SECRET-CODE" not in caplog.text
-    assert state == {"state": S.MENU}
 
 
 def test_save_failure_returns_safe_fallback_and_does_not_continue() -> None:
     continuation = MagicMock()
     state = {
-        "state": S.AWAIT_CODE_1C,
-        "pending_1c_ls": "100001",
+        "state": S.AWAIT_LS_1C,
         "after_1c_auth": "appeal",
     }
     deps = _flow_deps(
@@ -767,7 +645,7 @@ def test_save_failure_returns_safe_fallback_and_does_not_continue() -> None:
         continuations={"appeal": continuation},
     )
 
-    auth.on_await_code_1c(42, state, "123456", deps)
+    auth.on_await_ls_1c(42, state, "100001", deps)
 
     continuation.assert_not_called()
-    assert state == {"state": S.MENU}
+    assert state == {"state": S.AWAIT_LS_1C, "after_1c_auth": "appeal"}

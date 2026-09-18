@@ -12,7 +12,6 @@ class S:
     APPEAL_BODY = "appeal_body"
     AWAIT_LS = "await_ls"
     AWAIT_LS_1C = "await_ls_1c"
-    AWAIT_CODE_1C = "await_code_1c"
 
     REOPEN_COMMENT = "reopen_comment"
 
@@ -44,6 +43,7 @@ FLOW_KEYS = (
     "appt_date",
     "appt_time",
     "appt_theme",
+    # Cleans sessions left by deployments that still used the OTP flow.
     "pending_1c_ls",
     "after_1c_auth",
 )

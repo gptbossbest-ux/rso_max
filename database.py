@@ -21,21 +21,24 @@ database.py — уровень доступа к данным, РСО Порта
 import json
 import logging
 import os
+import re
 import sqlite3
-from datetime import datetime, timezone, timedelta
+import unicodedata
+from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from zoneinfo import ZoneInfo
+
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from config import (
+    BOOTSTRAP_ADMIN_PASSWORD,
     DB_PATH,
-    TIMEZONE_OFFSET,
+    LOG_BACKUP_COUNT,
     LOG_FILE,
     LOG_LEVEL,
     LOG_MAX_BYTES,
-    LOG_BACKUP_COUNT,
     TICKET_PREFIX,
-    BOOTSTRAP_ADMIN_PASSWORD,
+    TIMEZONE_OFFSET,
 )
 
 # ── Логгер модуля ─────────────────────────────────────────────────────────────
@@ -1332,11 +1335,150 @@ def update_1c_sync_state(**fields: str | None) -> None:
 
 # ── Лицевые счета и счётчики ──────────────────────────────────────────────────
 
-def get_ls(number: str) -> sqlite3.Row | None:
+_LS_NUMBER_RE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z", re.ASCII)
+_LS_SEARCH_MAX_LENGTH = 100
+
+
+def normalize_lschet_number(number: str) -> str:
+    """Normalize and validate a user-facing account number."""
+    normalized = number.strip()
+    if not normalized:
+        raise ValueError("Введите номер лицевого счёта")
+    if _LS_NUMBER_RE.fullmatch(normalized) is None:
+        raise ValueError(
+            "Номер лицевого счёта должен содержать от 1 до 64 символов: "
+            "латинские буквы, цифры, дефис или подчёркивание"
+        )
+    return normalized
+
+
+def _normalize_optional_lschet_field(
+    value: str | None,
+    *,
+    label: str,
+    max_length: int,
+) -> str | None:
+    normalized = unicodedata.normalize("NFC", value.strip()) if value else ""
+    if not normalized:
+        return None
+    if len(normalized) > max_length:
+        raise ValueError(f"Поле «{label}» не должно превышать {max_length} символов")
+    if any(unicodedata.category(char).startswith("C") for char in normalized):
+        raise ValueError(f"Поле «{label}» содержит недопустимые символы")
+    return normalized
+
+
+def normalize_lschet_search(query: str | None) -> str:
+    """Normalize an account-directory query and cap resource usage."""
+    return (query or "").strip()[:_LS_SEARCH_MAX_LENGTH]
+
+
+def _licschet_search(query: str | None) -> tuple[str, ...]:
+    normalized = normalize_lschet_search(query)
+    if not normalized:
+        return ()
+    escaped = (
+        normalized.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    )
+    pattern = f"%{escaped}%"
+    return (pattern, pattern, pattern)
+
+
+def count_lschet(query: str | None = None) -> int:
+    """Count accounts matching a literal administrative search query."""
+    params = _licschet_search(query)
     conn = get_conn()
-    row = conn.execute("SELECT * FROM licschet WHERE number=?", (number,)).fetchone()
-    conn.close()
-    return row
+    try:
+        if not params:
+            row = conn.execute("SELECT COUNT(*) FROM licschet").fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM licschet WHERE "
+                "number LIKE ? ESCAPE '\\' OR fio LIKE ? ESCAPE '\\' "
+                "OR address LIKE ? ESCAPE '\\'",
+                params,
+            ).fetchone()
+        return int(row[0])
+    finally:
+        conn.close()
+
+
+def list_lschet(
+    query: str | None = None,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[sqlite3.Row]:
+    """Return one bounded page of accounts for the administrative directory."""
+    if limit < 1 or limit > 100:
+        raise ValueError("Размер страницы должен быть от 1 до 100")
+    if offset < 0:
+        raise ValueError("Смещение не может быть отрицательным")
+    params = _licschet_search(query)
+    conn = get_conn()
+    try:
+        if not params:
+            return conn.execute(
+                "SELECT id, number, fio, address FROM licschet "
+                "ORDER BY number LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+        return conn.execute(
+            "SELECT id, number, fio, address FROM licschet WHERE "
+            "number LIKE ? ESCAPE '\\' OR fio LIKE ? ESCAPE '\\' "
+            "OR address LIKE ? ESCAPE '\\' ORDER BY number LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def create_lschet(
+    number: str,
+    fio: str | None = None,
+    address: str | None = None,
+) -> bool:
+    """Insert one account without overwriting an existing account."""
+    normalized = normalize_lschet_number(number)
+    normalized_fio = _normalize_optional_lschet_field(
+        fio,
+        label="ФИО",
+        max_length=256,
+    )
+    normalized_address = _normalize_optional_lschet_field(
+        address,
+        label="Адрес",
+        max_length=512,
+    )
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN")
+        conn.execute(
+            "INSERT INTO licschet (number, fio, address) VALUES (?, ?, ?)",
+            (normalized, normalized_fio, normalized_address),
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        if (
+            getattr(exc, "sqlite_errorname", None) == "SQLITE_CONSTRAINT_UNIQUE"
+            and "licschet.number" in str(exc)
+        ):
+            return False
+        raise
+    finally:
+        conn.close()
+
+def get_ls(number: str) -> sqlite3.Row | None:
+    normalized = normalize_lschet_number(number)
+    conn = get_conn()
+    try:
+        return conn.execute(
+            "SELECT * FROM licschet WHERE number=?", (normalized,)
+        ).fetchone()
+    finally:
+        conn.close()
 
 
 def get_schetchiki(ls: str) -> list[sqlite3.Row]:
@@ -1477,70 +1619,109 @@ def import_from_excel(filepath: str = "Данные_по_ЛС.xlsx") -> None:
         log.error(message)
         raise FileNotFoundError(message) from exc
 
-    conn = get_conn()
-
-    if "ЛС и ФИО" in wb.sheetnames:
-        ws = wb["ЛС и ФИО"]
-        count = 0
-        for i, row in enumerate(ws.iter_rows(values_only=True)):
-            if i == 0:
-                continue
-            number = str(row[0]).strip() if row[0] else None
-            fio = str(row[1]).strip() if row[1] else None
-            address = str(row[2]).strip() if row[2] else None
-            if not number:
-                continue
-            conn.execute(
-                "INSERT OR REPLACE INTO licschet (number, fio, address) VALUES (?, ?, ?)",
-                (number, fio, address),
-            )
-            count += 1
-        conn.commit()
-        log.info("Импортировано лицевых счетов: %d", count)
-
-    if "Счетчики" in wb.sheetnames:
-        ws = wb["Счетчики"]
-        conn.execute("DELETE FROM schetchiki")
-        count = init_count = 0
-
-        for i, row in enumerate(ws.iter_rows(values_only=True)):
-            if i == 0 or not row[0]:
-                continue
-            ls            = str(row[0]).strip()
-            resource_type = str(row[1]).strip() if row[1] else ""
-            meter_number  = str(row[2]).strip() if row[2] else ""
-            meter_type    = str(row[3]).strip() if row[3] else "Однотарифный"
-            initial1      = str(row[4]).strip() if row[4] else "0"
-            initial2      = str(row[5]).strip() if row[5] else "0"
-
-            conn.execute(
-                "INSERT INTO schetchiki "
-                "(ls, resource_type, meter_number, meter_type, initial1, initial2) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (ls, resource_type, meter_number, meter_type, initial1, initial2),
-            )
-            count += 1
-
-            # Начальные показания — только для новых счётчиков (один проход)
-            existing = conn.execute(
-                "SELECT id FROM pokazaniya WHERE ls=? AND meter_number=? LIMIT 1",
-                (ls, meter_number),
-            ).fetchone()
-            if not existing:
-                v2 = initial2 if meter_type == "Двухтарифный" and initial2 else None
-                conn.execute(
-                    "INSERT INTO pokazaniya "
-                    "(chat_id, ls, resource_type, meter_number, value1, value2, created_at, sent_to_1c) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
-                    (0, ls, resource_type, meter_number, initial1, v2, "2000-01-01 00:00"),
+    accounts: list[tuple[str, str | None, str | None]] = []
+    meters: list[tuple[str, str, str, str, str, str]] = []
+    has_accounts_sheet = "ЛС и ФИО" in wb.sheetnames
+    has_meters_sheet = "Счетчики" in wb.sheetnames
+    try:
+        if has_accounts_sheet:
+            for row_number, row in enumerate(
+                wb["ЛС и ФИО"].iter_rows(values_only=True), start=1
+            ):
+                if row_number == 1 or not row[0]:
+                    continue
+                try:
+                    number = normalize_lschet_number(str(row[0]))
+                except ValueError as exc:
+                    raise ValueError(
+                        "Некорректный лицевой счёт на листе «ЛС и ФИО», "
+                        f"строка {row_number}: {exc}"
+                    ) from exc
+                fio = _normalize_optional_lschet_field(
+                    str(row[1]) if row[1] else None,
+                    label="ФИО",
+                    max_length=256,
                 )
-                init_count += 1
+                address = _normalize_optional_lschet_field(
+                    str(row[2]) if row[2] else None,
+                    label="Адрес",
+                    max_length=512,
+                )
+                accounts.append((number, fio, address))
 
+        if has_meters_sheet:
+            for row_number, row in enumerate(
+                wb["Счетчики"].iter_rows(values_only=True), start=1
+            ):
+                if row_number == 1 or not row[0]:
+                    continue
+                try:
+                    ls = normalize_lschet_number(str(row[0]))
+                except ValueError as exc:
+                    raise ValueError(
+                        "Некорректный лицевой счёт на листе «Счетчики», "
+                        f"строка {row_number}: {exc}"
+                    ) from exc
+                meters.append(
+                    (
+                        ls,
+                        str(row[1]).strip() if row[1] else "",
+                        str(row[2]).strip() if row[2] else "",
+                        str(row[3]).strip() if row[3] else "Однотарифный",
+                        str(row[4]).strip() if row[4] else "0",
+                        str(row[5]).strip() if row[5] else "0",
+                    )
+                )
+    finally:
+        close_workbook = getattr(wb, "close", None)
+        if callable(close_workbook):
+            close_workbook()
+
+    conn = get_conn()
+    initial_count = 0
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if has_accounts_sheet:
+            conn.executemany(
+                "INSERT OR REPLACE INTO licschet (number, fio, address) VALUES (?, ?, ?)",
+                accounts,
+            )
+
+        if has_meters_sheet:
+            conn.execute("DELETE FROM schetchiki")
+            for ls, resource_type, meter_number, meter_type, initial1, initial2 in meters:
+                conn.execute(
+                    "INSERT INTO schetchiki "
+                    "(ls, resource_type, meter_number, meter_type, initial1, initial2) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (ls, resource_type, meter_number, meter_type, initial1, initial2),
+                )
+                existing = conn.execute(
+                    "SELECT id FROM pokazaniya WHERE ls=? AND meter_number=? LIMIT 1",
+                    (ls, meter_number),
+                ).fetchone()
+                if not existing:
+                    value2 = initial2 if meter_type == "Двухтарифный" and initial2 else None
+                    conn.execute(
+                        "INSERT INTO pokazaniya "
+                        "(chat_id, ls, resource_type, meter_number, value1, value2, created_at, sent_to_1c) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+                        (0, ls, resource_type, meter_number, initial1, value2,
+                         "2000-01-01 00:00"),
+                    )
+                    initial_count += 1
         conn.commit()
-        log.info("Импортировано счётчиков: %d", count)
-        log.info("Записано начальных показаний: %d", init_count)
+    except Exception:  # noqa: BLE001 - transaction boundary must rollback all errors
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
-    conn.close()
+    if has_accounts_sheet:
+        log.info("Импортировано лицевых счетов: %d", len(accounts))
+    if has_meters_sheet:
+        log.info("Импортировано счётчиков: %d", len(meters))
+        log.info("Записано начальных показаний: %d", initial_count)
 
 
 # ── Пользователи портала ──────────────────────────────────────────────────────
