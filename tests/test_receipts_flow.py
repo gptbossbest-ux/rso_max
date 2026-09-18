@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -519,3 +520,31 @@ def test_posix_open_rejects_file_swapped_to_outside_symlink(
         7, "Квитанция для ЛС TEST-LS-001 не найдена."
     )
     assert outside.read_bytes() == b"must-not-upload"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX FIFO behavior")
+def test_posix_fifo_is_rejected_without_blocking_or_calling_http(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "KV"
+    root.mkdir()
+    os.mkfifo(root / "TEST-LS-001.pdf")
+    deps = make_upload_deps(
+        open_receipt=lambda account: receipts.open_local_receipt(root, account)
+    )
+
+    worker = threading.Thread(
+        target=receipts.send_pdf,
+        args=(7, "TEST-LS-001", deps),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout=1)
+
+    assert not worker.is_alive(), (
+        "opening a FIFO must fail without waiting for a writer"
+    )
+    deps.http_client.post.assert_not_called()
+    deps.send_message.assert_called_once_with(
+        7, "Квитанция для ЛС TEST-LS-001 не найдена."
+    )

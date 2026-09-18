@@ -78,7 +78,9 @@ def validate_receipt_account(account: str) -> str:
 def _open_posix_receipt(root: Path, filename: str) -> BinaryIO:
     """Atomically open a regular file relative to a non-symlink directory."""
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    file_flags = os.O_RDONLY | os.O_NOFOLLOW
+    # O_NONBLOCK prevents a malicious/surprising FIFO from blocking before
+    # fstat can reject it.  It has no effect on subsequent regular-file reads.
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     if hasattr(os, "O_CLOEXEC"):
         directory_flags |= os.O_CLOEXEC
         file_flags |= os.O_CLOEXEC
@@ -181,6 +183,7 @@ def _open_windows_receipt(root: Path, filename: str) -> BinaryIO:
         None,
     )
     file_handle = invalid_handle
+    descriptor = -1
     try:
         root_info = FileInformation()
         if root_handle == invalid_handle or not get_information(
@@ -219,10 +222,14 @@ def _open_windows_receipt(root: Path, filename: str) -> BinaryIO:
             int(file_handle), os.O_RDONLY | getattr(os, "O_BINARY", 0)
         )
         file_handle = invalid_handle  # ownership transferred to descriptor
-        return os.fdopen(descriptor, "rb")
+        document = os.fdopen(descriptor, "rb")
+        descriptor = -1  # ownership transferred to the Python file object
+        return document
     except (OSError, ValueError):
         raise FileNotFoundError from None
     finally:
+        if descriptor >= 0:
+            os.close(descriptor)
         if file_handle != invalid_handle:
             close_handle(file_handle)
         if root_handle != invalid_handle:
