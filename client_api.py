@@ -23,10 +23,6 @@ log = logging.getLogger("rso.client_api")
 
 _TIMEOUT = 5
 _HEADERS = {"Authorization": f"Bearer {INTERNAL_API_TOKEN}"}
-_SENSITIVE_POST_PATH_SUFFIXES = (
-    "/auth/request-code",
-    "/auth/verify-code",
-)
 
 
 def _get(path: str, params: dict | None = None) -> tuple[dict | list | None, str | None]:
@@ -45,24 +41,31 @@ def _get(path: str, params: dict | None = None) -> tuple[dict | list | None, str
         return None, str(exc)
 
 
-def _post(path: str, body: dict) -> tuple[dict | None, str | None]:
+def _post(
+    path: str,
+    body: dict,
+    *,
+    sensitive: bool = False,
+) -> tuple[dict | None, str | None]:
     url = f"{FASTAPI_BASE_URL}{path}"
-    sensitive = path.endswith(_SENSITIVE_POST_PATH_SUFFIXES)
     try:
         r = httpx.post(url, headers=_HEADERS, json=body, timeout=_TIMEOUT)
         if r.status_code in (200, 201):
             return r.json(), None
         if sensitive:
-            log.warning("POST %s → %s", path, r.status_code)
+            log.warning("Sensitive POST failed with HTTP %s", r.status_code)
             return None, f"HTTP {r.status_code}"
         log.warning("POST %s → %s: %s", path, r.status_code, r.text[:200])
         return None, f"HTTP {r.status_code}: {r.json().get('detail', r.text[:100])}"
     except httpx.TimeoutException:
-        log.warning("POST %s timeout", path)
+        if sensitive:
+            log.warning("Sensitive POST timeout")
+        else:
+            log.warning("POST %s timeout", path)
         return None, "timeout"
     except Exception as exc:
         if sensitive:
-            log.error("POST %s error", path)
+            log.error("Sensitive POST failed")
             return None, "request_failed"
         log.error("POST %s error: %s", path, exc)
         return None, str(exc)
@@ -199,10 +202,14 @@ def reopen_appeal(appeal_id: int, reason: str) -> tuple[dict | None, str | None]
 # ── Авторизация через 1С ─────────────────────────────────────────────────────
 
 def request_1c_auth_code(ls: str, chat_id: int) -> tuple[dict | None, str | None]:
-    return _post("/api/v1/integrations/1c/auth/request-code", {
-        "ls": ls,
-        "chat_id": chat_id,
-    })
+    return _post(
+        "/api/v1/integrations/1c/auth/request-code",
+        {
+            "ls": ls,
+            "chat_id": chat_id,
+        },
+        sensitive=True,
+    )
 
 
 def verify_1c_auth_code(
@@ -210,11 +217,15 @@ def verify_1c_auth_code(
     chat_id: int,
     code: str,
 ) -> tuple[dict | None, str | None]:
-    return _post("/api/v1/integrations/1c/auth/verify-code", {
-        "ls": ls,
-        "chat_id": chat_id,
-        "code": code,
-    })
+    return _post(
+        "/api/v1/integrations/1c/auth/verify-code",
+        {
+            "ls": ls,
+            "chat_id": chat_id,
+            "code": code,
+        },
+        sensitive=True,
+    )
 
 
 # ── Скрипты ───────────────────────────────────────────────────────────────────

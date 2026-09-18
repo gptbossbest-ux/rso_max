@@ -1631,7 +1631,7 @@ def get_bot_user(chat_id: int) -> sqlite3.Row | None:
 
 def upsert_bot_user(
     chat_id: int,
-    ls: str,
+    ls: str | None,
     fio: str | None,
     authorized_1c: bool | None = None,
     *,
@@ -1645,7 +1645,7 @@ def upsert_bot_user(
             "VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT(chat_id) DO UPDATE SET "
             "ls=excluded.ls, "
-            "fio=CASE WHEN bot_users.ls <> excluded.ls OR ? THEN NULL "
+            "fio=CASE WHEN bot_users.ls IS NOT excluded.ls OR ? THEN NULL "
             "WHEN excluded.fio IS NULL OR excluded.fio='' "
             "THEN bot_users.fio ELSE excluded.fio END, "
             "last_seen=excluded.last_seen, "

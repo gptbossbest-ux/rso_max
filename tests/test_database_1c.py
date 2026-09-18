@@ -42,6 +42,34 @@ class Database1CTests(unittest.TestCase):
         db.upsert_bot_user(42, "100001", "", authorized_1c=True)
         self.assertEqual(db.get_bot_user(42)["authorized_1c"], 1)
 
+    def test_bot_user_fio_account_transition_is_null_safe(self) -> None:
+        db.upsert_bot_user(42, None, "Старое ФИО")
+
+        db.upsert_bot_user(42, "new-account", None)
+        self.assertIsNone(db.get_bot_user(42)["fio"])
+
+        db.upsert_bot_user(42, "new-account", "Новое ФИО")
+        db.upsert_bot_user(42, None, None)
+        self.assertIsNone(db.get_bot_user(42)["fio"])
+
+    def test_bot_user_fio_is_preserved_for_same_or_null_account(self) -> None:
+        db.upsert_bot_user(42, None, "ФИО без ЛС")
+        db.upsert_bot_user(42, None, None)
+        self.assertEqual(db.get_bot_user(42)["fio"], "ФИО без ЛС")
+
+        db.upsert_bot_user(43, "same-account", "ФИО с ЛС")
+        db.upsert_bot_user(43, "same-account", None)
+        self.assertEqual(db.get_bot_user(43)["fio"], "ФИО с ЛС")
+
+    def test_bot_user_explicit_fio_clear_wins_without_account_change(self) -> None:
+        db.upsert_bot_user(42, None, "ФИО без ЛС")
+        db.upsert_bot_user(42, None, None, clear_fio=True)
+        self.assertIsNone(db.get_bot_user(42)["fio"])
+
+        db.upsert_bot_user(42, "same-account", "ФИО с ЛС")
+        db.upsert_bot_user(42, "same-account", "Новое ФИО", clear_fio=True)
+        self.assertIsNone(db.get_bot_user(42)["fio"])
+
     def claim(self, batch_id="new", now=None):
         return db.claim_1c_sync_batch(
             now or datetime(2099, 1, 1, tzinfo=timezone.utc), batch_id, 500, 1, 24,
