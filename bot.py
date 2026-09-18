@@ -33,7 +33,6 @@ import truststore
 
 truststore.inject_into_ssl()
 
-import json
 import logging
 import os
 import time
@@ -62,7 +61,15 @@ from config import (
 from rso_bot import max_transport
 from rso_bot import scheduler as bot_scheduler
 from rso_bot import states as session_states
-from rso_bot.flows import appeals, appointments, auth, faq, readings, receipts
+from rso_bot.flows import (
+    appeals,
+    appointments,
+    auth,
+    faq,
+    house_chats,
+    readings,
+    receipts,
+)
 from rso_bot.jobs import appointment_reminders
 from rso_bot.session import SessionManager
 
@@ -958,7 +965,7 @@ def _scheduler_dependencies() -> bot_scheduler.SchedulerDependencies:
 # в handle_message() и в итоге получало главное меню, даже если оно пришло
 # из группового домового чата. Это и была причина бага.
 
-_UNKNOWN_CHAT_TYPE_WARNED: set[int] = set()  # чтобы не спамить лог на каждое сообщение
+_UNKNOWN_CHAT_TYPE_WARNED = house_chats.unknown_chat_type_warning
 
 
 def _get_chat_type(message: dict) -> str:
@@ -970,26 +977,21 @@ def _get_chat_type(message: dict) -> str:
     при проверке) — определено по косвенным источникам (схема TamTam,
     на которой основан MAX Bot API, и сторонние клиентские библиотеки).
     Если это поле в реальном payload называется иначе — при первом же
-    сообщении из группы в лог упадёт WARNING с полным recipient,
+    сообщении из группы в лог упадёт WARNING без содержимого recipient,
     после чего нужно поправить имя ключа ниже в одну строку.
     """
-    recipient = message.get("recipient", {}) or {}
-    chat_type = recipient.get("chat_type") or message.get("chat_type")
+    return house_chats.get_chat_type(message, log, _UNKNOWN_CHAT_TYPE_WARNED)
 
-    if chat_type is None:
-        chat_id = recipient.get("chat_id")
-        if chat_id not in _UNKNOWN_CHAT_TYPE_WARNED:
-            _UNKNOWN_CHAT_TYPE_WARNED.add(chat_id)
-            log.warning(
-                "Не удалось определить chat_type для chat_id=%s — recipient=%s. "
-                "Уточни точное имя поля в реальном payload и поправь _get_chat_type(). "
-                "По умолчанию считаем 'dialog' (личный чат), чтобы не сломать "
-                "существующий клиентский флоу.",
-                chat_id, recipient,
-            )
-        return "dialog"
 
-    return chat_type
+def _house_chat_dependencies() -> house_chats.HouseChatDependencies:
+    """Resolve collaborators at call time for runtime patch compatibility."""
+    return house_chats.HouseChatDependencies(
+        get_house_chat_by_chat_id=db.get_house_chat_by_chat_id,
+        is_user_excluded=db.is_user_excluded,
+        get_scenarios_for_chat=db.get_scenarios_for_chat,
+        send_message=send_message,
+        logger=log,
+    )
 
 
 def _handle_group_message(message: dict) -> None:
@@ -998,54 +1000,11 @@ def _handle_group_message(message: dict) -> None:
 
     Логика:
       1. Если chat_id не зарегистрирован в house_chats — бот молчит.
-         (Раньше падало в handle_message() → главное меню — это и был баг.)
-      2. Если отправитель в chat_exclusions — бот молчит (раздел 7.4).
-      3. Ищем среди активных сценариев чата первый с совпадением ключевого
-         слова (регистронезависимо, подстрокой) — отвечаем response_text.
-      4. Если совпадений нет — бот молчит (не спамит группу меню/подсказками).
+      2. Если отправитель в chat_exclusions — бот молчит.
+      3. Первый активный сценарий с совпавшим ключевым словом отправляет ответ.
+      4. Если совпадений нет — бот молчит.
     """
-    recipient = message.get("recipient", {}) or {}
-    chat_id = recipient.get("chat_id")
-    if chat_id is None:
-        return
-
-    house_chat = db.get_house_chat_by_chat_id(str(chat_id))
-    if not house_chat:
-        log.debug("Сообщение из незарегистрированного группового чата chat_id=%s — игнорируем", chat_id)
-        return
-
-    sender = message.get("sender") or {}
-    sender_id = sender.get("user_id")
-    if sender_id is not None and db.is_user_excluded(house_chat["id"], "max", str(sender_id)):
-        log.debug("Отправитель user_id=%s в списке исключений чата id=%s — игнорируем",
-                  sender_id, house_chat["id"])
-        return
-
-    text = ((message.get("body") or {}).get("text") or "").lower()
-    if not text:
-        return
-
-    scenarios = db.get_scenarios_for_chat(house_chat["id"])
-    for scenario in scenarios:
-        try:
-            keywords = json.loads(scenario["keywords"])
-        except (TypeError, ValueError, json.JSONDecodeError):
-            log.warning("Некорректный JSON в keywords сценария id=%s — пропускаем", scenario["id"])
-            continue
-
-        if any(kw.lower() in text for kw in keywords if kw):
-            send_message(chat_id, scenario["response_text"])
-            log.info(
-                "Сценарий '%s' сработал в чате id=%s (house_chat) по ключевому слову",
-                scenario["title"], house_chat["id"],
-            )
-            if scenario["suggest_appeal"]:
-                send_message(
-                    chat_id,
-                    "Если вопрос не решён — напишите мне в личные сообщения, "
-                    "оформим обращение с отслеживанием статуса.",
-                )
-            return  # первый подошедший сценарий — и хватит
+    house_chats.handle_group_message(message, _house_chat_dependencies())
 
 
 # ── Polling ────────────────────────────────────────────────────────────────────
