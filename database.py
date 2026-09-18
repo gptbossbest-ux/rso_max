@@ -889,6 +889,7 @@ def get_scenarios_for_chat(house_chat_id: int) -> list[sqlite3.Row]:
         FROM chat_scenarios cs
         JOIN chat_scenario_links csl ON csl.scenario_id = cs.id
         WHERE csl.house_chat_id = ? AND cs.is_active = 1
+        ORDER BY cs.id ASC
         """,
         (house_chat_id,),
     ).fetchall()

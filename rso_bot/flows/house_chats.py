@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable, Mapping, MutableSet, Sequence
-from dataclasses import dataclass
+import threading
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 APPEAL_SUGGESTION = (
@@ -19,8 +20,24 @@ APPEAL_SUGGESTION = (
     "оформим обращение с отслеживанием статуса."
 )
 
-# Process-local deduplication of warnings about payloads whose type is unknown.
-unknown_chat_type_warned: set[Any] = set()
+
+@dataclass
+class UnknownChatTypeWarningState:
+    """Thread-safe, bounded process state for one generic payload warning."""
+
+    warned: bool = False
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def claim(self) -> bool:
+        """Return true exactly once for this state instance."""
+        with self._lock:
+            if self.warned:
+                return False
+            self.warned = True
+            return True
+
+
+unknown_chat_type_warning = UnknownChatTypeWarningState()
 
 
 @dataclass(frozen=True)
@@ -47,25 +64,17 @@ def _field(record: Any, key: str, default: Any = None) -> Any:
         return default
 
 
-def _warning_key(chat_id: Any) -> Any:
-    try:
-        hash(chat_id)
-    except TypeError:
-        return ("unhashable", type(chat_id).__name__)
-    return chat_id
-
-
 def get_chat_type(
     message: Mapping[str, Any] | Any,
     logger: logging.Logger,
-    warned: MutableSet[Any] | None = None,
+    warning_state: UnknownChatTypeWarningState | None = None,
 ) -> str:
     """Return MAX chat type, defaulting unknown/malformed payloads to dialog.
 
     Defaulting to a private dialog is fail-safe: an uncertain update continues
     through the established client flow instead of triggering a house-chat
-    scenario.  The warning intentionally reports field names, not the raw
-    recipient payload, so user-supplied content and tokens cannot reach logs.
+    scenario.  The warning is intentionally generic and never reports the raw
+    recipient payload or chat ID, so user-supplied content cannot reach logs.
     """
     message_data = _mapping(message)
     recipient = _mapping(message_data.get("recipient"))
@@ -73,17 +82,13 @@ def get_chat_type(
     if isinstance(chat_type, str) and chat_type:
         return chat_type
 
-    registry = unknown_chat_type_warned if warned is None else warned
-    chat_id = recipient.get("chat_id")
-    warning_key = _warning_key(chat_id)
-    if warning_key not in registry:
-        registry.add(warning_key)
+    state = unknown_chat_type_warning if warning_state is None else warning_state
+    if state.claim():
         logger.warning(
-            "Не удалось определить chat_type для chat_id=%s. "
+            "Не удалось определить chat_type для входящего сообщения. "
             "Уточни точное имя поля в реальном payload и поправь get_chat_type(). "
             "По умолчанию считаем 'dialog' (личный чат), чтобы не сломать "
-            "существующий клиентский флоу.",
-            chat_id,
+            "существующий клиентский флоу."
         )
     return "dialog"
 
@@ -139,7 +144,10 @@ def handle_group_message(
         deps.logger.warning("У записи домового чата отсутствует id — пропускаем")
         return
 
-    sender = _mapping(message_data.get("sender"))
+    sender_value = message_data.get("sender")
+    if sender_value is not None and not isinstance(sender_value, Mapping):
+        return
+    sender = _mapping(sender_value)
     sender_id = sender.get("user_id")
     if sender_id is not None and deps.is_user_excluded(
         house_chat_id, "max", str(sender_id)
@@ -173,12 +181,28 @@ def handle_group_message(
             )
             continue
 
-        deps.send_message(chat_id, response_text)
+        scenario_id = _field(scenario, "id")
+        if deps.send_message(chat_id, response_text) is False:
+            deps.logger.warning(
+                "Не удалось доставить ответ сценария id=%s в домовой чат id=%s",
+                scenario_id,
+                house_chat_id,
+            )
+            return
+        if (
+            _field(scenario, "suggest_appeal", False)
+            and deps.send_message(chat_id, APPEAL_SUGGESTION) is False
+        ):
+            deps.logger.warning(
+                "Не удалось доставить предложение обращения сценария id=%s "
+                "в домовой чат id=%s",
+                scenario_id,
+                house_chat_id,
+            )
+            return
         deps.logger.info(
             "Сценарий id=%s сработал в чате id=%s (house_chat) по ключевому слову",
-            _field(scenario, "id"),
+            scenario_id,
             house_chat_id,
         )
-        if _field(scenario, "suggest_appeal", False):
-            deps.send_message(chat_id, APPEAL_SUGGESTION)
         return

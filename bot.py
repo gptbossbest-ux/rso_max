@@ -965,7 +965,7 @@ def _scheduler_dependencies() -> bot_scheduler.SchedulerDependencies:
 # в handle_message() и в итоге получало главное меню, даже если оно пришло
 # из группового домового чата. Это и была причина бага.
 
-_UNKNOWN_CHAT_TYPE_WARNED = house_chats.unknown_chat_type_warned
+_UNKNOWN_CHAT_TYPE_WARNED = house_chats.unknown_chat_type_warning
 
 
 def _get_chat_type(message: dict) -> str:
