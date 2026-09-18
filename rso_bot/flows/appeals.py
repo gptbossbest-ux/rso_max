@@ -11,6 +11,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from rso_bot.flows.auth import LsValidation
+
 State = dict[str, Any]
 Button = dict[str, Any]
 ApiResult = tuple[dict[str, Any] | None, Any]
@@ -29,7 +31,7 @@ class AppealDependencies:
     get_saved_ls: Callable[[int], str | None]
     request_ls: Callable[[int, str], None]
     check_ls_brute: Callable[[int], str | None]
-    validate_ls: Callable[[str], bool]
+    validate_ls: Callable[[str], bool | LsValidation]
     fail_ls: Callable[[int], str]
     reset_ls_brute: Callable[[int], None]
     save_ls: Callable[[int, str], None]
@@ -93,7 +95,11 @@ def got_ls(chat_id: int, ls_input: str, deps: AppealDependencies) -> None:
         deps.send_message(chat_id, block_message)
         return
 
-    if not deps.validate_ls(ls_input):
+    validation = deps.validate_ls(ls_input)
+    if validation is LsValidation.UNAVAILABLE:
+        deps.send_message(chat_id, "⚠️ Сервис временно недоступен. Попробуйте позже.")
+        return
+    if not validation:
         deps.send_message(chat_id, deps.fail_ls(chat_id))
         deps.send_message(chat_id, "Введите номер лицевого счёта повторно:")
         return

@@ -238,7 +238,7 @@ def _save_ls(chat_id: int, ls: str, fio: str | None = None) -> None:
     auth.save_ls(chat_id, ls, fio, _account_dependencies())
 
 
-def _validate_ls(ls_number: str) -> bool:
+def _validate_ls(ls_number: str) -> auth.LsValidation:
     """Compatibility wrapper for account validation."""
     return auth.validate_ls(ls_number, _account_dependencies())
 
@@ -833,7 +833,8 @@ def handle_message(message: dict) -> None:
     text    = (message.get("body") or {}).get("text", "").strip()
 
     current_state = _get_state(chat_id).get("state", S.MENU)
-    safe_text = "<скрыто>" if current_state == S.AWAIT_CODE_1C else text[:50]
+    secret_input_states = {S.AWAIT_LS, S.AWAIT_LS_1C, S.AWAIT_CODE_1C}
+    safe_text = "<скрыто>" if current_state in secret_input_states else text[:50]
     log.debug("msg chat_id=%s text='%s'", chat_id, safe_text)
 
     if not text:

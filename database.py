@@ -1634,6 +1634,8 @@ def upsert_bot_user(
     ls: str,
     fio: str | None,
     authorized_1c: bool | None = None,
+    *,
+    clear_fio: bool = False,
 ) -> None:
     conn = get_conn()
     try:
@@ -1643,12 +1645,21 @@ def upsert_bot_user(
             "VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT(chat_id) DO UPDATE SET "
             "ls=excluded.ls, "
-            "fio=CASE WHEN excluded.fio IS NULL OR excluded.fio='' "
+            "fio=CASE WHEN ? THEN NULL "
+            "WHEN excluded.fio IS NULL OR excluded.fio='' "
             "THEN bot_users.fio ELSE excluded.fio END, "
             "last_seen=excluded.last_seen, "
             "authorized_1c=CASE WHEN ? IS NULL THEN bot_users.authorized_1c "
             "ELSE excluded.authorized_1c END",
-            (chat_id, ls, fio, msk_now(), auth_value, authorized_1c),
+            (
+                chat_id,
+                ls,
+                fio,
+                msk_now(),
+                auth_value,
+                clear_fio,
+                authorized_1c,
+            ),
         )
         conn.commit()
     finally:

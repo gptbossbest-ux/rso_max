@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, call
 import pytest
 
 import bot
+import database as db
 from rso_bot.flows import auth
 from rso_bot.states import S
 
@@ -143,7 +144,57 @@ def test_save_ls_preserves_fio_and_mode() -> None:
     auth.save_ls(42, "100001", None, deps)
 
     assert state == {"ls": "100001", "fio": "Старое имя", "authorized_1c": True}
-    upsert.assert_called_once_with(42, "100001", "", authorized_1c=True)
+    upsert.assert_called_once_with(
+        42,
+        "100001",
+        "",
+        authorized_1c=True,
+        clear_fio=False,
+    )
+
+
+def test_save_ls_clears_fio_on_account_change_in_session_and_database(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "auth.sqlite"))
+    db.init_db()
+    db.upsert_bot_user(42, "old-account", "Старое ФИО", authorized_1c=True)
+    state = {
+        "ls": "old-account",
+        "fio": "Старое ФИО",
+        "authorized_1c": True,
+    }
+    deps = _account_deps(
+        get_state=MagicMock(return_value=state),
+        get_bot_user=db.get_bot_user,
+        upsert_bot_user=db.upsert_bot_user,
+        integration_enabled=True,
+    )
+
+    auth.save_ls(42, "new-account", None, deps)
+
+    assert state == {"ls": "new-account", "authorized_1c": True}
+    assert db.get_bot_user(42)["fio"] is None
+    assert db.get_all_bot_users()[0]["fio"] is None
+
+
+def test_save_ls_preserves_fio_for_same_account_in_real_database(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "auth.sqlite"))
+    db.init_db()
+    db.upsert_bot_user(42, "same-account", "Сохранённое ФИО", authorized_1c=True)
+    state: dict = {}
+    deps = _account_deps(
+        get_state=MagicMock(return_value=state),
+        get_bot_user=db.get_bot_user,
+        upsert_bot_user=db.upsert_bot_user,
+        integration_enabled=True,
+    )
+
+    auth.save_ls(42, "same-account", None, deps)
+
+    assert db.get_bot_user(42)["fio"] == "Сохранённое ФИО"
 
 
 def test_save_ls_rolls_back_session_when_persistence_fails() -> None:
@@ -192,6 +243,45 @@ def test_validate_ls_database_failure_is_safe_and_does_not_log_account(
     assert "SECRET-LS" not in caplog.text
 
 
+def test_database_outage_does_not_consume_attempts_or_lose_deferred_flow() -> None:
+    state = {"state": S.AWAIT_LS, "after_ls": "appeal", "appeal": {"body": "x"}}
+    attempts: dict = {}
+    account_deps = _account_deps(
+        get_ls=MagicMock(
+            side_effect=[
+                sqlite3.Error("offline 1"),
+                sqlite3.Error("offline 2"),
+                sqlite3.Error("offline 3"),
+                {"ls": "100001"},
+            ]
+        )
+    )
+    brute_deps = _brute_deps(attempts=attempts)
+    continuation = MagicMock()
+    deps = _flow_deps(
+        validate_ls=lambda value: auth.validate_ls(value, account_deps),
+        check_ls_brute=lambda chat_id: auth.check_ls_brute(chat_id, brute_deps),
+        fail_ls=lambda chat_id: auth.fail_ls(chat_id, brute_deps),
+        reset_ls_brute=lambda chat_id: auth.reset_ls_brute(chat_id, brute_deps),
+        continuations={"appeal": continuation},
+    )
+
+    for _ in range(3):
+        auth.on_await_ls(42, state, "100001", deps)
+        assert attempts == {}
+        assert state == {
+            "state": S.AWAIT_LS,
+            "after_ls": "appeal",
+            "appeal": {"body": "x"},
+        }
+
+    auth.on_await_ls(42, state, "100001", deps)
+
+    continuation.assert_called_once_with(42, "100001")
+    assert attempts == {}
+    assert state == {"state": S.MENU, "appeal": {"body": "x"}}
+
+
 def test_brute_force_blocks_on_exact_limit_and_expires() -> None:
     attempts: dict = {}
     deps = _brute_deps(attempts=attempts)
@@ -206,8 +296,9 @@ def test_brute_force_blocks_on_exact_limit_and_expires() -> None:
 
     expired = _brute_deps(attempts=attempts, now=lambda: NOW + timedelta(minutes=30))
     assert auth.check_ls_brute(42, expired) is None
-    auth.reset_ls_brute(42, expired)
     assert 42 not in attempts
+    assert auth.fail_ls(42, expired) == "Лицевой счёт не найден. Осталось попыток: 2"
+    assert attempts[42]["attempts"] == 1
 
 
 def test_bot_brute_wrappers_keep_runtime_registry_clock_and_limits(
@@ -230,6 +321,27 @@ def test_bot_brute_wrappers_keep_runtime_registry_clock_and_limits(
 
 def test_bot_default_attempt_registry_is_owned_by_auth_module() -> None:
     assert bot._auth_attempts is auth.auth_attempts
+
+
+@pytest.mark.parametrize("secret_state", [S.AWAIT_LS, S.AWAIT_LS_1C, S.AWAIT_CODE_1C])
+def test_handle_message_redacts_account_and_code_input_from_debug_log(
+    secret_state: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sentinel = "SECRET-LS-OR-CODE-991122"
+    state = {"state": secret_state}
+    handler = MagicMock()
+    monkeypatch.setattr(bot, "_get_state", MagicMock(return_value=state))
+    monkeypatch.setattr(bot, "_touch", MagicMock())
+    monkeypatch.setattr(bot, "_MESSAGE_HANDLERS", {secret_state: handler})
+
+    with caplog.at_level(logging.DEBUG, logger=bot.log.name):
+        bot.handle_message({"recipient": {"chat_id": 42}, "body": {"text": sentinel}})
+
+    handler.assert_called_once_with(42, state, sentinel)
+    assert sentinel not in caplog.text
+    assert "<скрыто>" in caplog.text
 
 
 def test_request_ls_preserves_context_and_deferred_action() -> None:
@@ -366,6 +478,20 @@ def test_request_code_handles_error_and_malformed_payload(response: tuple) -> No
     deps.send_main_menu.assert_called_once_with(42)  # type: ignore[attr-defined]
 
 
+def test_request_code_rejects_wrong_status_and_message_types() -> None:
+    state = {"state": S.AWAIT_LS_1C}
+    deps = _flow_deps(
+        request_1c_auth_code=MagicMock(
+            return_value=({"status": ["ok"], "message": {"secret": "value"}}, None)
+        )
+    )
+
+    auth.on_await_ls_1c(42, state, "100001", deps)
+
+    deps.send_message.assert_called_once_with(42, "Не удалось запросить код.")  # type: ignore[attr-defined]
+    assert state == {"state": S.MENU}
+
+
 def test_request_code_rejects_empty_account_without_calling_api() -> None:
     state = {"state": S.AWAIT_LS_1C}
     request = MagicMock()
@@ -419,6 +545,20 @@ def test_verify_code_handles_error_and_malformed_payload(response: tuple) -> Non
 
     assert state == {"state": S.MENU}
     deps.send_main_menu.assert_called_once_with(42)  # type: ignore[attr-defined]
+
+
+def test_verify_code_rejects_wrong_status_and_message_types() -> None:
+    state = {"state": S.AWAIT_CODE_1C, "pending_1c_ls": "100001"}
+    deps = _flow_deps(
+        verify_1c_auth_code=MagicMock(
+            return_value=({"status": {"ok": True}, "message": ["secret"]}, None)
+        )
+    )
+
+    auth.on_await_code_1c(42, state, "123456", deps)
+
+    deps.send_message.assert_called_once_with(42, "Не удалось проверить код.")  # type: ignore[attr-defined]
+    assert state == {"state": S.MENU}
 
 
 def test_missing_pending_account_restarts_authorization_without_api_call() -> None:

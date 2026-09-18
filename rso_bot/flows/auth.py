@@ -11,6 +11,7 @@ import logging
 from collections.abc import Callable, MutableMapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import Enum
 from typing import Any
 
 from rso_bot.states import S
@@ -22,6 +23,18 @@ AttemptRegistry = MutableMapping[int, dict[str, Any]]
 # Default process-local storage.  ``bot._auth_attempts`` remains an alias for
 # compatibility and may still be rebound by tests or embedding applications.
 auth_attempts: dict[int, dict[str, Any]] = {}
+
+
+class LsValidation(Enum):
+    """Typed result that keeps backend failures distinct from invalid accounts."""
+
+    VALID = "valid"
+    INVALID = "invalid"
+    UNAVAILABLE = "unavailable"
+
+    def __bool__(self) -> bool:
+        """Preserve the legacy truthiness contract for existing callers."""
+        return self is LsValidation.VALID
 
 
 @dataclass(frozen=True)
@@ -55,7 +68,7 @@ class AuthFlowDependencies:
     clear_flow: Callable[[Session], None]
     send_message: Callable[[int, str], Any]
     send_main_menu: Callable[..., None]
-    validate_ls: Callable[[str], bool]
+    validate_ls: Callable[[str], bool | LsValidation]
     check_ls_brute: Callable[[int], str | None]
     fail_ls: Callable[[int], str]
     reset_ls_brute: Callable[[int], None]
@@ -113,16 +126,25 @@ def save_ls(
         "authorized_1c": state.get("authorized_1c", missing),
         "fio": state.get("fio", missing),
     }
+    previous_ls = state.get("ls")
+    if previous_ls is None:
+        persisted = deps.get_bot_user(chat_id)
+        previous_ls = _row_value(persisted, "ls") if persisted is not None else None
+    account_changed = previous_ls is not None and str(previous_ls) != ls
+
     state["ls"] = ls
     state["authorized_1c"] = deps.integration_enabled
     if fio:
         state["fio"] = fio
+    elif account_changed:
+        state.pop("fio", None)
     try:
         deps.upsert_bot_user(
             chat_id,
             ls,
             fio or "",
             authorized_1c=deps.integration_enabled,
+            clear_fio=account_changed and not fio,
         )
     except Exception:
         for key, value in previous.items():
@@ -133,13 +155,15 @@ def save_ls(
         raise
 
 
-def validate_ls(ls_number: str, deps: AccountDependencies) -> bool:
-    """Return whether the account exists, treating DB failures as unavailable."""
+def validate_ls(ls_number: str, deps: AccountDependencies) -> LsValidation:
+    """Return a typed result without treating backend failures as bad input."""
     try:
-        return deps.get_ls(ls_number) is not None
+        if deps.get_ls(ls_number) is not None:
+            return LsValidation.VALID
+        return LsValidation.INVALID
     except Exception:  # noqa: BLE001 - DB adapter boundary must fail closed
         deps.logger.error("Не удалось проверить лицевой счёт")
-        return False
+        return LsValidation.UNAVAILABLE
 
 
 def check_ls_brute(chat_id: int, deps: BruteForceDependencies) -> str | None:
@@ -150,6 +174,8 @@ def check_ls_brute(chat_id: int, deps: BruteForceDependencies) -> str | None:
     if blocked_until and now < blocked_until:
         remaining = int((blocked_until - now).total_seconds() / 60) + 1
         return f"Слишком много неудачных попыток.\nПопробуйте через {remaining} мин."
+    if blocked_until:
+        deps.attempts.pop(chat_id, None)
     return None
 
 
@@ -221,7 +247,14 @@ def on_await_ls(
         deps.send_message(chat_id, block_message)
         return
 
-    if not deps.validate_ls(text):
+    validation = deps.validate_ls(text)
+    if validation is LsValidation.UNAVAILABLE:
+        deps.send_message(
+            chat_id,
+            "⚠️ Сервис временно недоступен. Попробуйте позже.",
+        )
+        return
+    if not validation:
         deps.send_message(chat_id, deps.fail_ls(chat_id))
         deps.send_message(chat_id, "Введите номер лицевого счёта повторно:")
         return
@@ -272,8 +305,14 @@ def on_await_ls_1c(
         _service_failure(chat_id, state, deps)
         return
 
-    status = data.get("status")
-    message = data.get("message") or "Не удалось запросить код."
+    status_value = data.get("status")
+    status = status_value if isinstance(status_value, str) else None
+    message_value = data.get("message")
+    message = (
+        message_value
+        if isinstance(message_value, str) and message_value
+        else "Не удалось запросить код."
+    )
     if status == "ok":
         state["pending_1c_ls"] = ls
         state["state"] = S.AWAIT_CODE_1C
@@ -307,8 +346,14 @@ def on_await_code_1c(
         _service_failure(chat_id, state, deps)
         return
 
-    status = data.get("status")
-    message = data.get("message") or "Не удалось проверить код."
+    status_value = data.get("status")
+    status = status_value if isinstance(status_value, str) else None
+    message_value = data.get("message")
+    message = (
+        message_value
+        if isinstance(message_value, str) and message_value
+        else "Не удалось проверить код."
+    )
     if status == "wrong_code":
         deps.send_message(chat_id, message)
         return
