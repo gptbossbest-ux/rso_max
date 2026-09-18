@@ -127,10 +127,18 @@ def save_ls(
         "fio": state.get("fio", missing),
     }
     previous_ls = state.get("ls")
+    persisted = None
     if previous_ls is None:
         persisted = deps.get_bot_user(chat_id)
         previous_ls = _row_value(persisted, "ls") if persisted is not None else None
-    account_changed = previous_ls is not None and str(previous_ls) != ls
+
+    # A NULL -> concrete account transition must invalidate an old FIO when
+    # there is evidence of a pre-existing identity.  Merely binding the first
+    # account for a brand-new user is not treated as a replacement.
+    has_prior_identity = persisted is not None or bool(state.get("fio"))
+    account_changed = (previous_ls is not None and str(previous_ls) != ls) or (
+        previous_ls is None and ls is not None and has_prior_identity
+    )
 
     state["ls"] = ls
     state["authorized_1c"] = deps.integration_enabled

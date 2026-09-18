@@ -132,8 +132,8 @@ def test_get_saved_ls_database_failure_does_not_log_account_or_fio(
     assert "Иванов Секретный" not in caplog.text
 
 
-def test_save_ls_preserves_fio_and_mode() -> None:
-    state = {"fio": "Старое имя"}
+def test_save_ls_binds_first_account_without_requesting_fio_clear() -> None:
+    state: dict = {}
     upsert = MagicMock()
     deps = _account_deps(
         get_state=MagicMock(return_value=state),
@@ -143,7 +143,7 @@ def test_save_ls_preserves_fio_and_mode() -> None:
 
     auth.save_ls(42, "100001", None, deps)
 
-    assert state == {"ls": "100001", "fio": "Старое имя", "authorized_1c": True}
+    assert state == {"ls": "100001", "authorized_1c": True}
     upsert.assert_called_once_with(
         42,
         "100001",
@@ -151,6 +151,56 @@ def test_save_ls_preserves_fio_and_mode() -> None:
         authorized_1c=True,
         clear_fio=False,
     )
+
+
+def test_save_ls_clears_stale_fio_for_null_to_account_transition(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "auth.sqlite"))
+    db.init_db()
+    db.upsert_bot_user(42, None, "Устаревшее ФИО", authorized_1c=True)
+    state = {"fio": "Устаревшее ФИО", "authorized_1c": True}
+    deps = _account_deps(
+        get_state=MagicMock(return_value=state),
+        get_bot_user=db.get_bot_user,
+        upsert_bot_user=db.upsert_bot_user,
+        integration_enabled=True,
+    )
+
+    auth.save_ls(42, "new-account", None, deps)
+
+    assert state == {"ls": "new-account", "authorized_1c": True}
+    row = db.get_bot_user(42)
+    assert row is not None
+    assert row["ls"] == "new-account"
+    assert row["fio"] is None
+
+
+def test_save_ls_explicit_fio_wins_during_account_transition(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "auth.sqlite"))
+    db.init_db()
+    db.upsert_bot_user(42, "old-account", "Старое ФИО", authorized_1c=True)
+    state = {"ls": "old-account", "fio": "Старое ФИО"}
+    deps = _account_deps(
+        get_state=MagicMock(return_value=state),
+        get_bot_user=db.get_bot_user,
+        upsert_bot_user=db.upsert_bot_user,
+        integration_enabled=True,
+    )
+
+    auth.save_ls(42, "new-account", "Новое ФИО", deps)
+
+    assert state == {
+        "ls": "new-account",
+        "fio": "Новое ФИО",
+        "authorized_1c": True,
+    }
+    row = db.get_bot_user(42)
+    assert row is not None
+    assert row["ls"] == "new-account"
+    assert row["fio"] == "Новое ФИО"
 
 
 def test_save_ls_clears_fio_on_account_change_in_session_and_database(
@@ -217,6 +267,21 @@ def test_save_ls_rolls_back_session_when_persistence_fails() -> None:
         "fio": "Иванов Иван",
         "authorized_1c": False,
     }
+
+
+def test_save_ls_rolls_back_stale_fio_clear_when_persistence_fails() -> None:
+    state = {"fio": "Устаревшее ФИО", "authorized_1c": False}
+    deps = _account_deps(
+        get_state=MagicMock(return_value=state),
+        get_bot_user=MagicMock(return_value={"ls": None, "fio": "Устаревшее ФИО"}),
+        upsert_bot_user=MagicMock(side_effect=sqlite3.Error("disk failed")),
+        integration_enabled=True,
+    )
+
+    with pytest.raises(sqlite3.Error, match="disk failed"):
+        auth.save_ls(42, "new-account", None, deps)
+
+    assert state == {"fio": "Устаревшее ФИО", "authorized_1c": False}
 
 
 @pytest.mark.parametrize("value", ["100001", " 100001 ", "", "abc", "１２３"])

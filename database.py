@@ -1640,21 +1640,24 @@ def upsert_bot_user(
     conn = get_conn()
     try:
         auth_value = int(bool(authorized_1c)) if authorized_1c is not None else 0
+        fio_value = None if clear_fio else fio
         conn.execute(
             "INSERT INTO bot_users (chat_id, ls, fio, last_seen, authorized_1c) "
             "VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT(chat_id) DO UPDATE SET "
             "ls=excluded.ls, "
-            "fio=CASE WHEN bot_users.ls IS NOT excluded.ls OR ? THEN NULL "
-            "WHEN excluded.fio IS NULL OR excluded.fio='' "
-            "THEN bot_users.fio ELSE excluded.fio END, "
+            "fio=CASE WHEN ? THEN NULL "
+            "WHEN excluded.fio IS NOT NULL AND excluded.fio<>'' "
+            "THEN excluded.fio "
+            "WHEN bot_users.ls IS NOT excluded.ls THEN NULL "
+            "ELSE bot_users.fio END, "
             "last_seen=excluded.last_seen, "
             "authorized_1c=CASE WHEN ? IS NULL THEN bot_users.authorized_1c "
             "ELSE excluded.authorized_1c END",
             (
                 chat_id,
                 ls,
-                fio,
+                fio_value,
                 msk_now(),
                 auth_value,
                 clear_fio,

@@ -70,6 +70,45 @@ class Database1CTests(unittest.TestCase):
         db.upsert_bot_user(42, "same-account", "Новое ФИО", clear_fio=True)
         self.assertIsNone(db.get_bot_user(42)["fio"])
 
+        db.upsert_bot_user(43, "first-account", "Новое ФИО", clear_fio=True)
+        self.assertIsNone(db.get_bot_user(43)["fio"])
+
+    def test_bot_user_fio_update_priority_matrix(self) -> None:
+        """Lock down clear/new-FIO/account-change precedence for all NULL cases."""
+        chat_id = 1000
+        for old_ls in (None, "account-a"):
+            for new_ls in (None, "account-a", "account-b"):
+                for new_fio in (None, "", "Новое ФИО"):
+                    for clear_fio in (False, True):
+                        chat_id += 1
+                        db.upsert_bot_user(chat_id, old_ls, "Старое ФИО")
+
+                        db.upsert_bot_user(
+                            chat_id,
+                            new_ls,
+                            new_fio,
+                            clear_fio=clear_fio,
+                        )
+
+                        if clear_fio:
+                            expected_fio = None
+                        elif new_fio:
+                            expected_fio = new_fio
+                        elif old_ls != new_ls:
+                            expected_fio = None
+                        else:
+                            expected_fio = "Старое ФИО"
+                        with self.subTest(
+                            old_ls=old_ls,
+                            new_ls=new_ls,
+                            new_fio=new_fio,
+                            clear_fio=clear_fio,
+                        ):
+                            row = db.get_bot_user(chat_id)
+                            self.assertIsNotNone(row)
+                            self.assertEqual(row["ls"], new_ls)
+                            self.assertEqual(row["fio"], expected_fio)
+
     def claim(self, batch_id="new", now=None):
         return db.claim_1c_sync_batch(
             now or datetime(2099, 1, 1, tzinfo=timezone.utc), batch_id, 500, 1, 24,
