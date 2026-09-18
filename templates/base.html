@@ -235,6 +235,10 @@
            class="nav-item {% if request.endpoint in ('users_page','user_create','user_delete') %}active{% endif %}">
             👥 Пользователи
         </a>
+        <a href="{{ url_for('ai_settings_page') }}"
+           class="nav-item {% if request.endpoint == 'ai_settings_page' %}active{% endif %}">
+            🤖 ИИ-помощник
+        </a>
         {% endif %}
         <div class="nav-label">История</div>
         <a href="{{ url_for('legacy_list') }}"

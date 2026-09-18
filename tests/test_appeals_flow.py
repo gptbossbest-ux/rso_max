@@ -69,6 +69,24 @@ def test_start_and_category_preserve_state_buttons_and_text():
     deps.send_message.assert_called_once_with(42, "Опишите вашу проблему или вопрос:")
 
 
+def test_ai_draft_is_preserved_and_can_be_submitted_or_edited():
+    deps, state = _dependencies(saved_ls="100001")
+    appeals.start_appeal(42, deps, draft_body="Вопрос\nОтвет ИИ")
+    assert state["appeal"]["body"] == "Вопрос\nОтвет ИИ"
+
+    appeals.set_category(42, "прочее", deps)
+    assert state["appeal"]["category"] == "прочее"
+    payloads = [row[0]["payload"] for row in deps.send_buttons.call_args.args[2]]
+    assert payloads == ["appeal_draft_submit", "appeal_draft_edit", "cancel"]
+
+    appeals.submit_draft(42, deps)
+    deps.submit_appeal.assert_called_once_with(42, "100001")
+
+    appeals.edit_draft(42, deps)
+    assert state["state"] == "appeal_body"
+    assert "изменённый текст" in deps.send_message.call_args.args[1]
+
+
 def test_body_submits_with_saved_ls_or_requests_authorization_without_it():
     saved, state = _dependencies(saved_ls="100001")
     state["appeal"] = {"category": "авария"}

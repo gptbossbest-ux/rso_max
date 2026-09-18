@@ -49,11 +49,18 @@ class AppealDependencies:
     menu_state: str
 
 
-def start_appeal(chat_id: int, deps: AppealDependencies) -> None:
+def start_appeal(
+    chat_id: int,
+    deps: AppealDependencies,
+    draft_body: str | None = None,
+) -> None:
     """Start appeal creation by asking the user for a category."""
     state = deps.get_state(chat_id)
     state["state"] = deps.category_state
-    state.pop("appeal", None)
+    if draft_body:
+        state["appeal"] = {"body": draft_body, "is_draft": True}
+    else:
+        state.pop("appeal", None)
     deps.touch(state)
 
     rows = [
@@ -68,9 +75,42 @@ def set_category(chat_id: int, category: str, deps: AppealDependencies) -> None:
     """Store the chosen category and ask for the appeal body."""
     state = deps.get_state(chat_id)
     state["state"] = deps.body_state
-    state["appeal"] = {"category": category}
+    appeal = state.setdefault("appeal", {})
+    appeal["category"] = category
     deps.touch(state)
-    deps.send_message(chat_id, "Опишите вашу проблему или вопрос:")
+    if appeal.get("is_draft") and appeal.get("body"):
+        deps.send_buttons(
+            chat_id,
+            "Черновик обращения:\n\n"
+            f"{appeal['body']}\n\nОтправить его или изменить?",
+            [
+                [deps.make_callback("✅ Отправить черновик", "appeal_draft_submit")],
+                [deps.make_callback("✏️ Изменить текст", "appeal_draft_edit")],
+                [deps.make_callback("❌ Отмена", "cancel")],
+            ],
+        )
+    else:
+        deps.send_message(chat_id, "Опишите вашу проблему или вопрос:")
+
+
+def submit_draft(chat_id: int, deps: AppealDependencies) -> None:
+    state = deps.get_state(chat_id)
+    appeal = state.get("appeal", {})
+    if not appeal.get("body"):
+        start_appeal(chat_id, deps)
+        return
+    account = deps.get_saved_ls(chat_id)
+    if account:
+        deps.submit_appeal(chat_id, account)
+    else:
+        deps.request_ls(chat_id, "appeal")
+
+
+def edit_draft(chat_id: int, deps: AppealDependencies) -> None:
+    state = deps.get_state(chat_id)
+    state["state"] = deps.body_state
+    deps.touch(state)
+    deps.send_message(chat_id, "Отправьте изменённый текст обращения:")
 
 
 def got_body(chat_id: int, text: str, deps: AppealDependencies) -> None:

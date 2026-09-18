@@ -106,7 +106,8 @@ def test_open_script_uses_smallest_root_and_logs_ambiguous_tree():
         99,
         2,
     )
-    deps.send_message.assert_called_once_with(42, "📌 Второй")
+    assert deps.send_buttons.call_args.args[1] == "📌 Второй"
+    assert deps.send_buttons.call_args.args[2][0][0]["payload"] == "ai_from_faq"
     assert state["state"] == "menu"
     assert "script" not in state
 
@@ -126,8 +127,8 @@ def test_terminal_node_returns_to_main_menu_and_clears_script():
 
     faq.show_script_node(42, deps)
 
-    deps.send_message.assert_called_once_with(42, "📌 Готовый ответ")
-    deps.send_main_menu.assert_called_once_with(42, "Выберите следующее действие:")
+    assert deps.send_buttons.call_args.args[1] == "📌 Готовый ответ"
+    assert deps.send_buttons.call_args.args[2][0][0]["payload"] == "ai_from_faq"
     assert state["state"] == "menu"
     assert "script" not in state
 
@@ -153,6 +154,24 @@ def test_navigate_can_move_to_child_and_back_to_parent():
     faq.navigate_script_node(42, 1, deps)
     assert state["script"]["current"] == 1
     assert deps.send_buttons.call_args.args[1] == "📌 Родитель"
+
+
+def test_terminal_faq_preserves_traversed_path_for_ai():
+    tree = {
+        "title": "Оплата",
+        "nodes": [
+            {"id": 1, "title": "Выберите тему", "is_terminal": False},
+            {"id": 2, "title": "Проверьте квитанцию", "is_terminal": True},
+        ],
+        "edges": [{"from_node_id": 1, "label": "Неверная сумма", "to_node_id": 2}],
+    }
+    deps, state = _dependencies(tree=(tree, None))
+    faq.open_script(42, 7, deps)
+    faq.navigate_script_node(42, 2, deps)
+    assert state["ai_faq_context"] == (
+        "Оплата → Выберите тему → Неверная сумма → Проверьте квитанцию"
+    )
+    assert deps.send_buttons.call_args.args[2][0][0]["payload"] == "ai_from_faq"
 
 
 def test_navigate_without_active_script_returns_to_menu():

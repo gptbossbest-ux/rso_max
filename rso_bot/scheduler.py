@@ -21,6 +21,7 @@ class SchedulerDependencies:
     appointment_reminder_day: JobCallback
     scheduler_factory: SchedulerFactory
     logger: logging.Logger
+    cleanup_ai_sessions: JobCallback | None = None
 
 
 def register_jobs(scheduler: Any, deps: SchedulerDependencies) -> None:
@@ -59,10 +60,21 @@ def register_jobs(scheduler: Any, deps: SchedulerDependencies) -> None:
         max_instances=1,
         misfire_grace_time=1800,
     )
+    if deps.cleanup_ai_sessions is not None:
+        scheduler.add_job(
+            deps.cleanup_ai_sessions,
+            trigger="interval",
+            hours=1,
+            id="cleanup_ai_sessions",
+            max_instances=1,
+            misfire_grace_time=300,
+        )
 
 
 def create_scheduler(deps: SchedulerDependencies) -> Any:
     """Create a Moscow-time scheduler and register all current bot jobs."""
+    if deps.cleanup_ai_sessions is not None:
+        deps.cleanup_ai_sessions()
     scheduler = deps.scheduler_factory(timezone="Europe/Moscow")
     register_jobs(scheduler, deps)
     return scheduler

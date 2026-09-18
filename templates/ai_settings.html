@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}ИИ-помощник{% endblock %}
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1>🤖 ИИ-помощник</h1>
+        <p class="text-muted small mt-1">Настройки YandexGPT для ответов по теме ЖКХ</p>
+    </div>
+</div>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+{% for category, message in messages %}
+<div class="alert alert-{{ category }}">{{ message }}</div>
+{% endfor %}
+{% endwith %}
+
+<div class="card">
+    <div class="card-header">Серверные Secret</div>
+    <div class="card-body">
+        <p class="mb-2">API-ключ:
+            {% if api_key_configured %}<span class="badge badge-success">задан</span>
+            {% else %}<span class="badge badge-danger">не задан</span>{% endif %}
+        </p>
+        <p>Folder ID:
+            {% if folder_configured or settings.model.startswith('gpt://') %}<span class="badge badge-success">задан</span>
+            {% else %}<span class="badge badge-warning">не задан</span>{% endif %}
+        </p>
+        <p class="text-muted small mt-1">API-ключ и Folder ID задаются только в окружении сервера и никогда не показываются в портале.</p>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">Параметры</div>
+    <div class="card-body">
+        <form method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="form-group">
+                <label style="text-transform:none; letter-spacing:0">
+                    <input type="checkbox" name="enabled" {% if settings.enabled %}checked{% endif %}>
+                    Включить ИИ-помощника
+                </label>
+            </div>
+            <div class="form-group">
+                <label>Модель</label>
+                <input class="form-control" name="model" maxlength="256" required value="{{ settings.model }}">
+                <div class="text-muted small mt-1">Например: <code>yandexgpt/latest</code> или полный <code>gpt://...</code></div>
+            </div>
+            <div class="form-group">
+                <label>Системный промпт</label>
+                <textarea class="form-control" name="system_prompt" rows="9" maxlength="8000" required>{{ settings.system_prompt }}</textarea>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Вопросов на MAX ID в день</label>
+                    <input class="form-control" type="number" name="daily_limit" min="1" max="100" required value="{{ settings.daily_limit }}">
+                </div>
+                <div class="form-group">
+                    <label>Температура</label>
+                    <input class="form-control" type="number" name="temperature" min="0" max="1" step="0.1" required value="{{ settings.temperature }}">
+                </div>
+                <div class="form-group">
+                    <label>Макс. токенов ответа</label>
+                    <input class="form-control" type="number" name="max_output_tokens" min="1" max="8000" required value="{{ settings.max_output_tokens }}">
+                </div>
+            </div>
+            <button class="btn btn-primary" type="submit">Сохранить</button>
+        </form>
+    </div>
+</div>
+{% endblock %}

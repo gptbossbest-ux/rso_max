@@ -35,6 +35,7 @@ truststore.inject_into_ssl()
 
 import logging
 import os
+import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
@@ -57,11 +58,16 @@ from config import (
     SESSION_TTL_MINUTES,
     TIMEZONE_OFFSET,
     TOKEN,
+    YANDEXGPT_API_KEY,
+    YANDEXGPT_API_URL,
+    YANDEXGPT_FOLDER_ID,
+    YANDEXGPT_TIMEOUT_SECONDS,
 )
 from rso_bot import max_transport
 from rso_bot import scheduler as bot_scheduler
 from rso_bot import states as session_states
 from rso_bot.flows import (
+    ai_assistant,
     appeals,
     appointments,
     auth,
@@ -227,6 +233,7 @@ def send_main_menu(chat_id: int, text: str = "Выберите действие:
         [_cb("📋 Проверить статус обращения", "my_appeals")],
         [_cb("📊 Передать показания",       "pokazaniya")],
         [_cb("📚 Ответ на типовой вопрос",  "scripts_list")],
+        [_cb("🤖 Спросить у ИИ-помощника", "ai_start")],
         [_cb("📄 Последняя квитанция",      "kvitanciya")],
         [_cb("🗓️ Записаться на приём",      "appointment_start")],
     ]
@@ -360,6 +367,10 @@ def _start_appeal(chat_id: int) -> None:
     appeals.start_appeal(chat_id, _appeal_dependencies())
 
 
+def _start_appeal_draft(chat_id: int, body: str) -> None:
+    appeals.start_appeal(chat_id, _appeal_dependencies(), draft_body=body)
+
+
 def _appeal_set_category(chat_id: int, category: str) -> None:
     """Compatibility wrapper for choosing an appeal category."""
     appeals.set_category(chat_id, category, _appeal_dependencies())
@@ -425,6 +436,69 @@ def _show_script_node(chat_id: int) -> None:
 def _navigate_script_node(chat_id: int, node_id: int) -> None:
     """Compatibility wrapper for moving through the active FAQ tree."""
     faq.navigate_script_node(chat_id, node_id, _faq_dependencies())
+
+
+# ── ИИ-помощник YandexGPT ────────────────────────────────────────────────────────────────
+
+_yandexgpt_client = ai_assistant.YandexGPTClient(
+    api_key=YANDEXGPT_API_KEY,
+    folder_id=YANDEXGPT_FOLDER_ID,
+    api_url=YANDEXGPT_API_URL,
+    timeout_seconds=YANDEXGPT_TIMEOUT_SECONDS,
+)
+
+
+def _ai_sensitive_values(chat_id: int) -> list[str]:
+    values: list[str] = []
+    user = db.get_bot_user(chat_id)
+    if user:
+        values.extend([user["ls"] or "", user["fio"] or ""])
+        if user["ls"]:
+            try:
+                account = db.get_ls(user["ls"])
+            except ValueError:
+                account = None
+            if account:
+                values.extend([account["fio"] or "", account["address"] or ""])
+    return [value for value in values if value]
+
+
+def _ai_dependencies() -> ai_assistant.AIDependencies:
+    return ai_assistant.AIDependencies(
+        get_settings=db.get_ai_settings,
+        get_session=db.get_ai_session,
+        set_context=db.set_ai_context,
+        reserve_question=db.reserve_ai_question,
+        release_question=db.release_ai_question,
+        append_exchange=db.append_ai_exchange,
+        clear_history=db.clear_ai_history,
+        get_sensitive_values=_ai_sensitive_values,
+        complete=_yandexgpt_client.complete,
+        get_state=_get_state,
+        touch=_touch,
+        start_appeal_draft=_start_appeal_draft,
+        make_callback=_cb,
+        send_buttons=send_buttons,
+        send_main_menu=send_main_menu,
+        is_configured=_yandexgpt_client.configured_for,
+        get_operation_date=db.server_local_date,
+        logger=log,
+        question_state=S.AI_QUESTION,
+    )
+
+
+def _start_ai(chat_id: int, faq_context: str | None = None) -> None:
+    ai_assistant.start(chat_id, _ai_dependencies(), faq_context=faq_context)
+
+
+def _start_ai_from_faq(chat_id: int, state: dict) -> None:
+    context = state.pop("ai_faq_context", None)
+    _start_ai(chat_id, context)
+
+
+def _on_ai_question(chat_id: int, state: dict, text: str) -> None:
+    del state
+    ai_assistant.ask(chat_id, text, _ai_dependencies())
 
 
 # ── Показания (адаптировано из предыдущей версии) ────────────────────────────
@@ -697,12 +771,39 @@ def _cb_meter_retry(chat_id: int, st: dict) -> None:
     readings.retry(chat_id, st, _reading_dependencies())
 
 
+def _cb_ai_new(chat_id: int, st: dict) -> None:
+    del st
+    ai_assistant.new_dialog(chat_id, _ai_dependencies())
+
+
+def _cb_ai_appeal(chat_id: int, st: dict) -> None:
+    del st
+    ai_assistant.create_appeal_draft(chat_id, _ai_dependencies())
+
+
+def _cb_appeal_draft_submit(chat_id: int, st: dict) -> None:
+    del st
+    appeals.submit_draft(chat_id, _appeal_dependencies())
+
+
+def _cb_appeal_draft_edit(chat_id: int, st: dict) -> None:
+    del st
+    appeals.edit_draft(chat_id, _appeal_dependencies())
+
+
 _CALLBACK_STATIC: dict[str, callable] = {
     "auth_1c":          lambda chat_id, st: _start_1c_auth(chat_id),
     "appeal_start":      lambda chat_id, st: _start_appeal(chat_id),
     "my_appeals":        lambda chat_id, st: _show_my_appeals(chat_id),
     "pokazaniya":        lambda chat_id, st: _start_pokazaniya(chat_id),
     "scripts_list":      lambda chat_id, st: _show_scripts_list(chat_id),
+    "ai_start":          lambda chat_id, st: _start_ai(chat_id),
+    "ai_from_faq":       _start_ai_from_faq,
+    "ai_more":           lambda chat_id, st: _start_ai(chat_id),
+    "ai_new":            _cb_ai_new,
+    "ai_appeal":         _cb_ai_appeal,
+    "appeal_draft_submit": _cb_appeal_draft_submit,
+    "appeal_draft_edit": _cb_appeal_draft_edit,
     "kvitanciya":        _cb_kvitanciya,
     "appointment_start": lambda chat_id, st: _start_appointment_flow(chat_id),
     "appt_skip_theme":   _cb_skip_theme,
@@ -817,6 +918,7 @@ _MESSAGE_HANDLERS: dict[str, callable] = {
     S.APPOINTMENT_THEME: _on_appointment_theme,
     S.WAITING_VALUE1:    _on_value1,
     S.WAITING_VALUE2:    _on_value2,
+    S.AI_QUESTION:       _on_ai_question,
 }
 
 _RESET_COMMANDS = ("/start", "/help", "/menu")
@@ -890,6 +992,15 @@ def _task_cleanup_user_states() -> None:
         log.error("APScheduler cleanup_user_states ошибка: %s", exc)
 
 
+def _task_cleanup_ai_sessions() -> None:
+    try:
+        removed = db.cleanup_expired_ai_sessions()
+        if removed:
+            log.info("APScheduler cleanup_ai_sessions: удалено %d", removed)
+    except sqlite3.Error as exc:
+        log.error("APScheduler cleanup_ai_sessions ошибка: %s", exc)
+
+
 def _format_appointment_reminder(appointment, when_label: str) -> str:
     """Совместимая обёртка форматирования напоминания."""
     return appointment_reminders.format_appointment_reminder(appointment, when_label)
@@ -947,6 +1058,7 @@ def _scheduler_dependencies() -> bot_scheduler.SchedulerDependencies:
         appointment_reminder_day=_task_appointment_reminder_day,
         scheduler_factory=BackgroundScheduler,
         logger=log,
+        cleanup_ai_sessions=_task_cleanup_ai_sessions,
     )
 
 

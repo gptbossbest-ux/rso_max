@@ -20,6 +20,7 @@ from __future__ import annotations
 # (который тянет httpx) и до локальных `import httpx` внутри broadcast()/
 # appointment_cancel().
 import truststore
+
 truststore.inject_into_ssl()
 
 import json
@@ -54,6 +55,8 @@ from config import (
     LOG_LEVEL,
     LOG_MAX_BYTES,
     SECRET_KEY,
+    YANDEXGPT_API_KEY,
+    YANDEXGPT_FOLDER_ID,
 )
 
 # ── Логгер ────────────────────────────────────────────────────────────────────
@@ -336,6 +339,43 @@ def index():
         counts=counts,
         statuses=STATUSES,
         status_colors=STATUS_COLORS,
+        user=session["user"],
+    )
+
+
+# ── ИИ-помощник ─────────────────────────────────────────────────────────────────────────
+
+@app.route("/ai-settings", methods=["GET", "POST"])
+@admin_required
+def ai_settings_page():
+    if request.method == "POST":
+        expected = session.get(_CSRF_SESSION_KEY)
+        submitted = request.form.get("csrf_token", "")
+        if not isinstance(expected, str) or not expected or not secrets.compare_digest(expected, submitted):
+            abort(400)
+        try:
+            db.update_ai_settings(
+                enabled=request.form.get("enabled") == "on",
+                model=request.form.get("model", ""),
+                system_prompt=request.form.get("system_prompt", ""),
+                daily_limit=int(request.form.get("daily_limit", "")),
+                temperature=float(request.form.get("temperature", "")),
+                max_output_tokens=int(request.form.get("max_output_tokens", "")),
+            )
+        except (ValueError, TypeError) as exc:
+            flash(str(exc) or "Проверьте значения настроек", "error")
+        except sqlite3.Error:
+            log.exception("Не удалось сохранить настройки ИИ-помощника")
+            flash("Не удалось сохранить настройки", "error")
+        else:
+            flash("Настройки ИИ-помощника сохранены", "success")
+            return redirect(url_for("ai_settings_page"))
+    return render_template(
+        "ai_settings.html",
+        settings=db.get_ai_settings(),
+        api_key_configured=bool(YANDEXGPT_API_KEY),
+        folder_configured=bool(YANDEXGPT_FOLDER_ID),
+        csrf_token=_csrf_token(),
         user=session["user"],
     )
 

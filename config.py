@@ -87,6 +87,16 @@ INTEGRATION_1C_CODE_MAX_ATTEMPTS: int = int(
 # Только для локальной имитации. В production код генерирует и хранит 1С.
 INTEGRATION_1C_MOCK_CODE: str = os.getenv("INTEGRATION_1C_MOCK_CODE", "000000")
 
+# ── YandexGPT ───────────────────────────────────────────────────────────────────────
+# Секрет никогда не хранится в БД и не редактируется через веб-портал.
+YANDEXGPT_API_KEY: str = os.getenv("YANDEXGPT_API_KEY", "").strip()
+YANDEXGPT_FOLDER_ID: str = os.getenv("YANDEXGPT_FOLDER_ID", "").strip()
+YANDEXGPT_API_URL: str = os.getenv(
+    "YANDEXGPT_API_URL",
+    "https://llm.api.cloud.yandex.net/foundationModels/v1/completion",
+).strip()
+YANDEXGPT_TIMEOUT_SECONDS: float = float(os.getenv("YANDEXGPT_TIMEOUT_SECONDS", "20"))
+
 # ── Маркерные слова для автоматического повышения приоритета ──────────────────
 # Используются в FastAPI (Этап 2), здесь только хранятся
 EMERGENCY_KEYWORDS: tuple[str, ...] = (
