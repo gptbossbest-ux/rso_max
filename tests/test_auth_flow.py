@@ -315,6 +315,16 @@ def test_validate_ls_database_failure_is_safe_and_does_not_log_account(
     assert "SECRET-LS" not in caplog.text
 
 
+@pytest.mark.parametrize(
+    "number",
+    ["СЧЕТ-1", "ＴＥＳＴ-1", "TEST\u200b-1", "TEST\u202e-1", "TEST/1"],
+)
+def test_validate_ls_treats_noncanonical_bot_input_as_invalid(number) -> None:
+    deps = _account_deps(get_ls=db.get_ls)
+
+    assert auth.validate_ls(number, deps) is auth.LsValidation.INVALID
+
+
 def test_database_outage_does_not_consume_attempts_or_lose_deferred_flow() -> None:
     state = {"state": S.AWAIT_LS, "after_ls": "appeal", "appeal": {"body": "x"}}
     attempts: dict = {}

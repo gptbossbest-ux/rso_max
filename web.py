@@ -25,6 +25,8 @@ truststore.inject_into_ssl()
 import json
 import logging
 import os
+import secrets
+import sqlite3
 from collections import defaultdict
 from datetime import datetime, timedelta
 from functools import wraps
@@ -32,6 +34,7 @@ from logging.handlers import RotatingFileHandler
 
 from flask import (
     Flask,
+    abort,
     flash,
     redirect,
     render_template,
@@ -90,6 +93,7 @@ log = _setup_logger()
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
 
 
 @app.get("/healthz")
@@ -134,6 +138,8 @@ CHANNELS = {
 _login_attempts: dict = defaultdict(lambda: {"attempts": 0, "blocked_until": None})
 _MAX_LOGIN_ATTEMPTS = 5
 _LOGIN_BLOCK_MINUTES = 15
+_ACCOUNTS_PAGE_SIZE = 50
+_CSRF_SESSION_KEY = "_csrf_token"
 
 
 def _check_login_block(ip: str) -> str | None:
@@ -188,6 +194,24 @@ def admin_required(f):
     return decorated
 
 
+def csrf_protected(f):
+    """Require a session-bound token for browser form mutations."""
+
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        expected = session.get(_CSRF_SESSION_KEY)
+        submitted = request.form.get("csrf_token", "")
+        if (
+            not isinstance(expected, str)
+            or not expected
+            or not secrets.compare_digest(expected, submitted)
+        ):
+            abort(400)
+        return f(*args, **kwargs)
+
+    return decorated
+
+
 def _validated_session_user():
     """Сверяет cookie-сессию с текущим пользователем и версией в БД."""
     saved = session.get("user")
@@ -214,6 +238,14 @@ def _validated_session_user():
 def _operator_id() -> int | None:
     """ID текущего оператора из сессии (для передачи в FastAPI)."""
     return session.get("user", {}).get("id")
+
+
+def _csrf_token() -> str:
+    token = session.get(_CSRF_SESSION_KEY)
+    if not isinstance(token, str) or not token:
+        token = secrets.token_urlsafe(32)
+        session[_CSRF_SESSION_KEY] = token
+    return token
 
 
 def _enrich_appeals(rows) -> list[dict]:
@@ -247,6 +279,7 @@ def login():
 
         if user and check_password_hash(user["password"], password):
             _ok_login(ip)
+            session.clear()
             session["user"] = {
                 "id":       user["id"],      # нужен для operator_id в API
                 "username": user["username"],
@@ -269,7 +302,8 @@ def login():
 
 @app.route("/logout")
 def logout():
-    user = session.pop("user", {})
+    user = session.get("user", {})
+    session.clear()
     log.info("Выход: %s", user.get("username", "?"))
     return redirect(url_for("login"))
 
@@ -561,12 +595,34 @@ def upload_file():
 @app.route("/accounts")
 @admin_required
 def accounts_page():
-    accounts = db.list_lschet()
-    return render_template("accounts.html", accounts=accounts, user=session["user"])
+    query = db.normalize_lschet_search(request.args.get("q"))
+    try:
+        requested_page = int(request.args.get("page", "1"))
+    except ValueError:
+        requested_page = 1
+    total = db.count_lschet(query)
+    total_pages = max(1, (total + _ACCOUNTS_PAGE_SIZE - 1) // _ACCOUNTS_PAGE_SIZE)
+    page = min(max(requested_page, 1), total_pages)
+    accounts = db.list_lschet(
+        query,
+        limit=_ACCOUNTS_PAGE_SIZE,
+        offset=(page - 1) * _ACCOUNTS_PAGE_SIZE,
+    )
+    return render_template(
+        "accounts.html",
+        accounts=accounts,
+        csrf_token=_csrf_token(),
+        page=page,
+        query=query,
+        total=total,
+        total_pages=total_pages,
+        user=session["user"],
+    )
 
 
 @app.route("/accounts/create", methods=["POST"])
 @admin_required
+@csrf_protected
 def account_create():
     number = request.form.get("number", "")
     fio = request.form.get("fio", "")
@@ -575,6 +631,9 @@ def account_create():
         created = db.create_lschet(number, fio, address)
     except ValueError as exc:
         flash(str(exc), "error")
+    except sqlite3.DatabaseError:
+        log.error("Ошибка БД при добавлении лицевого счёта")
+        flash("Не удалось добавить лицевой счёт. Попробуйте позже.", "error")
     else:
         if created:
             flash("Лицевой счёт добавлен", "success")

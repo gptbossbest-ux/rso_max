@@ -27,6 +27,7 @@
     <div class="card-header"><strong>Добавить лицевой счёт</strong></div>
     <div class="card-body">
         <form method="POST" action="{{ url_for('account_create') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <div class="account-grid">
                 <div class="form-group">
                     <label for="account-number">Номер</label>
@@ -52,7 +53,17 @@
 <div class="card">
     <div class="card-header">
         <strong>Список лицевых счетов</strong>
-        <span class="badge badge-primary">{{ accounts|length }}</span>
+        <span class="badge badge-primary">{{ total }}</span>
+    </div>
+    <div class="card-body">
+        <form method="GET" action="{{ url_for('accounts_page') }}" class="form-inline">
+            <input type="search" name="q" value="{{ query }}" class="form-control"
+                   maxlength="100" placeholder="Номер, ФИО или адрес">
+            <button type="submit" class="btn btn-secondary">Найти</button>
+            {% if query %}
+                <a href="{{ url_for('accounts_page') }}" class="btn btn-outline-secondary">Сбросить</a>
+            {% endif %}
+        </form>
     </div>
     <div class="card-body p-0">
         <table class="table">
@@ -71,6 +82,19 @@
                 {% endfor %}
             </tbody>
         </table>
+    </div>
+    <div class="card-footer d-flex align-items-center justify-content-between">
+        <span>Страница {{ page }} из {{ total_pages }}</span>
+        <div class="d-flex gap-2">
+            {% if page > 1 %}
+                <a class="btn btn-sm btn-secondary"
+                   href="{{ url_for('accounts_page', q=query, page=page-1) }}">← Назад</a>
+            {% endif %}
+            {% if page < total_pages %}
+                <a class="btn btn-sm btn-secondary"
+                   href="{{ url_for('accounts_page', q=query, page=page+1) }}">Вперёд →</a>
+            {% endif %}
+        </div>
     </div>
 </div>
 {% endblock %}

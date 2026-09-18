@@ -167,6 +167,8 @@ def validate_ls(ls_number: str, deps: AccountDependencies) -> LsValidation:
         if deps.get_ls(ls_number) is not None:
             return LsValidation.VALID
         return LsValidation.INVALID
+    except ValueError:
+        return LsValidation.INVALID
     except Exception:  # noqa: BLE001 - DB adapter boundary must fail closed
         deps.logger.error("Не удалось проверить лицевой счёт")
         return LsValidation.UNAVAILABLE
