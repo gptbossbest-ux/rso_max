@@ -39,6 +39,7 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 import httpx
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -61,7 +62,7 @@ from config import (
 from rso_bot import max_transport
 from rso_bot import scheduler as bot_scheduler
 from rso_bot import states as session_states
-from rso_bot.flows import appeals, appointments, auth, faq, readings
+from rso_bot.flows import appeals, appointments, auth, faq, readings, receipts
 from rso_bot.jobs import appointment_reminders
 from rso_bot.session import SessionManager
 
@@ -568,47 +569,45 @@ def _cancel_own_appointment(chat_id: int, appointment_id: int) -> None:
 
 # ── PDF квитанция ─────────────────────────────────────────────────────────────
 
+def _open_receipt_binary(ls: str):
+    """Validate and atomically open an account receipt for streaming."""
+    return receipts.open_local_receipt(Path("KV"), ls)
+
+
+def _receipt_upload_dependencies() -> receipts.ReceiptUploadDependencies:
+    """Resolve filesystem and MAX collaborators at call time."""
+    return receipts.ReceiptUploadDependencies(
+        open_receipt=_open_receipt_binary,
+        http_client=httpx,
+        api_base=API,
+        headers=_MAX_HEADERS,
+        send_raw=_send_raw,
+        send_message=send_message,
+        sleep=time.sleep,
+        logger=log,
+    )
+
+
+def _receipt_flow_dependencies() -> receipts.ReceiptFlowDependencies:
+    """Resolve account/session hooks while preserving legacy patch points."""
+    return receipts.ReceiptFlowDependencies(
+        get_saved_ls=_get_saved_ls,
+        request_ls=_request_ls,
+        clear_flow=_clear_flow,
+        send_message=send_message,
+        send_main_menu=send_main_menu,
+        send_pdf=_send_pdf,
+        deliver_receipt=_deliver_kvitanciya,
+    )
+
 def _deliver_kvitanciya(chat_id: int, ls: str) -> None:
-    """Отправляет квитанцию и возвращает клиента в главное меню."""
-    send_message(chat_id, "Ищу квитанцию, подождите...")
-    _send_pdf(chat_id, ls)
-    send_main_menu(chat_id)
+    """Compatibility wrapper for delivering a receipt and reopening the menu."""
+    receipts.deliver(chat_id, ls, _receipt_flow_dependencies())
 
 
 def _send_pdf(chat_id: int, ls: str) -> None:
-    pdf_path = os.path.join("KV", f"{ls}.pdf")
-    if not os.path.exists(pdf_path):
-        send_message(chat_id, f"Квитанция для ЛС {ls} не найдена.")
-        return
-    try:
-        r1 = httpx.post(f"{API}/uploads", headers=_MAX_HEADERS,
-                        params={"type": "file"}, timeout=10)
-        r1.raise_for_status()
-        upload_url = r1.json()["url"]
-
-        with open(pdf_path, "rb") as f:
-            r2 = httpx.post(upload_url, headers=_MAX_HEADERS,
-                            files={"data": (f"{ls}.pdf", f, "application/pdf")},
-                            timeout=30)
-        r2.raise_for_status()
-        token = r2.json()["token"]
-
-        # MAX требует паузу между загрузкой файла и отправкой сообщения с ним
-        time.sleep(2)
-        _send_raw(chat_id, {
-            "text": f"Квитанция по ЛС {ls}:",
-            "attachments": [{"type": "file", "payload": {"token": token}}],
-        })
-        log.info("PDF отправлен: ЛС=%s  chat_id=%s", ls, chat_id)
-    except httpx.HTTPStatusError as exc:
-        log.error("PDF: MAX API вернул %s для ЛС=%s", exc.response.status_code, ls)
-        send_message(chat_id, "Не удалось отправить квитанцию. Попробуйте позже.")
-    except (KeyError, ValueError) as exc:
-        log.error("PDF: неожиданный ответ MAX API для ЛС=%s: %s", ls, exc)
-        send_message(chat_id, "Не удалось отправить квитанцию. Попробуйте позже.")
-    except Exception as exc:
-        log.error("PDF ошибка: ЛС=%s  %s", ls, exc)
-        send_message(chat_id, "Не удалось отправить квитанцию. Попробуйте позже.")
+    """Compatibility wrapper for the two-step MAX PDF upload contract."""
+    receipts.send_pdf(chat_id, ls, _receipt_upload_dependencies())
 
 
 # ── Обработчик callback-кнопок ────────────────────────────────────────────────
@@ -664,11 +663,7 @@ _CALLBACK_PREFIXES: dict[str, callable] = {
 # -- Обработчики статичных callback ------------------------------------------
 
 def _cb_kvitanciya(chat_id: int, st: dict) -> None:
-    ls = _get_saved_ls(chat_id)
-    if not ls:
-        _request_ls(chat_id, "kvitanciya")
-    else:
-        _deliver_kvitanciya(chat_id, ls)
+    receipts.start(chat_id, st, _receipt_flow_dependencies())
 
 
 def _cb_skip_theme(chat_id: int, st: dict) -> None:
