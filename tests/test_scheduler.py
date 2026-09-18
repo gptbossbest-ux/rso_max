@@ -98,6 +98,7 @@ def test_bot_factory_keeps_runtime_callback_seams(monkeypatch):
         "_task_cleanup_user_states": Mock(),
         "_task_appointment_reminder_24h": Mock(),
         "_task_appointment_reminder_day": Mock(),
+        "_task_cleanup_ai_sessions": Mock(),
     }
     for name, callback in callbacks.items():
         monkeypatch.setattr(bot, name, callback)
@@ -112,8 +113,31 @@ def test_bot_factory_keeps_runtime_callback_seams(monkeypatch):
     assert deps.cleanup_user_states is callbacks["_task_cleanup_user_states"]
     assert deps.appointment_reminder_24h is callbacks["_task_appointment_reminder_24h"]
     assert deps.appointment_reminder_day is callbacks["_task_appointment_reminder_day"]
+    assert deps.cleanup_ai_sessions is callbacks["_task_cleanup_ai_sessions"]
     assert deps.scheduler_factory is factory
     assert deps.logger is logger
+
+
+def test_ai_cleanup_runs_on_scheduler_creation_and_then_hourly():
+    instance = Mock()
+    factory = Mock(return_value=instance)
+    cleanup = Mock()
+    deps = _dependencies(factory)
+    deps = scheduler_module.SchedulerDependencies(
+        **{**deps.__dict__, "cleanup_ai_sessions": cleanup}
+    )
+
+    scheduler_module.create_scheduler(deps)
+
+    cleanup.assert_called_once_with()
+    assert instance.add_job.call_args_list[-1] == call(
+        cleanup,
+        trigger="interval",
+        hours=1,
+        id="cleanup_ai_sessions",
+        max_instances=1,
+        misfire_grace_time=300,
+    )
 
 
 def test_real_scheduler_applies_default_coalesce_and_exact_triggers():

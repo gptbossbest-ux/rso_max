@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any
 
 JobCallback = Callable[[], None]
@@ -64,18 +63,18 @@ def register_jobs(scheduler: Any, deps: SchedulerDependencies) -> None:
     if deps.cleanup_ai_sessions is not None:
         scheduler.add_job(
             deps.cleanup_ai_sessions,
-            trigger="cron",
-            hour=0,
-            minute=0,
-            timezone=datetime.now().astimezone().tzinfo,
+            trigger="interval",
+            hours=1,
             id="cleanup_ai_sessions",
             max_instances=1,
-            misfire_grace_time=3600,
+            misfire_grace_time=300,
         )
 
 
 def create_scheduler(deps: SchedulerDependencies) -> Any:
     """Create a Moscow-time scheduler and register all current bot jobs."""
+    if deps.cleanup_ai_sessions is not None:
+        deps.cleanup_ai_sessions()
     scheduler = deps.scheduler_factory(timezone="Europe/Moscow")
     register_jobs(scheduler, deps)
     return scheduler

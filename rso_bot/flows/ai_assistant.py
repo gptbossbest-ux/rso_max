@@ -23,38 +23,99 @@ class AIServiceError(RuntimeError):
     """A safe, content-free indication that the provider request failed."""
 
 
+class PersonalDataDetected(ValueError):
+    """Input may contain PII that cannot be safely sent to an external API."""
+
+
 _EMAIL_RE = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-zА-Яа-я]{2,}(?!\w)")
 _PHONE_RE = re.compile(r"(?<!\d)(?:\+7|8)[\s()\-]*\d{3}[\s()\-]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}(?!\d)")
 _ACCOUNT_RE = re.compile(
-    r"(?i)\b(?:лицев(?:ой|ого)\s+сч(?:ё|е)т(?:а)?|л\.?\s*с\.?)\s*[:№#-]?\s*[A-ZА-Я0-9_-]{3,64}"
+    r"(?i)\b(?:лицев(?:ой|ого)\s+сч(?:ё|е)т(?:а)?|л\.?\s*с\.?)"
+    r"\s*[:№#-]?\s*[A-ZА-Я0-9][A-ZА-Я0-9_./\\-]{0,63}"
 )
 _LONG_ID_RE = re.compile(r"(?<!\d)\d{6,20}(?!\d)")
 _FULL_NAME_RE = re.compile(
     r"\b[A-ZА-ЯЁ][a-zа-яё-]+\s+[A-ZА-ЯЁ][a-zа-яё-]+\s+[A-ZА-ЯЁ][a-zа-яё-]+\b"
 )
+_TWO_PART_NAME_RE = re.compile(
+    r"\b[A-ZА-ЯЁ][a-zа-яё-]{1,}\s+[A-ZА-ЯЁ][a-zа-яё-]{1,}\b"
+)
+_INITIALS_NAME_RE = re.compile(
+    r"\b(?:[А-ЯЁ][а-яё-]+\s+[А-ЯЁ]\.\s*[А-ЯЁ]\.?|"
+    r"[А-ЯЁ]\.\s*[А-ЯЁ]\.?\s+[А-ЯЁ][а-яё-]+)",
+    re.IGNORECASE,
+)
+_INTRO_NAME_RE = re.compile(
+    r"(?i)\b(?:меня\s+зовут|моё\s+имя)\s+[а-яё-]+(?:\s+[а-яё-]+){1,2}"
+)
 _ADDRESS_RE = re.compile(
-    r"(?i)\b(?:адрес|улица|ул\.| проспект|пр-т|переулок|пер\.)\s*[:,-]?\s*[^\n;]{2,120}"
+    r"(?i)\b(?:адрес|улица|ул\.| проспект|пр-т|переулок|пер\.|"
+    r"дом|д\.|\bквартира|кв\.)\s*[:,-]?\s*[^\n;]{1,120}"
+)
+_UNMARKED_ADDRESS_RE = re.compile(
+    r"\b[A-ZА-ЯЁ][a-zа-яё-]{2,}\s*,?\s*(?:д\.?\s*)?\d{1,4}(?:[/корпуск\s.-]*\d{0,4})?\b",
+    re.IGNORECASE,
 )
 _LABELED_NAME_RE = re.compile(r"(?i)\b(?:фио|получатель|собственник)\s*[:,-]?\s*[A-ZА-ЯЁ][A-Za-zА-яЁё-]+(?:\s+[A-ZА-ЯЁ][A-Za-zА-яЁё-]+){1,2}")
+_REDACTION_RE = re.compile(
+    r"(?i)(?:лицевой\s+счёт|фио|адрес)?\s*\[[^\]]*удал[^\]]*\]"
+)
+_RESIDUAL_PII_HINT_RE = re.compile(
+    r"(?i)(?:\bфио\b|лицев\w*\s+сч|л\.?\s*с\.?|адрес|"
+    r"(?<!\d)\d{3,5}(?!\d)|\b[A-ZА-Я0-9]{1,12}[-/\\][A-ZА-Я0-9/-]{1,20}\b)"
+)
+_AMBIGUOUS_ACCOUNT_RE = re.compile(
+    r"(?i)\b(?:лицев(?:ой|ого)\s+сч(?:ё|е)т(?:а)?|л\.?\s*с\.?)"
+    r"\s*[:№#-]?\s*[A-ZА-Я0-9]+\s+[A-ZА-Я0-9]+"
+)
 
 
 def sanitize_personal_data(text: str, known_values: Iterable[str] = ()) -> str:
     """Redact obvious PII plus exact customer data known by the application."""
     cleaned = str(text or "")
+    cleaned = _EMAIL_RE.sub("[эл. почта удалена]", cleaned)
+    cleaned = _PHONE_RE.sub("[телефон удалён]", cleaned)
+    cleaned = _ACCOUNT_RE.sub("лицевой счёт [удалён]", cleaned)
+    cleaned = _LONG_ID_RE.sub("[номер удалён]", cleaned)
+    cleaned = _LABELED_NAME_RE.sub("ФИО [удалено]", cleaned)
+    cleaned = _INTRO_NAME_RE.sub("ФИО [удалено]", cleaned)
+    cleaned = _FULL_NAME_RE.sub("ФИО [удалено]", cleaned)
+    cleaned = _INITIALS_NAME_RE.sub("ФИО [удалено]", cleaned)
+    cleaned = _TWO_PART_NAME_RE.sub("ФИО [удалено]", cleaned)
+    cleaned = _ADDRESS_RE.sub("адрес [удалён]", cleaned)
+    cleaned = _UNMARKED_ADDRESS_RE.sub("адрес [удалён]", cleaned)
     for value in sorted(
         {str(item).strip() for item in known_values if str(item).strip()},
         key=len,
         reverse=True,
     ):
         cleaned = re.sub(re.escape(value), "[ПДн удалены]", cleaned, flags=re.IGNORECASE)
-    cleaned = _EMAIL_RE.sub("[эл. почта удалена]", cleaned)
-    cleaned = _PHONE_RE.sub("[телефон удалён]", cleaned)
-    cleaned = _ACCOUNT_RE.sub("лицевой счёт [удалён]", cleaned)
-    cleaned = _LONG_ID_RE.sub("[номер удалён]", cleaned)
-    cleaned = _LABELED_NAME_RE.sub("ФИО [удалено]", cleaned)
-    cleaned = _FULL_NAME_RE.sub("ФИО [удалено]", cleaned)
-    cleaned = _ADDRESS_RE.sub("адрес [удалён]", cleaned)
+        if re.fullmatch(r"[A-Za-zА-Яа-яЁё0-9_./\\-]+", value) and any(
+            char.isdigit() for char in value
+        ):
+            compact = [char for char in value if char.isalnum()]
+            if len(compact) >= 2:
+                flexible = r"[\s._/\\-]*".join(re.escape(char) for char in compact)
+                cleaned = re.sub(flexible, "[ПДн удалены]", cleaned, flags=re.IGNORECASE)
     return cleaned.strip()
+
+
+def sanitize_ai_input(text: str, known_values: Iterable[str] = ()) -> str:
+    """Sanitize input or reject it when any ambiguous PII indicator remains."""
+    if _AMBIGUOUS_ACCOUNT_RE.search(str(text or "")):
+        raise PersonalDataDetected("ambiguous account number")
+    cleaned = sanitize_personal_data(text, known_values)
+    inspectable = _REDACTION_RE.sub(" ", cleaned).strip(" ,;:.-")
+    if (
+        not cleaned
+        or not inspectable
+        or _RESIDUAL_PII_HINT_RE.search(inspectable)
+        or _TWO_PART_NAME_RE.search(inspectable)
+        or _INITIALS_NAME_RE.search(inspectable)
+        or _UNMARKED_ADDRESS_RE.search(inspectable)
+    ):
+        raise PersonalDataDetected("potential personal data")
+    return cleaned
 
 
 @dataclass(frozen=True)
@@ -109,8 +170,21 @@ class YandexGPTClient:
             )
             response.raise_for_status()
             data = response.json()
-            alternatives = data.get("result", {}).get("alternatives", [])
-            answer = alternatives[0].get("message", {}).get("text", "").strip()
+            if not isinstance(data, dict):
+                raise AIServiceError("malformed response")
+            result = data.get("result")
+            if not isinstance(result, dict):
+                raise AIServiceError("malformed response")
+            alternatives = result.get("alternatives")
+            if not isinstance(alternatives, list) or not alternatives:
+                raise AIServiceError("malformed response")
+            alternative = alternatives[0]
+            if not isinstance(alternative, dict):
+                raise AIServiceError("malformed response")
+            message = alternative.get("message")
+            if not isinstance(message, dict) or not isinstance(message.get("text"), str):
+                raise AIServiceError("malformed response")
+            answer = message["text"].strip()
             if not answer:
                 raise AIServiceError("empty response")
             return answer
@@ -167,7 +241,11 @@ def start(chat_id: int, deps: AIDependencies, faq_context: str | None = None) ->
         return
     known = tuple(deps.get_sensitive_values(chat_id))
     if faq_context:
-        deps.set_context(chat_id, sanitize_personal_data(faq_context, known))
+        try:
+            clean_context = sanitize_ai_input(faq_context, known)
+        except PersonalDataDetected:
+            clean_context = None
+        deps.set_context(chat_id, clean_context)
     else:
         deps.get_session(chat_id)
     state = deps.get_state(chat_id)
@@ -189,9 +267,14 @@ def ask(chat_id: int, text: str, deps: AIDependencies) -> None:
         deps.send_buttons(chat_id, "⚠️ ИИ-помощник сейчас недоступен.", _fallback_buttons(deps))
         return
     known = tuple(deps.get_sensitive_values(chat_id))
-    question = sanitize_personal_data(text, known)
-    if not question:
-        deps.send_buttons(chat_id, "Напишите вопрос без персональных данных.", _fallback_buttons(deps))
+    try:
+        question = sanitize_ai_input(text, known)
+    except PersonalDataDetected:
+        deps.send_buttons(
+            chat_id,
+            "В вопросе могут быть личные данные. Переформулируйте его без ФИО, адреса, телефона и номера лицевого счёта.",
+            _fallback_buttons(deps),
+        )
         return
     if not deps.reserve_question(chat_id, int(settings["daily_limit"])):
         state = deps.get_state(chat_id)
@@ -217,6 +300,9 @@ def ask(chat_id: int, text: str, deps: AIDependencies) -> None:
             question=question,
             faq_context=faq_context,
         )
+        answer = sanitize_personal_data(raw_answer, known)
+        if not answer:
+            raise AIServiceError("empty sanitized response")
     except AIServiceError:
         deps.release_question(chat_id)
         state = deps.get_state(chat_id)
@@ -229,7 +315,6 @@ def ask(chat_id: int, text: str, deps: AIDependencies) -> None:
             _fallback_buttons(deps),
         )
         return
-    answer = sanitize_personal_data(raw_answer, known)
     deps.append_exchange(chat_id, question, answer)
     state = deps.get_state(chat_id)
     state["state"] = deps.question_state

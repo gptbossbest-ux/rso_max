@@ -2859,29 +2859,44 @@ def _server_date() -> str:
     return datetime.now().astimezone().date().isoformat()
 
 
+def _ensure_ai_session_locked(
+    conn: sqlite3.Connection,
+    chat_id: int,
+    session_date: str,
+    updated_at: str,
+) -> sqlite3.Row:
+    """Create or roll over a session inside the caller's write transaction."""
+    row = conn.execute(
+        "SELECT * FROM ai_daily_sessions WHERE chat_id=?", (chat_id,)
+    ).fetchone()
+    if row is None:
+        conn.execute(
+            """INSERT INTO ai_daily_sessions
+               (chat_id, session_date, question_count, history_json, faq_context, updated_at)
+               VALUES (?, ?, 0, '[]', NULL, ?)""",
+            (chat_id, session_date, updated_at),
+        )
+    elif row["session_date"] != session_date:
+        conn.execute(
+            """UPDATE ai_daily_sessions
+               SET session_date=?, question_count=0, history_json='[]',
+                   faq_context=NULL, updated_at=? WHERE chat_id=?""",
+            (session_date, updated_at, chat_id),
+        )
+    return conn.execute(
+        "SELECT * FROM ai_daily_sessions WHERE chat_id=?", (chat_id,)
+    ).fetchone()
+
+
 def get_ai_session(chat_id: int, *, session_date: str | None = None) -> dict:
     """Return today's sanitized session, replacing any expired daily data."""
     today = session_date or _server_date()
     now = datetime.now().astimezone().isoformat(timespec="seconds")
     conn = get_conn()
     try:
-        row = conn.execute(
-            "SELECT * FROM ai_daily_sessions WHERE chat_id=?", (chat_id,)
-        ).fetchone()
-        if row is None or row["session_date"] != today:
-            conn.execute(
-                """INSERT INTO ai_daily_sessions
-                   (chat_id, session_date, question_count, history_json, faq_context, updated_at)
-                   VALUES (?, ?, 0, '[]', NULL, ?)
-                   ON CONFLICT(chat_id) DO UPDATE SET
-                     session_date=excluded.session_date, question_count=0,
-                     history_json='[]', faq_context=NULL, updated_at=excluded.updated_at""",
-                (chat_id, today, now),
-            )
-            conn.commit()
-            row = conn.execute(
-                "SELECT * FROM ai_daily_sessions WHERE chat_id=?", (chat_id,)
-            ).fetchone()
+        conn.execute("BEGIN IMMEDIATE")
+        row = _ensure_ai_session_locked(conn, chat_id, today, now)
+        conn.commit()
         result = dict(row)
         try:
             result["history"] = json.loads(result.pop("history_json"))
@@ -2893,12 +2908,15 @@ def get_ai_session(chat_id: int, *, session_date: str | None = None) -> dict:
 
 
 def set_ai_context(chat_id: int, context: str | None, *, session_date: str | None = None) -> None:
-    get_ai_session(chat_id, session_date=session_date)
+    today = session_date or _server_date()
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
     conn = get_conn()
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        _ensure_ai_session_locked(conn, chat_id, today, now)
         conn.execute(
             "UPDATE ai_daily_sessions SET faq_context=?, updated_at=? WHERE chat_id=?",
-            (context or None, datetime.now().astimezone().isoformat(timespec="seconds"), chat_id),
+            (context or None, now, chat_id),
         )
         conn.commit()
     finally:
@@ -2913,15 +2931,16 @@ def reserve_ai_question(
 ) -> bool:
     """Atomically reserve one request from the shared daily allowance."""
     today = session_date or _server_date()
-    get_ai_session(chat_id, session_date=today)
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
     conn = get_conn()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        _ensure_ai_session_locked(conn, chat_id, today, now)
         cursor = conn.execute(
             """UPDATE ai_daily_sessions
                SET question_count=question_count+1, updated_at=?
                WHERE chat_id=? AND session_date=? AND question_count < ?""",
-            (datetime.now().astimezone().isoformat(timespec="seconds"), chat_id, today, daily_limit),
+            (now, chat_id, today, daily_limit),
         )
         conn.commit()
         return cursor.rowcount == 1
@@ -2952,19 +2971,27 @@ def append_ai_exchange(
     session_date: str | None = None,
     max_messages: int = 20,
 ) -> None:
-    session = get_ai_session(chat_id, session_date=session_date)
-    history = list(session["history"])
-    history.extend(
-        ({"role": "user", "text": question}, {"role": "assistant", "text": answer})
-    )
-    history = history[-max_messages:]
+    today = session_date or _server_date()
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
     conn = get_conn()
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _ensure_ai_session_locked(conn, chat_id, today, now)
+        try:
+            history = json.loads(row["history_json"])
+            if not isinstance(history, list):
+                history = []
+        except (TypeError, ValueError):
+            history = []
+        history.extend(
+            ({"role": "user", "text": question}, {"role": "assistant", "text": answer})
+        )
+        history = history[-max_messages:]
         conn.execute(
             "UPDATE ai_daily_sessions SET history_json=?, updated_at=? WHERE chat_id=?",
             (
                 json.dumps(history, ensure_ascii=False),
-                datetime.now().astimezone().isoformat(timespec="seconds"),
+                now,
                 chat_id,
             ),
         )
@@ -2975,13 +3002,16 @@ def append_ai_exchange(
 
 def clear_ai_history(chat_id: int, *, session_date: str | None = None) -> None:
     """Clear context without resetting today's used-question counter."""
-    get_ai_session(chat_id, session_date=session_date)
+    today = session_date or _server_date()
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
     conn = get_conn()
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        _ensure_ai_session_locked(conn, chat_id, today, now)
         conn.execute(
             """UPDATE ai_daily_sessions SET history_json='[]', faq_context=NULL, updated_at=?
                WHERE chat_id=?""",
-            (datetime.now().astimezone().isoformat(timespec="seconds"), chat_id),
+            (now, chat_id),
         )
         conn.commit()
     finally:

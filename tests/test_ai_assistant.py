@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock
 
 import pytest
@@ -73,6 +74,52 @@ def test_sanitizer_removes_known_and_obvious_personal_data():
         assert secret not in cleaned
 
 
+@pytest.mark.parametrize(
+    ("source", "secret"),
+    [
+        ("Меня зовут Иванов Иван", "Иванов Иван"),
+        ("Собственник Иванов И. И.", "Иванов И. И."),
+        ("Живу Ленина 10, нет воды", "Ленина 10"),
+        ("ЛС: 7, нет воды", "ЛС: 7"),
+        ("ЛС № AB/12-3, нет воды", "AB/12-3"),
+    ],
+)
+def test_sanitizer_covers_names_initials_unmarked_addresses_and_short_accounts(
+    source, secret
+):
+    assert secret not in ai_assistant.sanitize_personal_data(source)
+
+
+def test_known_account_is_redacted_even_with_different_separators():
+    cleaned = ai_assistant.sanitize_personal_data(
+        "По счёту 12 34 нужен перерасчёт",
+        ["12-34"],
+    )
+    assert "12 34" not in cleaned
+
+
+@pytest.mark.parametrize("source", ["меня зовут иван иванов", "иванов и.и."])
+def test_lowercase_name_forms_are_redacted(source):
+    cleaned = ai_assistant.sanitize_personal_data(source)
+    assert "иванов" not in cleaned.lower()
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "1234",
+        "ЛС 12 34, нет воды",
+        "AB-12",
+    ],
+)
+def test_ambiguous_personal_data_is_never_sent_to_provider(source):
+    deps, _, _ = _deps()
+    ai_assistant.ask(42, source, deps)
+    deps.reserve_question.assert_not_called()
+    deps.complete.assert_not_called()
+    assert "переформулируйте" in deps.send_buttons.call_args.args[1].lower()
+
+
 def test_yandex_client_builds_bounded_request_without_secret_in_body():
     response = Mock()
     response.raise_for_status.return_value = None
@@ -108,6 +155,39 @@ def test_yandex_client_builds_bounded_request_without_secret_in_body():
     assert call.kwargs["json"]["messages"][-1] == {"role": "user", "text": "Вопрос"}
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"result": None},
+        {"result": {"alternatives": [None]}},
+        {"result": {"alternatives": [{"message": None}]}},
+        {"result": {"alternatives": [{"message": {"text": None}}]}},
+    ],
+)
+def test_yandex_client_rejects_malformed_provider_json(payload):
+    response = Mock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = payload
+    client = ai_assistant.YandexGPTClient(
+        api_key="secret",
+        folder_id="folder",
+        api_url="https://example.invalid",
+        http_client=Mock(post=Mock(return_value=response)),
+    )
+    with pytest.raises(ai_assistant.AIServiceError):
+        client.complete(
+            settings={
+                "model": "yandexgpt/latest",
+                "system_prompt": "ЖКХ",
+                "temperature": 0.2,
+                "max_output_tokens": 100,
+            },
+            history=[],
+            question="Вопрос",
+            faq_context=None,
+        )
+
+
 def test_database_settings_migration_and_daily_session_reset_preserve_data(ai_db):
     assert db.create_lschet("KEEP-1", "Клиент", "Дом 1")
     settings = db.get_ai_settings()
@@ -134,6 +214,50 @@ def test_database_settings_migration_and_daily_session_reset_preserve_data(ai_db
     assert next_day["question_count"] == 0
     assert next_day["history"] == []
     assert db.get_ls("KEEP-1")["fio"] == "Клиент"
+
+
+def test_parallel_first_reservations_cannot_reset_daily_counter(ai_db):
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                lambda _: db.reserve_ai_question(
+                    77, 1, session_date="2026-09-18"
+                ),
+                range(2),
+            )
+        )
+    assert sorted(results) == [False, True]
+    assert db.get_ai_session(77, session_date="2026-09-18")["question_count"] == 1
+
+
+def test_parallel_history_appends_do_not_lose_an_exchange(ai_db):
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(
+            executor.map(
+                lambda index: db.append_ai_exchange(
+                    88,
+                    f"q{index}",
+                    f"a{index}",
+                    session_date="2026-09-18",
+                ),
+                range(2),
+            )
+        )
+    history = db.get_ai_session(88, session_date="2026-09-18")["history"]
+    assert len(history) == 4
+    assert {item["text"] for item in history} == {"q0", "a0", "q1", "a1"}
+
+
+def test_expired_history_is_removed_after_missed_midnight_cleanup(ai_db):
+    db.append_ai_exchange(99, "old question", "old answer", session_date="2026-09-18")
+    assert db.cleanup_expired_ai_sessions(session_date="2026-09-20") == 1
+    conn = db.get_conn()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM ai_daily_sessions WHERE chat_id=99"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
 
 
 def test_flow_sanitizes_question_context_and_answer_before_storage():
@@ -166,6 +290,13 @@ def test_limit_and_provider_failure_have_safe_appeal_fallback():
     failed.release_question.assert_called_once_with(43)
     assert failed_state["ai_last_exchange"]["question"] == "Вопрос"
     assert "временно недоступен" in failed.send_buttons.call_args.args[1]
+
+
+def test_empty_answer_after_sanitizing_is_safe_failure():
+    failed, _, _ = _deps(complete=Mock(return_value="   "))
+    ai_assistant.ask(43, "Как подать заявку?", failed)
+    failed.release_question.assert_called_once_with(43)
+    failed.append_exchange.assert_not_called()
 
 
 def test_new_dialog_keeps_counter_and_ai_appeal_uses_sanitized_exchange():
