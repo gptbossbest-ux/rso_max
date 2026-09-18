@@ -556,6 +556,33 @@ def upload_file():
     return redirect(url_for("upload_page"))
 
 
+# ── Управление лицевыми счетами ──────────────────────────────────────────────
+
+@app.route("/accounts")
+@admin_required
+def accounts_page():
+    accounts = db.list_lschet()
+    return render_template("accounts.html", accounts=accounts, user=session["user"])
+
+
+@app.route("/accounts/create", methods=["POST"])
+@admin_required
+def account_create():
+    number = request.form.get("number", "")
+    fio = request.form.get("fio", "")
+    address = request.form.get("address", "")
+    try:
+        created = db.create_lschet(number, fio, address)
+    except ValueError as exc:
+        flash(str(exc), "error")
+    else:
+        if created:
+            flash("Лицевой счёт добавлен", "success")
+        else:
+            flash("Лицевой счёт с таким номером уже существует", "error")
+    return redirect(url_for("accounts_page"))
+
+
 # ── Управление пользователями ─────────────────────────────────────────────────
 
 @app.route("/users")

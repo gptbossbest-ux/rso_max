@@ -305,7 +305,7 @@ def _request_ls(chat_id: int, after: str) -> None:
 
 
 def _start_1c_auth(chat_id: int, after: str | None = None) -> None:
-    """Compatibility wrapper for starting two-step 1C authorization."""
+    """Compatibility wrapper for local account authorization."""
     auth.start_1c_auth(chat_id, after, _auth_flow_dependencies())
 
 
@@ -772,8 +772,6 @@ def _auth_flow_dependencies() -> auth.AuthFlowDependencies:
         reset_ls_brute=_reset_ls_brute,
         save_ls=_save_ls,
         start_1c_auth=_start_1c_auth,
-        request_1c_auth_code=client_api.request_1c_auth_code,
-        verify_1c_auth_code=client_api.verify_1c_auth_code,
         continuations=_AFTER_LS_ACTIONS,
         integration_enabled=ENABLE_1C_INTEGRATION,
         logger=log,
@@ -786,13 +784,8 @@ def _on_await_ls(chat_id: int, st: dict, text: str) -> None:
 
 
 def _on_await_ls_1c(chat_id: int, st: dict, text: str) -> None:
-    """Compatibility wrapper for requesting a one-time 1C code."""
+    """Compatibility wrapper for local account authorization."""
     auth.on_await_ls_1c(chat_id, st, text, _auth_flow_dependencies())
-
-
-def _on_await_code_1c(chat_id: int, st: dict, text: str) -> None:
-    """Compatibility wrapper for verifying a one-time 1C code."""
-    auth.on_await_code_1c(chat_id, st, text, _auth_flow_dependencies())
 
 
 def _on_reopen_comment(chat_id: int, st: dict, text: str) -> None:
@@ -820,7 +813,6 @@ _MESSAGE_HANDLERS: dict[str, callable] = {
     S.APPEAL_BODY:       lambda chat_id, st, text: _appeal_got_body(chat_id, text),
     S.AWAIT_LS:          _on_await_ls,
     S.AWAIT_LS_1C:       _on_await_ls_1c,
-    S.AWAIT_CODE_1C:     _on_await_code_1c,
     S.REOPEN_COMMENT:    _on_reopen_comment,
     S.APPOINTMENT_THEME: _on_appointment_theme,
     S.WAITING_VALUE1:    _on_value1,
@@ -867,7 +859,8 @@ def handle_message(message: dict) -> None:
             send_main_menu(chat_id, "Начнём заново. Выберите действие:")
         return
 
-    # Состояние без текстового обработчика — показываем меню
+    # Состояние без текстового обработчика — сбрасываем и показываем меню.
+    _clear_flow(st)
     send_main_menu(chat_id)
 
 

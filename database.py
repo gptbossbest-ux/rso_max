@@ -22,20 +22,22 @@ import json
 import logging
 import os
 import sqlite3
-from datetime import datetime, timezone, timedelta
+import unicodedata
+from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from zoneinfo import ZoneInfo
+
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from config import (
+    BOOTSTRAP_ADMIN_PASSWORD,
     DB_PATH,
-    TIMEZONE_OFFSET,
+    LOG_BACKUP_COUNT,
     LOG_FILE,
     LOG_LEVEL,
     LOG_MAX_BYTES,
-    LOG_BACKUP_COUNT,
     TICKET_PREFIX,
-    BOOTSTRAP_ADMIN_PASSWORD,
+    TIMEZONE_OFFSET,
 )
 
 # ── Логгер модуля ─────────────────────────────────────────────────────────────
@@ -1331,6 +1333,77 @@ def update_1c_sync_state(**fields: str | None) -> None:
 
 
 # ── Лицевые счета и счётчики ──────────────────────────────────────────────────
+
+def normalize_lschet_number(number: str) -> str:
+    """Normalize and validate a user-facing account number."""
+    normalized = number.strip()
+    if not normalized:
+        raise ValueError("Введите номер лицевого счёта")
+    if len(normalized) > 64:
+        raise ValueError("Номер лицевого счёта не должен превышать 64 символа")
+    if any(unicodedata.category(char) == "Cc" for char in normalized):
+        raise ValueError("Номер лицевого счёта содержит недопустимые символы")
+    return normalized
+
+
+def _normalize_optional_lschet_field(
+    value: str | None,
+    *,
+    label: str,
+    max_length: int,
+) -> str | None:
+    normalized = value.strip() if value else ""
+    if not normalized:
+        return None
+    if len(normalized) > max_length:
+        raise ValueError(f"Поле «{label}» не должно превышать {max_length} символов")
+    if any(unicodedata.category(char) == "Cc" for char in normalized):
+        raise ValueError(f"Поле «{label}» содержит недопустимые символы")
+    return normalized
+
+
+def list_lschet() -> list[sqlite3.Row]:
+    """Return all accounts for the administrative directory."""
+    conn = get_conn()
+    try:
+        return conn.execute(
+            "SELECT id, number, fio, address FROM licschet ORDER BY number"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def create_lschet(
+    number: str,
+    fio: str | None = None,
+    address: str | None = None,
+) -> bool:
+    """Insert one account without overwriting an existing account."""
+    normalized = normalize_lschet_number(number)
+    normalized_fio = _normalize_optional_lschet_field(
+        fio,
+        label="ФИО",
+        max_length=256,
+    )
+    normalized_address = _normalize_optional_lschet_field(
+        address,
+        label="Адрес",
+        max_length=512,
+    )
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN")
+        conn.execute(
+            "INSERT INTO licschet (number, fio, address) VALUES (?, ?, ?)",
+            (normalized, normalized_fio, normalized_address),
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
 
 def get_ls(number: str) -> sqlite3.Row | None:
     conn = get_conn()

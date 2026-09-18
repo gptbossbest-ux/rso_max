@@ -16,7 +16,6 @@ STATE_VALUES = {
     "APPEAL_BODY": "appeal_body",
     "AWAIT_LS": "await_ls",
     "AWAIT_LS_1C": "await_ls_1c",
-    "AWAIT_CODE_1C": "await_code_1c",
     "REOPEN_COMMENT": "reopen_comment",
     "SCRIPT_LIST": "script_list",
     "SCRIPT_NODE": "script_node",

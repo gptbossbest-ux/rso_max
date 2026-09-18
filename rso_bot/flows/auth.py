@@ -74,8 +74,6 @@ class AuthFlowDependencies:
     reset_ls_brute: Callable[[int], None]
     save_ls: Callable[..., None]
     start_1c_auth: Callable[[int, str | None], None]
-    request_1c_auth_code: Callable[[str, int], tuple[dict | None, str | None]]
-    verify_1c_auth_code: Callable[[str, int, str], tuple[dict | None, str | None]]
     continuations: dict[str, Continuation]
     integration_enabled: bool
     logger: logging.Logger
@@ -220,10 +218,9 @@ def start_1c_auth(
     after: str | None,
     deps: AuthFlowDependencies,
 ) -> None:
-    """Start two-step account authorization through the published 1C API."""
+    """Start temporary local authorization by an existing account number."""
     state = deps.get_state(chat_id)
     if after:
-        state.pop("pending_1c_ls", None)
         state.pop("after_ls", None)
     else:
         deps.clear_flow(state)
@@ -232,15 +229,6 @@ def start_1c_auth(
         state["after_1c_auth"] = after
     deps.touch(state)
     deps.send_message(chat_id, "Введите номер вашего лицевого счёта:")
-
-
-def _service_failure(chat_id: int, state: Session, deps: AuthFlowDependencies) -> None:
-    deps.send_message(
-        chat_id,
-        "⚠️ Сервис авторизации временно недоступен. Попробуйте позже.",
-    )
-    deps.clear_flow(state)
-    deps.send_main_menu(chat_id)
 
 
 def on_await_ls(
@@ -298,95 +286,46 @@ def on_await_ls_1c(
     text: str,
     deps: AuthFlowDependencies,
 ) -> None:
-    """Request a one-time authorization code for the entered account."""
+    """Authorize immediately when the account exists in the local directory."""
     ls = text.strip()
     if not ls:
         deps.send_message(chat_id, "Введите номер лицевого счёта.")
         return
+
+    block_message = deps.check_ls_brute(chat_id)
+    if block_message:
+        deps.send_message(chat_id, block_message)
+        return
+
+    validation = deps.validate_ls(ls)
+    if validation is LsValidation.UNAVAILABLE:
+        deps.send_message(
+            chat_id,
+            "⚠️ Сервис временно недоступен. Попробуйте позже.",
+        )
+        return
+    if not validation:
+        deps.send_message(chat_id, deps.fail_ls(chat_id))
+        deps.send_message(chat_id, "Введите номер лицевого счёта повторно:")
+        return
+
+    deps.reset_ls_brute(chat_id)
     try:
-        data, error = deps.request_1c_auth_code(ls, chat_id)
-    except Exception:  # noqa: BLE001 - API callback is an app boundary
-        deps.logger.error("Ошибка запроса к сервису авторизации 1С")
-        _service_failure(chat_id, state, deps)
-        return
-    if error or not isinstance(data, dict):
-        _service_failure(chat_id, state, deps)
+        deps.save_ls(chat_id, ls)
+    except Exception:  # noqa: BLE001 - persistence callback is an app boundary
+        deps.logger.error("Не удалось сохранить авторизованный лицевой счёт")
+        deps.send_message(
+            chat_id,
+            "⚠️ Не удалось сохранить лицевой счёт. Попробуйте позже.",
+        )
         return
 
-    status_value = data.get("status")
-    status = status_value if isinstance(status_value, str) else None
-    message_value = data.get("message")
-    if not isinstance(message_value, str) or not message_value.strip():
-        _service_failure(chat_id, state, deps)
+    after = state.pop("after_1c_auth", None)
+    state["state"] = S.MENU
+    deps.touch(state)
+    action = deps.continuations.get(after) if isinstance(after, str) else None
+    if action:
+        action(chat_id, ls)
         return
-    message = message_value
-    if status == "ok":
-        state["pending_1c_ls"] = ls
-        state["state"] = S.AWAIT_CODE_1C
-        deps.touch(state)
-        deps.send_message(chat_id, message)
-        return
-    deps.send_message(chat_id, message)
     deps.clear_flow(state)
-    deps.send_main_menu(chat_id)
-
-
-def on_await_code_1c(
-    chat_id: int,
-    state: Session,
-    text: str,
-    deps: AuthFlowDependencies,
-) -> None:
-    """Verify a one-time code without retaining or logging the secret value."""
-    ls = state.get("pending_1c_ls")
-    if not ls:
-        deps.clear_flow(state)
-        deps.send_main_menu(chat_id, "Начнём авторизацию заново.")
-        return
-    try:
-        data, error = deps.verify_1c_auth_code(str(ls), chat_id, text.strip())
-    except Exception:  # noqa: BLE001 - API callback is an app boundary
-        deps.logger.error("Ошибка проверки кода авторизации 1С")
-        _service_failure(chat_id, state, deps)
-        return
-    if error or not isinstance(data, dict):
-        _service_failure(chat_id, state, deps)
-        return
-
-    status_value = data.get("status")
-    status = status_value if isinstance(status_value, str) else None
-    message_value = data.get("message")
-    if not isinstance(message_value, str) or not message_value.strip():
-        _service_failure(chat_id, state, deps)
-        return
-    message = message_value
-    if status == "wrong_code":
-        deps.send_message(chat_id, message)
-        return
-    if status == "ok":
-        after = state.pop("after_1c_auth", None)
-        try:
-            deps.save_ls(chat_id, str(ls))
-        except Exception:  # noqa: BLE001 - persistence callback is an app boundary
-            deps.logger.error("Не удалось сохранить авторизованный лицевой счёт")
-            deps.send_message(
-                chat_id,
-                "⚠️ Не удалось сохранить лицевой счёт. Попробуйте позже.",
-            )
-            deps.clear_flow(state)
-            deps.send_main_menu(chat_id)
-            return
-        state.pop("pending_1c_ls", None)
-        state["state"] = S.MENU
-        deps.touch(state)
-        deps.send_message(chat_id, message)
-        action = deps.continuations.get(after) if isinstance(after, str) else None
-        if action:
-            action(chat_id, str(ls))
-        else:
-            deps.clear_flow(state)
-            deps.send_main_menu(chat_id)
-        return
-    deps.send_message(chat_id, message)
-    deps.clear_flow(state)
-    deps.send_main_menu(chat_id)
+    deps.send_main_menu(chat_id, "✅ Авторизация выполнена. Выберите действие:")

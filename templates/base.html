@@ -227,6 +227,10 @@
            class="nav-item {% if request.endpoint == 'upload_page' %}active{% endif %}">
             📂 Загрузка данных
         </a>
+        <a href="{{ url_for('accounts_page') }}"
+           class="nav-item {% if request.endpoint in ('accounts_page','account_create') %}active{% endif %}">
+            🧾 Лицевые счета
+        </a>
         <a href="{{ url_for('users_page') }}"
            class="nav-item {% if request.endpoint in ('users_page','user_create','user_delete') %}active{% endif %}">
             👥 Пользователи
