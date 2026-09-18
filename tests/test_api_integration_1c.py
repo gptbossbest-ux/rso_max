@@ -114,7 +114,7 @@ class Integration1CApiTests(unittest.TestCase):
         self.assertEqual(db.get_bot_user(42)["ls"], "100001")
         self.assertEqual(db.get_schetchiki("100001")[0]["meter_number"], "M-1")
 
-    def test_verify_success_preserves_existing_fio(self) -> None:
+    def test_verify_success_clears_existing_fio_when_account_changes(self) -> None:
         db.upsert_bot_user(42, "old-ls", "Иванов Иван", authorized_1c=False)
         result = {"status": "ok", "message": "Готово", "meters": []}
 
@@ -128,6 +128,22 @@ class Integration1CApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         user = db.get_bot_user(42)
         self.assertEqual(user["ls"], "100001")
+        self.assertIsNone(user["fio"])
+        self.assertEqual(user["authorized_1c"], 1)
+
+    def test_verify_success_preserves_existing_fio_for_same_account(self) -> None:
+        db.upsert_bot_user(42, "100001", "Иванов Иван", authorized_1c=False)
+        result = {"status": "ok", "message": "Готово", "meters": []}
+
+        with patch.object(client_1c, "verify_auth_code", return_value=(result, None)):
+            response = self.client.post(
+                "/api/v1/integrations/1c/auth/verify-code",
+                headers=self.headers,
+                json={"ls": "100001", "chat_id": 42, "code": "123456"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        user = db.get_bot_user(42)
         self.assertEqual(user["fio"], "Иванов Иван")
         self.assertEqual(user["authorized_1c"], 1)
 
@@ -149,6 +165,23 @@ class Integration1CApiTests(unittest.TestCase):
         for meters in invalid_meters:
             with self.subTest(meters=meters):
                 result = {"status": "ok", "message": "Готово", "meters": meters}
+                with patch.object(
+                    client_1c, "verify_auth_code", return_value=(result, None)
+                ):
+                    response = self.client.post(
+                        "/api/v1/integrations/1c/auth/verify-code",
+                        headers=self.headers,
+                        json={"ls": "100001", "chat_id": 42, "code": "123456"},
+                    )
+
+                self.assertEqual(response.status_code, 502)
+                self.assertIsNone(db.get_bot_user(42))
+                self.assertEqual(db.get_schetchiki("100001"), [])
+
+    def test_success_with_empty_message_is_rejected_before_any_write(self) -> None:
+        for message in ("", "   "):
+            with self.subTest(message=repr(message)):
+                result = {"status": "ok", "message": message, "meters": []}
                 with patch.object(
                     client_1c, "verify_auth_code", return_value=(result, None)
                 ):

@@ -61,7 +61,7 @@ from config import (
 from rso_bot import max_transport
 from rso_bot import scheduler as bot_scheduler
 from rso_bot import states as session_states
-from rso_bot.flows import appeals, appointments, faq, readings
+from rso_bot.flows import appeals, appointments, auth, faq, readings
 from rso_bot.jobs import appointment_reminders
 from rso_bot.session import SessionManager
 
@@ -124,8 +124,8 @@ CATEGORIES: dict[str, str] = {
 # {chat_id: {state, ls, fio, last_active, ...}}
 user_states: dict = {}
 
-# {chat_id: {attempts, blocked_until}}
-_auth_attempts: dict = {}
+# {chat_id: {attempts, blocked_until}} — compatibility alias for integrations.
+_auth_attempts: dict = auth.auth_attempts
 
 
 def _now() -> datetime:
@@ -230,67 +230,53 @@ def send_main_menu(chat_id: int, text: str = "Выберите действие:
 # ── Вспомогательные функции ───────────────────────────────────────────────────
 
 def _get_saved_ls(chat_id: int) -> str | None:
-    """Возвращает сохранённый ЛС из сессии или таблицы bot_users."""
-    st = _get_state(chat_id)
-    if st.get("ls") and (not ENABLE_1C_INTEGRATION or st.get("authorized_1c")):
-        return st["ls"]
-    row = db.get_bot_user(chat_id)
-    if row and row["ls"] and (
-        not ENABLE_1C_INTEGRATION or bool(row["authorized_1c"])
-    ):
-        st["ls"] = row["ls"]
-        st["fio"] = row["fio"]
-        st["authorized_1c"] = bool(row["authorized_1c"])
-        return row["ls"]
-    return None
+    """Compatibility wrapper for loading a saved account."""
+    return auth.get_saved_ls(chat_id, _account_dependencies())
 
 
 def _save_ls(chat_id: int, ls: str, fio: str | None = None) -> None:
-    st = _get_state(chat_id)
-    st["ls"] = ls
-    st["authorized_1c"] = ENABLE_1C_INTEGRATION
-    if fio:
-        st["fio"] = fio
-    db.upsert_bot_user(
-        chat_id,
-        ls,
-        fio or "",
-        authorized_1c=ENABLE_1C_INTEGRATION,
-    )
+    auth.save_ls(chat_id, ls, fio, _account_dependencies())
 
 
-def _validate_ls(ls_number: str) -> bool:
-    """True если ЛС существует в БД."""
-    return db.get_ls(ls_number) is not None
+def _validate_ls(ls_number: str) -> auth.LsValidation:
+    """Compatibility wrapper for account validation."""
+    return auth.validate_ls(ls_number, _account_dependencies())
 
 
 def _check_ls_brute(chat_id: int) -> str | None:
-    """
-    Проверяет блокировку перебора ЛС.
-    Возвращает None если можно продолжать,
-    или строку с сообщением об ошибке если заблокировано.
-    """
-    info = _auth_attempts.get(chat_id, {"attempts": 0, "blocked_until": None})
-    if info["blocked_until"] and _now() < info["blocked_until"]:
-        remaining = int((info["blocked_until"] - _now()).total_seconds() / 60) + 1
-        return f"Слишком много неудачных попыток.\nПопробуйте через {remaining} мин."
-    return None
+    """Compatibility wrapper for manual account brute-force protection."""
+    return auth.check_ls_brute(chat_id, _brute_force_dependencies())
 
 
 def _fail_ls(chat_id: int) -> str:
-    """Фиксирует неудачную попытку ЛС, возвращает сообщение."""
-    info = _auth_attempts.setdefault(chat_id, {"attempts": 0, "blocked_until": None})
-    info["attempts"] += 1
-    left = MAX_AUTH_ATTEMPTS - info["attempts"]
-    if info["attempts"] >= MAX_AUTH_ATTEMPTS:
-        info["blocked_until"] = _now() + timedelta(minutes=AUTH_BLOCK_MINUTES)
-        info["attempts"] = 0
-        return f"Превышено число попыток. Введите ЛС через {AUTH_BLOCK_MINUTES} мин."
-    return f"Лицевой счёт не найден. Осталось попыток: {left}"
+    """Compatibility wrapper for recording an invalid account."""
+    return auth.fail_ls(chat_id, _brute_force_dependencies())
 
 
 def _reset_ls_brute(chat_id: int) -> None:
-    _auth_attempts.pop(chat_id, None)
+    auth.reset_ls_brute(chat_id, _brute_force_dependencies())
+
+
+def _account_dependencies() -> auth.AccountDependencies:
+    """Build account storage dependencies from current runtime patch points."""
+    return auth.AccountDependencies(
+        get_state=_get_state,
+        get_bot_user=db.get_bot_user,
+        upsert_bot_user=db.upsert_bot_user,
+        get_ls=db.get_ls,
+        integration_enabled=ENABLE_1C_INTEGRATION,
+        logger=log,
+    )
+
+
+def _brute_force_dependencies() -> auth.BruteForceDependencies:
+    """Build brute-force policy from current config and clock patch points."""
+    return auth.BruteForceDependencies(
+        attempts=_auth_attempts,
+        now=_now,
+        max_attempts=MAX_AUTH_ATTEMPTS,
+        block_minutes=AUTH_BLOCK_MINUTES,
+    )
 
 
 # ── Управление состоянием сессии ──────────────────────────────────────────────
@@ -306,34 +292,13 @@ def _reset_meter_input(st: dict) -> None:
 
 
 def _request_ls(chat_id: int, after: str) -> None:
-    """
-    Запрашивает ЛС у клиента и запоминает, какое действие выполнить после
-    успешной валидации (см. _AFTER_LS_ACTIONS).
-    """
-    if ENABLE_1C_INTEGRATION:
-        _start_1c_auth(chat_id, after=after)
-        return
-    st = _get_state(chat_id)
-    st["state"] = S.AWAIT_LS
-    st["after_ls"] = after
-    _touch(st)
-    send_message(chat_id, "Введите номер вашего лицевого счёта:")
+    """Compatibility wrapper for requesting an account."""
+    auth.request_ls(chat_id, after, _auth_flow_dependencies())
 
 
 def _start_1c_auth(chat_id: int, after: str | None = None) -> None:
-    """Начинает двухшаговую авторизацию ЛС через опубликованный сервис 1С."""
-    st = _get_state(chat_id)
-    if after:
-        # Авторизация приостанавливает текущий флоу, сохраняя его данные.
-        st.pop("pending_1c_ls", None)
-        st.pop("after_ls", None)
-    else:
-        _clear_flow(st)
-    st["state"] = S.AWAIT_LS_1C
-    if after:
-        st["after_1c_auth"] = after
-    _touch(st)
-    send_message(chat_id, "Введите номер вашего лицевого счёта:")
+    """Compatibility wrapper for starting two-step 1C authorization."""
+    auth.start_1c_auth(chat_id, after, _auth_flow_dependencies())
 
 
 # ── Ввод и валидация показаний ────────────────────────────────────────────────
@@ -791,95 +756,41 @@ _AFTER_LS_ACTIONS: dict[str, callable] = {
 }
 
 
+def _auth_flow_dependencies() -> auth.AuthFlowDependencies:
+    """Build auth flow dependencies from runtime patch points in this entry point."""
+    return auth.AuthFlowDependencies(
+        get_state=_get_state,
+        touch=_touch,
+        clear_flow=_clear_flow,
+        send_message=send_message,
+        send_main_menu=send_main_menu,
+        validate_ls=_validate_ls,
+        check_ls_brute=_check_ls_brute,
+        fail_ls=_fail_ls,
+        reset_ls_brute=_reset_ls_brute,
+        save_ls=_save_ls,
+        start_1c_auth=_start_1c_auth,
+        request_1c_auth_code=client_api.request_1c_auth_code,
+        verify_1c_auth_code=client_api.verify_1c_auth_code,
+        continuations=_AFTER_LS_ACTIONS,
+        integration_enabled=ENABLE_1C_INTEGRATION,
+        logger=log,
+    )
+
+
 def _on_await_ls(chat_id: int, st: dict, text: str) -> None:
-    """Клиент ввёл ЛС — валидируем и выполняем отложенное действие."""
-    block_msg = _check_ls_brute(chat_id)
-    if block_msg:
-        send_message(chat_id, block_msg)
-        return
-
-    if not _validate_ls(text):
-        send_message(chat_id, _fail_ls(chat_id))
-        send_message(chat_id, "Введите номер лицевого счёта повторно:")
-        return
-
-    _reset_ls_brute(chat_id)
-    _save_ls(chat_id, text)
-
-    after = st.pop("after_ls", None)
-    st["state"] = S.MENU
-    _touch(st)
-
-    action = _AFTER_LS_ACTIONS.get(after)
-    if action:
-        action(chat_id, text)
-    else:
-        # Отложенное действие не задано — просто подтверждаем и показываем меню
-        log.warning("after_ls не задан или неизвестен: %r  chat_id=%s", after, chat_id)
-        send_message(chat_id, "✅ Лицевой счёт сохранён.")
-        send_main_menu(chat_id)
+    """Compatibility wrapper for manual account input."""
+    auth.on_await_ls(chat_id, st, text, _auth_flow_dependencies())
 
 
 def _on_await_ls_1c(chat_id: int, st: dict, text: str) -> None:
-    """Запрашивает одноразовый код для введённого ЛС."""
-    ls = text.strip()
-    if not ls:
-        send_message(chat_id, "Введите номер лицевого счёта.")
-        return
-    data, error = client_api.request_1c_auth_code(ls, chat_id)
-    if error or not data:
-        send_message(chat_id, "⚠️ Сервис авторизации временно недоступен. Попробуйте позже.")
-        _clear_flow(st)
-        send_main_menu(chat_id)
-        return
-    status = data.get("status")
-    message = data.get("message") or "Не удалось запросить код."
-    if status == "ok":
-        st["pending_1c_ls"] = ls
-        st["state"] = S.AWAIT_CODE_1C
-        _touch(st)
-        send_message(chat_id, message)
-        return
-    send_message(chat_id, message)
-    _clear_flow(st)
-    send_main_menu(chat_id)
+    """Compatibility wrapper for requesting a one-time 1C code."""
+    auth.on_await_ls_1c(chat_id, st, text, _auth_flow_dependencies())
 
 
 def _on_await_code_1c(chat_id: int, st: dict, text: str) -> None:
-    """Проверяет введённый код; сам код не сохраняет и не логирует."""
-    ls = st.get("pending_1c_ls")
-    if not ls:
-        _clear_flow(st)
-        send_main_menu(chat_id, "Начнём авторизацию заново.")
-        return
-    data, error = client_api.verify_1c_auth_code(ls, chat_id, text.strip())
-    if error or not data:
-        send_message(chat_id, "⚠️ Сервис авторизации временно недоступен. Попробуйте позже.")
-        _clear_flow(st)
-        send_main_menu(chat_id)
-        return
-    status = data.get("status")
-    message = data.get("message") or "Не удалось проверить код."
-    if status == "wrong_code":
-        send_message(chat_id, message)
-        return
-    if status == "ok":
-        after = st.pop("after_1c_auth", None)
-        _save_ls(chat_id, ls)
-        st.pop("pending_1c_ls", None)
-        st["state"] = S.MENU
-        _touch(st)
-        send_message(chat_id, message)
-        action = _AFTER_LS_ACTIONS.get(after)
-        if action:
-            action(chat_id, ls)
-        else:
-            _clear_flow(st)
-            send_main_menu(chat_id)
-        return
-    send_message(chat_id, message)
-    _clear_flow(st)
-    send_main_menu(chat_id)
+    """Compatibility wrapper for verifying a one-time 1C code."""
+    auth.on_await_code_1c(chat_id, st, text, _auth_flow_dependencies())
 
 
 def _on_reopen_comment(chat_id: int, st: dict, text: str) -> None:
@@ -922,8 +833,12 @@ def handle_message(message: dict) -> None:
     text    = (message.get("body") or {}).get("text", "").strip()
 
     current_state = _get_state(chat_id).get("state", S.MENU)
-    safe_text = "<скрыто>" if current_state == S.AWAIT_CODE_1C else text[:50]
-    log.debug("msg chat_id=%s text='%s'", chat_id, safe_text)
+    log.debug(
+        "msg chat_id=%s state=%s text=<скрыто> length=%s",
+        chat_id,
+        current_state,
+        len(text),
+    )
 
     if not text:
         return

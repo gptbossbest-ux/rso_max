@@ -3,7 +3,7 @@ from __future__ import annotations
 from unittest.mock import Mock
 
 import bot
-from rso_bot.flows import appeals
+from rso_bot.flows import appeals, auth
 
 
 def _dependencies(
@@ -109,6 +109,20 @@ def test_got_ls_preserves_block_invalid_and_valid_paths():
     valid.reset_ls_brute.assert_called_once_with(42)
     valid.save_ls.assert_called_once_with(42, "100001")
     valid.submit_appeal.assert_called_once_with(42, "100001")
+
+
+def test_got_ls_does_not_spend_attempt_when_database_is_unavailable():
+    unavailable, state = _dependencies()
+    unavailable.validate_ls.return_value = auth.LsValidation.UNAVAILABLE
+
+    appeals.got_ls(42, "100001", unavailable)
+
+    unavailable.fail_ls.assert_not_called()
+    unavailable.save_ls.assert_not_called()
+    unavailable.send_message.assert_called_once_with(
+        42, "⚠️ Сервис временно недоступен. Попробуйте позже."
+    )
+    assert state == {"state": "menu"}
 
 
 def test_submit_success_preserves_api_contract_and_clears_flow():
