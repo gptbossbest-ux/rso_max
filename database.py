@@ -2881,7 +2881,7 @@ def _ensure_ai_session_locked(
                VALUES (?, ?, 0, '[]', NULL, ?)""",
             (chat_id, session_date, updated_at),
         )
-    elif row["session_date"] != session_date:
+    elif row["session_date"] < session_date:
         conn.execute(
             """UPDATE ai_daily_sessions
                SET session_date=?, question_count=0, history_json='[]',
@@ -2955,6 +2955,8 @@ def reserve_ai_question(
 ) -> bool:
     """Atomically reserve one request from the shared daily allowance."""
     today = session_date or _server_date()
+    if today != _server_date():
+        return False
     now = datetime.now().astimezone().isoformat(timespec="seconds")
     conn = get_conn()
     try:
@@ -2974,6 +2976,8 @@ def reserve_ai_question(
 
 def release_ai_question(chat_id: int, *, session_date: str | None = None) -> None:
     today = session_date or _server_date()
+    if today != _server_date():
+        return
     conn = get_conn()
     try:
         conn.execute(
@@ -2996,6 +3000,8 @@ def append_ai_exchange(
     max_messages: int = 20,
 ) -> None:
     today = session_date or _server_date()
+    if today != _server_date():
+        return
     now = datetime.now().astimezone().isoformat(timespec="seconds")
     conn = get_conn()
     try:

@@ -16,6 +16,7 @@ from rso_bot.flows import ai_assistant
 def ai_db(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "ai.sqlite"))
     monkeypatch.setattr(db, "BOOTSTRAP_ADMIN_PASSWORD", "")
+    monkeypatch.setattr(db, "_server_date", lambda: "2026-09-18")
     db.init_db()
 
 
@@ -121,8 +122,15 @@ def test_ambiguous_personal_data_is_never_sent_to_provider(source):
     assert "переформулируйте" in deps.send_buttons.call_args.args[1].lower()
 
 
-@pytest.mark.parametrize("source", ["иванов иван", "AB123"])
-def test_lowercase_name_and_short_alphanumeric_account_are_never_sent(source):
+@pytest.mark.parametrize(
+    "source",
+    [
+        "кучма леонид жалуется на отопление",
+        "живу ленина 10, нет воды",
+        "AB123",
+    ],
+)
+def test_contextual_name_address_and_short_account_are_never_sent(source):
     deps, _, _ = _deps()
     ai_assistant.ask(42, source, deps)
     deps.complete.assert_not_called()
@@ -135,6 +143,8 @@ def test_lowercase_name_and_short_alphanumeric_account_are_never_sent(source):
         ("Как получить перерасчёт за 2024 год?", ("2024", "перерасчёт")),
         ("из-за чего отключили воду?", ("из-за", "воду")),
         ("Почему в доме 25 нет воды?", ("Почему", "доме", "нет воды")),
+        ("вывоз отходов", ("вывоз отходов",)),
+        ("Когда будет ремонт домов?", ("ремонт домов",)),
     ],
 )
 def test_normal_utility_questions_keep_meaning_and_reach_provider(
@@ -145,6 +155,8 @@ def test_normal_utility_questions_keep_meaning_and_reach_provider(
     sent = deps.complete.call_args.kwargs["question"]
     for part in required_parts:
         assert part in sent
+    if source in {"вывоз отходов", "Когда будет ремонт домов?"}:
+        assert sent == source
 
 
 def test_yandex_client_builds_bounded_request_without_secret_in_body():
@@ -289,8 +301,11 @@ def test_expired_history_is_removed_after_missed_midnight_cleanup(ai_db):
         conn.close()
 
 
-def test_late_result_after_midnight_cannot_change_new_day_session(ai_db):
+def test_late_result_after_midnight_cannot_change_new_day_session(
+    ai_db, monkeypatch
+):
     assert db.reserve_ai_question(101, 5, session_date="2026-09-18")
+    monkeypatch.setattr(db, "_server_date", lambda: "2026-09-19")
     assert db.reserve_ai_question(101, 5, session_date="2026-09-19")
 
     db.append_ai_exchange(
@@ -303,8 +318,29 @@ def test_late_result_after_midnight_cannot_change_new_day_session(ai_db):
     assert current["history"] == []
 
 
-def test_late_result_after_cleanup_does_not_recreate_expired_session(ai_db):
+def test_late_reserve_cannot_roll_current_session_backwards(ai_db, monkeypatch):
+    assert db.reserve_ai_question(103, 5, session_date="2026-09-18")
+    monkeypatch.setattr(db, "_server_date", lambda: "2026-09-19")
+    assert db.reserve_ai_question(103, 5, session_date="2026-09-19")
+
+    assert not db.reserve_ai_question(103, 5, session_date="2026-09-18")
+
+    conn = db.get_conn()
+    try:
+        row = conn.execute(
+            "SELECT session_date, question_count, history_json "
+            "FROM ai_daily_sessions WHERE chat_id=103"
+        ).fetchone()
+        assert tuple(row) == ("2026-09-19", 1, "[]")
+    finally:
+        conn.close()
+
+
+def test_late_result_after_cleanup_does_not_recreate_expired_session(
+    ai_db, monkeypatch
+):
     assert db.reserve_ai_question(102, 5, session_date="2026-09-18")
+    monkeypatch.setattr(db, "_server_date", lambda: "2026-09-19")
     assert db.cleanup_expired_ai_sessions(session_date="2026-09-19") == 1
 
     db.append_ai_exchange(

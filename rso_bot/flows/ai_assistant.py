@@ -40,10 +40,6 @@ _FULL_NAME_RE = re.compile(
 _TWO_PART_NAME_RE = re.compile(
     r"\b[A-ZА-ЯЁ][a-zа-яё-]{1,}\s+[A-ZА-ЯЁ][a-zа-яё-]{1,}\b"
 )
-_LOWERCASE_NAME_RE = re.compile(
-    r"(?i)\b(?:[а-яё-]+(?:ов|ев|ёв|ин|ын|ский|цкий|ова|ева|ёва|ина)\s+[а-яё-]{2,}|"
-    r"[а-яё-]{2,}\s+[а-яё-]+(?:ов|ев|ёв|ин|ын|ский|цкий|ова|ева|ёва|ина))\b"
-)
 _INITIALS_NAME_RE = re.compile(
     r"\b(?:[А-ЯЁ][а-яё-]+\s+[А-ЯЁ]\.\s*[А-ЯЁ]\.?|"
     r"[А-ЯЁ]\.\s*[А-ЯЁ]\.?\s+[А-ЯЁ][а-яё-]+)",
@@ -51,6 +47,13 @@ _INITIALS_NAME_RE = re.compile(
 )
 _INTRO_NAME_RE = re.compile(
     r"(?i)\b(?:меня\s+зовут|моё\s+имя)\s+[а-яё-]+(?:\s+[а-яё-]+){1,2}"
+)
+_COMPLAINT_NAME_RE = re.compile(
+    r"(?i)\b[а-яё-]{2,}\s+[а-яё-]{2,}\s+(?=жалуется|сообщает|"
+    r"просит|обратился|обратилась|проживает)"
+)
+_RESIDENCE_ADDRESS_RE = re.compile(
+    r"(?i)\b(?:живу|нахожусь|проживаю|по\s+адресу)\s+[^,;\n]{2,100}"
 )
 _ADDRESS_RE = re.compile(
     r"(?i)\b(?:адрес|улица|ул\.|проспект|пр-т|переулок|пер\.)"
@@ -89,10 +92,11 @@ def sanitize_personal_data(text: str, known_values: Iterable[str] = ()) -> str:
     cleaned = _LONG_ID_RE.sub("[номер удалён]", cleaned)
     cleaned = _LABELED_NAME_RE.sub("ФИО [удалено]", cleaned)
     cleaned = _INTRO_NAME_RE.sub("ФИО [удалено]", cleaned)
+    cleaned = _COMPLAINT_NAME_RE.sub("ФИО [удалено] ", cleaned)
     cleaned = _FULL_NAME_RE.sub("ФИО [удалено]", cleaned)
     cleaned = _INITIALS_NAME_RE.sub("ФИО [удалено]", cleaned)
     cleaned = _TWO_PART_NAME_RE.sub("ФИО [удалено]", cleaned)
-    cleaned = _LOWERCASE_NAME_RE.sub("ФИО [удалено]", cleaned)
+    cleaned = _RESIDENCE_ADDRESS_RE.sub("адрес [удалён]", cleaned)
     cleaned = _ADDRESS_RE.sub("адрес [удалён]", cleaned)
     cleaned = _HOUSE_NUMBER_RE.sub(r"\1 [номер удалён]", cleaned)
     cleaned = _UNMARKED_ADDRESS_RE.sub("адрес [удалён]", cleaned)
@@ -114,8 +118,13 @@ def sanitize_personal_data(text: str, known_values: Iterable[str] = ()) -> str:
 
 def sanitize_ai_input(text: str, known_values: Iterable[str] = ()) -> str:
     """Sanitize input or reject it when any ambiguous PII indicator remains."""
-    if _AMBIGUOUS_ACCOUNT_RE.search(str(text or "")):
-        raise PersonalDataDetected("ambiguous account number")
+    raw_text = str(text or "")
+    if (
+        _AMBIGUOUS_ACCOUNT_RE.search(raw_text)
+        or _COMPLAINT_NAME_RE.search(raw_text)
+        or _RESIDENCE_ADDRESS_RE.search(raw_text)
+    ):
+        raise PersonalDataDetected("contextual personal data")
     cleaned = sanitize_personal_data(text, known_values)
     inspectable = _REDACTION_RE.sub(" ", cleaned).strip(" ,;:.-")
     pii_inspection = _YEAR_RE.sub(" ", inspectable)
@@ -125,7 +134,8 @@ def sanitize_ai_input(text: str, known_values: Iterable[str] = ()) -> str:
         or _RESIDUAL_PII_HINT_RE.search(pii_inspection)
         or _SHORT_ALNUM_ID_RE.search(pii_inspection)
         or _TWO_PART_NAME_RE.search(pii_inspection)
-        or _LOWERCASE_NAME_RE.search(pii_inspection)
+        or _COMPLAINT_NAME_RE.search(pii_inspection)
+        or _RESIDENCE_ADDRESS_RE.search(pii_inspection)
         or _INITIALS_NAME_RE.search(pii_inspection)
         or _UNMARKED_ADDRESS_RE.search(pii_inspection)
     ):
