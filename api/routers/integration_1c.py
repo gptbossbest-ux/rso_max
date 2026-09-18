@@ -1,4 +1,5 @@
 """Защищённые внутренние маршруты авторизации через 1С."""
+
 from __future__ import annotations
 
 import logging
@@ -47,6 +48,7 @@ def _validated_result(data: dict | None, error: str | None, allowed: set[str]) -
         or not isinstance(data.get("status"), str)
         or data["status"] not in allowed
         or not isinstance(data.get("message"), str)
+        or not data["message"].strip()
     ):
         log.error("1С вернула неизвестный бизнес-статус")
         _raise_transport_error("invalid_response")
@@ -95,5 +97,9 @@ def verify_code(payload: Integration1CVerifyRequest) -> dict:
         db.upsert_bot_user(payload.chat_id, payload.ls, "", authorized_1c=True)
         log.info("Авторизация через 1С успешна: chat_id=%s", payload.chat_id)
     else:
-        log.info("Проверка кода 1С завершена: status=%s chat_id=%s", result["status"], payload.chat_id)
+        log.info(
+            "Проверка кода 1С завершена: status=%s chat_id=%s",
+            result["status"],
+            payload.chat_id,
+        )
     return result
