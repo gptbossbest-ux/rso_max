@@ -9,6 +9,7 @@ the bot or creates a circular dependency.
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -50,12 +51,24 @@ class ReadingDependencies:
 
 
 def parse_reading(chat_id: int, text: str, deps: ReadingDependencies) -> float | None:
-    """Parse a reading, retaining the legacy ``float`` input semantics."""
+    """Parse a finite, non-negative meter reading."""
     try:
-        return float(text.replace(",", "."))
+        value = float(text.replace(",", "."))
     except ValueError:
         deps.send_message(chat_id, "Введите числовое значение.")
         return None
+    if value < 0 or not math.isfinite(value):
+        deps.send_message(chat_id, "Введите неотрицательное числовое значение.")
+        return None
+    return value
+
+
+def _record_value(record: Record, key: str, default: Any = None) -> Any:
+    """Read mappings and sqlite3.Row records without relying on ``get``."""
+    try:
+        return record[key]
+    except (IndexError, KeyError, TypeError):
+        return default
 
 
 def current_reading(
@@ -67,9 +80,10 @@ def current_reading(
 ) -> float:
     """Return the latest non-empty reading or the meter's initial value."""
     last = deps.get_last_reading(account, str(meter["meter_number"]))
-    if last and last[column]:
-        return float(last[column])
-    return float(meter.get(initial_key, "0") or "0")
+    latest = _record_value(last, column) if last is not None else None
+    if latest:
+        return float(latest)
+    return float(_record_value(meter, initial_key, "0") or "0")
 
 
 def start(chat_id: int, deps: ReadingDependencies) -> None:
@@ -131,7 +145,9 @@ def ask_meter_value(chat_id: int, deps: ReadingDependencies) -> None:
                 current_info = f"Текущее показание: {last['value1']}"
             current_info += f" (от {(last['created_at'] or '')[:10]})"
         else:
-            initial = meter.get("initial2" if waiting_v2 else "initial1", "0")
+            initial = _record_value(
+                meter, "initial2" if waiting_v2 else "initial1", "0"
+            )
             current_info = f"Начальное: {initial}"
 
     info_line = f"\n{current_info}" if current_info else ""
@@ -178,7 +194,11 @@ def select_meter(
     deps: ReadingDependencies,
 ) -> None:
     """Select a meter and reset value entry to T1."""
-    state["meter_idx"] = int(argument)
+    meter_index = int(argument)
+    meters = state.get("meters")
+    if not isinstance(meters, Sequence) or not 0 <= meter_index < len(meters):
+        raise ValueError("meter index is outside the available range")
+    state["meter_idx"] = meter_index
     deps.reset_meter_input(state)
     deps.touch(state)
     deps.ask_meter_value(chat_id)
@@ -190,14 +210,22 @@ def confirm(chat_id: int, state: State, deps: ReadingDependencies) -> None:
         return
 
     meter = state["meters"][state["meter_idx"]]
-    deps.add_reading(
-        chat_id,
-        state["ls"],
-        meter["resource_type"],
-        meter["meter_number"],
-        state.get("new_value1"),
-        state.get("new_value2"),
-    )
+    try:
+        deps.add_reading(
+            chat_id,
+            state["ls"],
+            meter["resource_type"],
+            meter["meter_number"],
+            state.get("new_value1"),
+            state.get("new_value2"),
+        )
+    except Exception:
+        deps.logger.exception("Не удалось сохранить показания счётчика")
+        deps.send_message(
+            chat_id,
+            "Не удалось сохранить показания. Попробуйте подтвердить ещё раз позже.",
+        )
+        return
     if deps.integration_enabled:
         deps.logger.info(
             "Показания сохранены в очередь 1С: ЛС=%s  счётчик=%s  chat_id=%s",
@@ -251,6 +279,9 @@ def on_value1(
     value = deps.parse_input(chat_id, text)
     if value is None:
         return
+    if value < 0 or not math.isfinite(value):
+        deps.send_message(chat_id, "Введите неотрицательное числовое значение.")
+        return
 
     current = deps.get_current_value(state.get("ls", ""), meter, "value1", "initial1")
     if not deps.integration_enabled and value < current:
@@ -282,6 +313,9 @@ def on_value2(
     meter = state["meters"][state["meter_idx"]]
     value = deps.parse_input(chat_id, text)
     if value is None:
+        return
+    if value < 0 or not math.isfinite(value):
+        deps.send_message(chat_id, "Введите неотрицательное числовое значение.")
         return
 
     current = deps.get_current_value(state.get("ls", ""), meter, "value2", "initial2")

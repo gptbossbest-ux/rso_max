@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-import math
+import sqlite3
 from dataclasses import replace
 from unittest.mock import MagicMock, patch
 
@@ -59,19 +59,23 @@ def make_deps(**overrides) -> readings.ReadingDependencies:
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
-    [("12.5", 12.5), ("12,5", 12.5), (" 12.5 ", 12.5), ("-1", -1.0)],
+    [("12.5", 12.5), ("12,5", 12.5), (" 12.5 ", 12.5), ("0", 0.0)],
 )
-def test_parse_reading_keeps_float_input_semantics(raw: str, expected: float) -> None:
+def test_parse_reading_accepts_finite_non_negative_values(
+    raw: str, expected: float
+) -> None:
     deps = make_deps()
     assert readings.parse_reading(7, raw, deps) == expected
     deps.send_message.assert_not_called()
 
 
-@pytest.mark.parametrize("raw", ["nan", "inf", "-inf"])
-def test_parse_reading_keeps_non_finite_float_semantics(raw: str) -> None:
-    value = readings.parse_reading(7, raw, make_deps())
-    assert value is not None
-    assert not math.isfinite(value)
+@pytest.mark.parametrize("raw", ["-1", "nan", "inf", "+inf", "-inf"])
+def test_parse_reading_rejects_negative_and_non_finite_values(raw: str) -> None:
+    deps = make_deps()
+    assert readings.parse_reading(7, raw, deps) is None
+    deps.send_message.assert_called_once_with(
+        7, "Введите неотрицательное числовое значение."
+    )
 
 
 def test_parse_reading_reports_non_number() -> None:
@@ -87,6 +91,26 @@ def test_current_reading_prefers_latest_and_falls_back_for_empty_value() -> None
 
     deps.get_last_reading.return_value = {"value1": 0}
     assert readings.current_reading("LS", meter(), "value1", "initial1", deps) == 10.0
+
+
+@pytest.mark.parametrize("latest", [0, None])
+def test_current_reading_supports_sqlite_row_and_falls_back(latest) -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("CREATE TABLE latest (value1 REAL)")
+        connection.execute("CREATE TABLE meters (meter_number TEXT, initial1 REAL)")
+        connection.execute("INSERT INTO latest VALUES (?)", (latest,))
+        connection.execute("INSERT INTO meters VALUES ('E-1', 10)")
+        row = connection.execute("SELECT value1 FROM latest").fetchone()
+        meter_row = connection.execute("SELECT * FROM meters").fetchone()
+        deps = make_deps(get_last_reading=MagicMock(return_value=row))
+        assert (
+            readings.current_reading("LS", meter_row, "value1", "initial1", deps)
+            == 10.0
+        )
+    finally:
+        connection.close()
 
 
 def test_start_uses_saved_account_or_requests_it() -> None:
@@ -149,18 +173,41 @@ def test_two_tariff_t2_prompt_shows_both_latest_values() -> None:
     )
 
 
-@pytest.mark.parametrize("argument,exc", [("x", ValueError), ("2", IndexError)])
-def test_invalid_or_missing_meter_selection_keeps_legacy_failure(argument, exc) -> None:
+@pytest.mark.parametrize("argument", ["x", "1", "-1"])
+def test_invalid_meter_selection_does_not_mutate_state(argument) -> None:
     deps = make_deps(
         reset_meter_input=MagicMock(
             side_effect=lambda state: state.update(state="waiting_value1")
         )
     )
     state = {"meters": [meter()]}
-    if argument == "2":
-        deps = replace(deps, ask_meter_value=MagicMock(side_effect=IndexError))
-    with pytest.raises(exc):
+    before = state.copy()
+    with pytest.raises(ValueError):
         readings.select_meter(7, state, argument, deps)
+    assert state == before
+    deps.reset_meter_input.assert_not_called()
+    deps.ask_meter_value.assert_not_called()
+
+
+@pytest.mark.parametrize("argument", ["x", "1", "-1"])
+def test_invalid_meter_callback_returns_to_menu_without_invalid_state(argument) -> None:
+    chat_id = 777
+    bot.user_states[chat_id] = {"state": bot.S.METER_SELECT, "meters": [meter()]}
+    update = {
+        "callback": {
+            "callback_id": "callback-invalid-meter",
+            "payload": f"meter:{argument}",
+        },
+        "message": {"recipient": {"chat_id": chat_id}},
+    }
+    with (
+        patch.object(bot, "_ack_callback"),
+        patch.object(bot, "send_main_menu") as menu,
+    ):
+        bot.handle_callback(update)
+    menu.assert_called_once_with(chat_id)
+    assert "meter_idx" not in bot.user_states[chat_id]
+    assert bot.user_states[chat_id]["state"] == bot.S.METER_SELECT
 
 
 def test_single_tariff_value_advances_to_confirmation() -> None:
@@ -237,6 +284,30 @@ def test_integration_mode_accepts_lower_value() -> None:
     assert state["new_value1"] == "5.0"
 
 
+@pytest.mark.parametrize("invalid", [-1.0, float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("handler", [readings.on_value1, readings.on_value2])
+@pytest.mark.parametrize("integration_enabled", [False, True])
+def test_invalid_values_never_mutate_or_confirm(
+    invalid, handler, integration_enabled: bool
+) -> None:
+    deps = make_deps(
+        integration_enabled=integration_enabled,
+        parse_input=MagicMock(return_value=invalid),
+    )
+    state = {
+        "ls": "LS",
+        "state": "waiting_value1",
+        "meters": [meter(two_tariff=True)],
+        "meter_idx": 0,
+    }
+    before = state.copy()
+    handler(7, state, str(invalid), deps)
+    assert state == before
+    deps.touch.assert_not_called()
+    deps.confirm_meter_reading.assert_not_called()
+    deps.add_reading.assert_not_called()
+
+
 def test_confirm_persists_exact_arguments_and_reopens_meter_list() -> None:
     deps = make_deps()
     state = {
@@ -256,14 +327,30 @@ def test_confirm_persists_exact_arguments_and_reopens_meter_list() -> None:
     assert "приняты!" in deps.send_message.call_args.args[1]
 
 
-def test_confirm_propagates_database_error_without_mutating_flow() -> None:
-    error = RuntimeError("database unavailable")
-    deps = make_deps(add_reading=MagicMock(side_effect=error))
-    state = {"state": "confirm", "ls": "LS", "meters": [meter()], "meter_idx": 0}
-    with pytest.raises(RuntimeError, match="database unavailable"):
-        readings.confirm(7, state, deps)
+def test_confirm_database_error_preserves_state_and_allows_retry() -> None:
+    add_reading = MagicMock(side_effect=[RuntimeError("database unavailable"), None])
+    deps = make_deps(add_reading=add_reading)
+    state = {
+        "state": "confirm",
+        "ls": "LS",
+        "meters": [meter()],
+        "meter_idx": 0,
+        "new_value1": "15.0",
+        "new_value2": None,
+    }
+    before = state.copy()
+    readings.confirm(7, state, deps)
+    assert state == before
     deps.clear_flow.assert_not_called()
-    deps.send_message.assert_not_called()
+    deps.show_meter_select.assert_not_called()
+    assert "Попробуйте подтвердить" in deps.send_message.call_args.args[1]
+
+    deps.send_message.reset_mock()
+    readings.confirm(7, state, deps)
+    assert add_reading.call_count == 2
+    deps.clear_flow.assert_called_once_with(state)
+    deps.show_meter_select.assert_called_once_with(7, "LS")
+    assert "приняты!" in deps.send_message.call_args.args[1]
 
 
 def test_retry_only_resets_confirmation_state() -> None:
@@ -297,3 +384,29 @@ def test_bot_start_wrapper_resolves_saved_ls_and_request_hooks() -> None:
     ):
         bot._start_pokazaniya(7)
     request.assert_called_once_with(7, "pokazaniya")
+
+
+def test_1c_auth_continues_deferred_readings_flow() -> None:
+    chat_id = 778
+    state = bot._get_state(chat_id)
+    state.update(
+        {
+            "state": bot.S.AWAIT_CODE_1C,
+            "pending_1c_ls": "100001",
+            "after_1c_auth": "pokazaniya",
+        }
+    )
+    result = {"status": "ok", "message": "Авторизация выполнена"}
+    with (
+        patch.object(
+            bot.client_api, "verify_1c_auth_code", return_value=(result, None)
+        ),
+        patch.object(bot, "_save_ls"),
+        patch.object(bot, "send_message"),
+        patch.object(bot, "_show_meter_select") as show_meter_select,
+    ):
+        bot._on_await_code_1c(chat_id, state, "123456")
+    show_meter_select.assert_called_once_with(chat_id, "100001")
+    assert state["state"] == bot.S.MENU
+    assert "after_1c_auth" not in state
+    assert "pending_1c_ls" not in state
