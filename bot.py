@@ -833,9 +833,12 @@ def handle_message(message: dict) -> None:
     text    = (message.get("body") or {}).get("text", "").strip()
 
     current_state = _get_state(chat_id).get("state", S.MENU)
-    secret_input_states = {S.AWAIT_LS, S.AWAIT_LS_1C, S.AWAIT_CODE_1C}
-    safe_text = "<скрыто>" if current_state in secret_input_states else text[:50]
-    log.debug("msg chat_id=%s text='%s'", chat_id, safe_text)
+    log.debug(
+        "msg chat_id=%s state=%s text=<скрыто> length=%s",
+        chat_id,
+        current_state,
+        len(text),
+    )
 
     if not text:
         return

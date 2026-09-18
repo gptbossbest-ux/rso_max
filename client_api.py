@@ -23,6 +23,10 @@ log = logging.getLogger("rso.client_api")
 
 _TIMEOUT = 5
 _HEADERS = {"Authorization": f"Bearer {INTERNAL_API_TOKEN}"}
+_SENSITIVE_POST_PATH_SUFFIXES = (
+    "/auth/request-code",
+    "/auth/verify-code",
+)
 
 
 def _get(path: str, params: dict | None = None) -> tuple[dict | list | None, str | None]:
@@ -43,16 +47,23 @@ def _get(path: str, params: dict | None = None) -> tuple[dict | list | None, str
 
 def _post(path: str, body: dict) -> tuple[dict | None, str | None]:
     url = f"{FASTAPI_BASE_URL}{path}"
+    sensitive = path.endswith(_SENSITIVE_POST_PATH_SUFFIXES)
     try:
         r = httpx.post(url, headers=_HEADERS, json=body, timeout=_TIMEOUT)
         if r.status_code in (200, 201):
             return r.json(), None
+        if sensitive:
+            log.warning("POST %s → %s", path, r.status_code)
+            return None, f"HTTP {r.status_code}"
         log.warning("POST %s → %s: %s", path, r.status_code, r.text[:200])
         return None, f"HTTP {r.status_code}: {r.json().get('detail', r.text[:100])}"
     except httpx.TimeoutException:
         log.warning("POST %s timeout", path)
         return None, "timeout"
     except Exception as exc:
+        if sensitive:
+            log.error("POST %s error", path)
+            return None, "request_failed"
         log.error("POST %s error: %s", path, exc)
         return None, str(exc)
 

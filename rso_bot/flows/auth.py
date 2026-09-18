@@ -308,11 +308,10 @@ def on_await_ls_1c(
     status_value = data.get("status")
     status = status_value if isinstance(status_value, str) else None
     message_value = data.get("message")
-    message = (
-        message_value
-        if isinstance(message_value, str) and message_value
-        else "Не удалось запросить код."
-    )
+    if not isinstance(message_value, str) or not message_value.strip():
+        _service_failure(chat_id, state, deps)
+        return
+    message = message_value
     if status == "ok":
         state["pending_1c_ls"] = ls
         state["state"] = S.AWAIT_CODE_1C
@@ -349,11 +348,10 @@ def on_await_code_1c(
     status_value = data.get("status")
     status = status_value if isinstance(status_value, str) else None
     message_value = data.get("message")
-    message = (
-        message_value
-        if isinstance(message_value, str) and message_value
-        else "Не удалось проверить код."
-    )
+    if not isinstance(message_value, str) or not message_value.strip():
+        _service_failure(chat_id, state, deps)
+        return
+    message = message_value
     if status == "wrong_code":
         deps.send_message(chat_id, message)
         return

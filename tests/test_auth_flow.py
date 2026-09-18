@@ -323,23 +323,31 @@ def test_bot_default_attempt_registry_is_owned_by_auth_module() -> None:
     assert bot._auth_attempts is auth.auth_attempts
 
 
-@pytest.mark.parametrize("secret_state", [S.AWAIT_LS, S.AWAIT_LS_1C, S.AWAIT_CODE_1C])
-def test_handle_message_redacts_account_and_code_input_from_debug_log(
-    secret_state: str,
+@pytest.mark.parametrize(
+    "message_state",
+    [S.AWAIT_LS, S.AWAIT_LS_1C, S.AWAIT_CODE_1C, S.APPEAL_BODY, S.MENU],
+)
+def test_handle_message_redacts_all_user_input_from_debug_log(
+    message_state: str,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     sentinel = "SECRET-LS-OR-CODE-991122"
-    state = {"state": secret_state}
+    state = {"state": message_state}
     handler = MagicMock()
     monkeypatch.setattr(bot, "_get_state", MagicMock(return_value=state))
     monkeypatch.setattr(bot, "_touch", MagicMock())
-    monkeypatch.setattr(bot, "_MESSAGE_HANDLERS", {secret_state: handler})
+    handlers = {} if message_state == S.MENU else {message_state: handler}
+    monkeypatch.setattr(bot, "_MESSAGE_HANDLERS", handlers)
+    monkeypatch.setattr(bot, "send_main_menu", MagicMock())
 
     with caplog.at_level(logging.DEBUG, logger=bot.log.name):
         bot.handle_message({"recipient": {"chat_id": 42}, "body": {"text": sentinel}})
 
-    handler.assert_called_once_with(42, state, sentinel)
+    if message_state == S.MENU:
+        handler.assert_not_called()
+    else:
+        handler.assert_called_once_with(42, state, sentinel)
     assert sentinel not in caplog.text
     assert "<скрыто>" in caplog.text
 
@@ -488,8 +496,28 @@ def test_request_code_rejects_wrong_status_and_message_types() -> None:
 
     auth.on_await_ls_1c(42, state, "100001", deps)
 
-    deps.send_message.assert_called_once_with(42, "Не удалось запросить код.")  # type: ignore[attr-defined]
+    deps.send_message.assert_called_once_with(  # type: ignore[attr-defined]
+        42, "⚠️ Сервис авторизации временно недоступен. Попробуйте позже."
+    )
     assert state == {"state": S.MENU}
+
+
+@pytest.mark.parametrize("bad_message", [None, "", "   ", {"secret": "SECRET-LS"}])
+def test_request_success_with_malformed_message_fails_closed(
+    bad_message: object,
+) -> None:
+    state = {"state": S.AWAIT_LS_1C, "appeal": {"body": "context"}}
+    deps = _flow_deps(
+        request_1c_auth_code=MagicMock(
+            return_value=({"status": "ok", "message": bad_message}, None)
+        )
+    )
+
+    auth.on_await_ls_1c(42, state, "100001", deps)
+
+    assert state == {"state": S.MENU}
+    assert "pending_1c_ls" not in state
+    deps.send_main_menu.assert_called_once_with(42)  # type: ignore[attr-defined]
 
 
 def test_request_code_rejects_empty_account_without_calling_api() -> None:
@@ -557,8 +585,35 @@ def test_verify_code_rejects_wrong_status_and_message_types() -> None:
 
     auth.on_await_code_1c(42, state, "123456", deps)
 
-    deps.send_message.assert_called_once_with(42, "Не удалось проверить код.")  # type: ignore[attr-defined]
+    deps.send_message.assert_called_once_with(  # type: ignore[attr-defined]
+        42, "⚠️ Сервис авторизации временно недоступен. Попробуйте позже."
+    )
     assert state == {"state": S.MENU}
+
+
+@pytest.mark.parametrize("bad_message", [None, "", "   ", ["SECRET-CODE"]])
+def test_verify_success_with_malformed_message_fails_closed(
+    bad_message: object,
+) -> None:
+    continuation = MagicMock()
+    state = {
+        "state": S.AWAIT_CODE_1C,
+        "pending_1c_ls": "100001",
+        "after_1c_auth": "appeal",
+    }
+    deps = _flow_deps(
+        verify_1c_auth_code=MagicMock(
+            return_value=({"status": "ok", "message": bad_message}, None)
+        ),
+        continuations={"appeal": continuation},
+    )
+
+    auth.on_await_code_1c(42, state, "123456", deps)
+
+    deps.save_ls.assert_not_called()  # type: ignore[attr-defined]
+    continuation.assert_not_called()
+    assert state == {"state": S.MENU}
+    deps.send_main_menu.assert_called_once_with(42)  # type: ignore[attr-defined]
 
 
 def test_missing_pending_account_restarts_authorization_without_api_call() -> None:
