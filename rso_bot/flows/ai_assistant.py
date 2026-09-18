@@ -40,6 +40,10 @@ _FULL_NAME_RE = re.compile(
 _TWO_PART_NAME_RE = re.compile(
     r"\b[A-ZА-ЯЁ][a-zа-яё-]{1,}\s+[A-ZА-ЯЁ][a-zа-яё-]{1,}\b"
 )
+_LOWERCASE_NAME_RE = re.compile(
+    r"(?i)\b(?:[а-яё-]+(?:ов|ев|ёв|ин|ын|ский|цкий|ова|ева|ёва|ина)\s+[а-яё-]{2,}|"
+    r"[а-яё-]{2,}\s+[а-яё-]+(?:ов|ев|ёв|ин|ын|ский|цкий|ова|ева|ёва|ина))\b"
+)
 _INITIALS_NAME_RE = re.compile(
     r"\b(?:[А-ЯЁ][а-яё-]+\s+[А-ЯЁ]\.\s*[А-ЯЁ]\.?|"
     r"[А-ЯЁ]\.\s*[А-ЯЁ]\.?\s+[А-ЯЁ][а-яё-]+)",
@@ -49,12 +53,14 @@ _INTRO_NAME_RE = re.compile(
     r"(?i)\b(?:меня\s+зовут|моё\s+имя)\s+[а-яё-]+(?:\s+[а-яё-]+){1,2}"
 )
 _ADDRESS_RE = re.compile(
-    r"(?i)\b(?:адрес|улица|ул\.| проспект|пр-т|переулок|пер\.|"
-    r"дом|д\.|\bквартира|кв\.)\s*[:,-]?\s*[^\n;]{1,120}"
+    r"(?i)\b(?:адрес|улица|ул\.|проспект|пр-т|переулок|пер\.)"
+    r"\s*[:,-]?\s*[^\n;]{1,120}"
+)
+_HOUSE_NUMBER_RE = re.compile(
+    r"(?i)\b(дом(?:е)?|д\.|\bквартир(?:а|е|ы)?|кв\.)\s*№?\s*\d+[A-Za-zА-Яа-яЁё/-]*"
 )
 _UNMARKED_ADDRESS_RE = re.compile(
-    r"\b[A-ZА-ЯЁ][a-zа-яё-]{2,}\s*,?\s*(?:д\.?\s*)?\d{1,4}(?:[/корпуск\s.-]*\d{0,4})?\b",
-    re.IGNORECASE,
+    r"\b[А-ЯЁ][а-яё]{2,}(?:-[А-ЯЁ]?[а-яё]+)*\s*,?\s*(?:д\.?\s*)?\d{1,4}(?:[/.-]\d{1,4})?\b"
 )
 _LABELED_NAME_RE = re.compile(r"(?i)\b(?:фио|получатель|собственник)\s*[:,-]?\s*[A-ZА-ЯЁ][A-Za-zА-яЁё-]+(?:\s+[A-ZА-ЯЁ][A-Za-zА-яЁё-]+){1,2}")
 _REDACTION_RE = re.compile(
@@ -62,8 +68,12 @@ _REDACTION_RE = re.compile(
 )
 _RESIDUAL_PII_HINT_RE = re.compile(
     r"(?i)(?:\bфио\b|лицев\w*\s+сч|л\.?\s*с\.?|адрес|"
-    r"(?<!\d)\d{3,5}(?!\d)|\b[A-ZА-Я0-9]{1,12}[-/\\][A-ZА-Я0-9/-]{1,20}\b)"
+    r"(?<!\d)\d{3,5}(?!\d)|\b(?=[A-ZА-Я0-9/\\-]*\d)[A-ZА-Я0-9]{1,12}[-/\\][A-ZА-Я0-9/\\-]{1,20}\b)"
 )
+_SHORT_ALNUM_ID_RE = re.compile(
+    r"\b(?=[A-Za-zА-Яа-яЁё0-9]{4,12}\b)(?=[A-Za-zА-Яа-яЁё]*\d)(?=\d*[A-Za-zА-Яа-яЁё])[A-Za-zА-Яа-яЁё0-9]+\b"
+)
+_YEAR_RE = re.compile(r"(?<!\d)(?:19|20)\d{2}(?!\d)")
 _AMBIGUOUS_ACCOUNT_RE = re.compile(
     r"(?i)\b(?:лицев(?:ой|ого)\s+сч(?:ё|е)т(?:а)?|л\.?\s*с\.?)"
     r"\s*[:№#-]?\s*[A-ZА-Я0-9]+\s+[A-ZА-Я0-9]+"
@@ -82,7 +92,9 @@ def sanitize_personal_data(text: str, known_values: Iterable[str] = ()) -> str:
     cleaned = _FULL_NAME_RE.sub("ФИО [удалено]", cleaned)
     cleaned = _INITIALS_NAME_RE.sub("ФИО [удалено]", cleaned)
     cleaned = _TWO_PART_NAME_RE.sub("ФИО [удалено]", cleaned)
+    cleaned = _LOWERCASE_NAME_RE.sub("ФИО [удалено]", cleaned)
     cleaned = _ADDRESS_RE.sub("адрес [удалён]", cleaned)
+    cleaned = _HOUSE_NUMBER_RE.sub(r"\1 [номер удалён]", cleaned)
     cleaned = _UNMARKED_ADDRESS_RE.sub("адрес [удалён]", cleaned)
     for value in sorted(
         {str(item).strip() for item in known_values if str(item).strip()},
@@ -106,13 +118,16 @@ def sanitize_ai_input(text: str, known_values: Iterable[str] = ()) -> str:
         raise PersonalDataDetected("ambiguous account number")
     cleaned = sanitize_personal_data(text, known_values)
     inspectable = _REDACTION_RE.sub(" ", cleaned).strip(" ,;:.-")
+    pii_inspection = _YEAR_RE.sub(" ", inspectable)
     if (
         not cleaned
         or not inspectable
-        or _RESIDUAL_PII_HINT_RE.search(inspectable)
-        or _TWO_PART_NAME_RE.search(inspectable)
-        or _INITIALS_NAME_RE.search(inspectable)
-        or _UNMARKED_ADDRESS_RE.search(inspectable)
+        or _RESIDUAL_PII_HINT_RE.search(pii_inspection)
+        or _SHORT_ALNUM_ID_RE.search(pii_inspection)
+        or _TWO_PART_NAME_RE.search(pii_inspection)
+        or _LOWERCASE_NAME_RE.search(pii_inspection)
+        or _INITIALS_NAME_RE.search(pii_inspection)
+        or _UNMARKED_ADDRESS_RE.search(pii_inspection)
     ):
         raise PersonalDataDetected("potential personal data")
     return cleaned
@@ -195,11 +210,11 @@ class YandexGPTClient:
 @dataclass(frozen=True)
 class AIDependencies:
     get_settings: Callable[[], dict[str, Any]]
-    get_session: Callable[[int], dict[str, Any]]
+    get_session: Callable[..., dict[str, Any]]
     set_context: Callable[[int, str | None], None]
-    reserve_question: Callable[[int, int], bool]
-    release_question: Callable[[int], None]
-    append_exchange: Callable[[int, str, str], None]
+    reserve_question: Callable[..., bool]
+    release_question: Callable[..., None]
+    append_exchange: Callable[..., None]
     clear_history: Callable[[int], None]
     get_sensitive_values: Callable[[int], Iterable[str]]
     complete: Callable[..., str]
@@ -210,6 +225,7 @@ class AIDependencies:
     send_buttons: Callable[[int, str, list[list[Button]]], Any]
     send_main_menu: Callable[..., None]
     is_configured: Callable[[str], bool]
+    get_operation_date: Callable[[], str]
     logger: logging.Logger
     question_state: str
 
@@ -262,6 +278,7 @@ def start(chat_id: int, deps: AIDependencies, faq_context: str | None = None) ->
 
 
 def ask(chat_id: int, text: str, deps: AIDependencies) -> None:
+    operation_date = deps.get_operation_date()
     settings = deps.get_settings()
     if not settings["enabled"] or not deps.is_configured(settings["model"]):
         deps.send_buttons(chat_id, "⚠️ ИИ-помощник сейчас недоступен.", _fallback_buttons(deps))
@@ -276,7 +293,11 @@ def ask(chat_id: int, text: str, deps: AIDependencies) -> None:
             _fallback_buttons(deps),
         )
         return
-    if not deps.reserve_question(chat_id, int(settings["daily_limit"])):
+    if not deps.reserve_question(
+        chat_id,
+        int(settings["daily_limit"]),
+        session_date=operation_date,
+    ):
         state = deps.get_state(chat_id)
         state["ai_last_exchange"] = {"question": question, "answer": ""}
         deps.touch(state)
@@ -286,7 +307,11 @@ def ask(chat_id: int, text: str, deps: AIDependencies) -> None:
             _fallback_buttons(deps),
         )
         return
-    session = deps.get_session(chat_id)
+    session = deps.get_session(
+        chat_id,
+        session_date=operation_date,
+        create_if_missing=False,
+    )
     history = [
         {"role": item["role"], "text": sanitize_personal_data(item["text"], known)}
         for item in session.get("history", [])
@@ -304,7 +329,7 @@ def ask(chat_id: int, text: str, deps: AIDependencies) -> None:
         if not answer:
             raise AIServiceError("empty sanitized response")
     except AIServiceError:
-        deps.release_question(chat_id)
+        deps.release_question(chat_id, session_date=operation_date)
         state = deps.get_state(chat_id)
         state["ai_last_exchange"] = {"question": question, "answer": ""}
         deps.touch(state)
@@ -315,7 +340,7 @@ def ask(chat_id: int, text: str, deps: AIDependencies) -> None:
             _fallback_buttons(deps),
         )
         return
-    deps.append_exchange(chat_id, question, answer)
+    deps.append_exchange(chat_id, question, answer, session_date=operation_date)
     state = deps.get_state(chat_id)
     state["state"] = deps.question_state
     state["ai_last_exchange"] = {"question": question, "answer": answer}

@@ -50,6 +50,7 @@ def _deps(**overrides):
         send_buttons=Mock(),
         send_main_menu=Mock(),
         is_configured=Mock(return_value=True),
+        get_operation_date=Mock(return_value="2026-09-18"),
         logger=Mock(),
         question_state="ai_question",
     )
@@ -118,6 +119,32 @@ def test_ambiguous_personal_data_is_never_sent_to_provider(source):
     deps.reserve_question.assert_not_called()
     deps.complete.assert_not_called()
     assert "переформулируйте" in deps.send_buttons.call_args.args[1].lower()
+
+
+@pytest.mark.parametrize("source", ["иванов иван", "AB123"])
+def test_lowercase_name_and_short_alphanumeric_account_are_never_sent(source):
+    deps, _, _ = _deps()
+    ai_assistant.ask(42, source, deps)
+    deps.complete.assert_not_called()
+    deps.reserve_question.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("source", "required_parts"),
+    [
+        ("Как получить перерасчёт за 2024 год?", ("2024", "перерасчёт")),
+        ("из-за чего отключили воду?", ("из-за", "воду")),
+        ("Почему в доме 25 нет воды?", ("Почему", "доме", "нет воды")),
+    ],
+)
+def test_normal_utility_questions_keep_meaning_and_reach_provider(
+    source, required_parts
+):
+    deps, _, _ = _deps()
+    ai_assistant.ask(42, source, deps)
+    sent = deps.complete.call_args.kwargs["question"]
+    for part in required_parts:
+        assert part in sent
 
 
 def test_yandex_client_builds_bounded_request_without_secret_in_body():
@@ -231,6 +258,7 @@ def test_parallel_first_reservations_cannot_reset_daily_counter(ai_db):
 
 
 def test_parallel_history_appends_do_not_lose_an_exchange(ai_db):
+    assert db.reserve_ai_question(88, 5, session_date="2026-09-18")
     with ThreadPoolExecutor(max_workers=2) as executor:
         list(
             executor.map(
@@ -249,12 +277,45 @@ def test_parallel_history_appends_do_not_lose_an_exchange(ai_db):
 
 
 def test_expired_history_is_removed_after_missed_midnight_cleanup(ai_db):
+    assert db.reserve_ai_question(99, 5, session_date="2026-09-18")
     db.append_ai_exchange(99, "old question", "old answer", session_date="2026-09-18")
     assert db.cleanup_expired_ai_sessions(session_date="2026-09-20") == 1
     conn = db.get_conn()
     try:
         assert conn.execute(
             "SELECT COUNT(*) FROM ai_daily_sessions WHERE chat_id=99"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_late_result_after_midnight_cannot_change_new_day_session(ai_db):
+    assert db.reserve_ai_question(101, 5, session_date="2026-09-18")
+    assert db.reserve_ai_question(101, 5, session_date="2026-09-19")
+
+    db.append_ai_exchange(
+        101, "late old question", "late old answer", session_date="2026-09-18"
+    )
+    db.release_ai_question(101, session_date="2026-09-18")
+
+    current = db.get_ai_session(101, session_date="2026-09-19")
+    assert current["question_count"] == 1
+    assert current["history"] == []
+
+
+def test_late_result_after_cleanup_does_not_recreate_expired_session(ai_db):
+    assert db.reserve_ai_question(102, 5, session_date="2026-09-18")
+    assert db.cleanup_expired_ai_sessions(session_date="2026-09-19") == 1
+
+    db.append_ai_exchange(
+        102, "late old question", "late old answer", session_date="2026-09-18"
+    )
+    db.release_ai_question(102, session_date="2026-09-18")
+
+    conn = db.get_conn()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM ai_daily_sessions WHERE chat_id=102"
         ).fetchone()[0] == 0
     finally:
         conn.close()
@@ -287,7 +348,7 @@ def test_limit_and_provider_failure_have_safe_appeal_fallback():
 
     failed, failed_state, _ = _deps(complete=Mock(side_effect=ai_assistant.AIServiceError()))
     ai_assistant.ask(43, "Вопрос", failed)
-    failed.release_question.assert_called_once_with(43)
+    failed.release_question.assert_called_once_with(43, session_date="2026-09-18")
     assert failed_state["ai_last_exchange"]["question"] == "Вопрос"
     assert "временно недоступен" in failed.send_buttons.call_args.args[1]
 
@@ -295,7 +356,7 @@ def test_limit_and_provider_failure_have_safe_appeal_fallback():
 def test_empty_answer_after_sanitizing_is_safe_failure():
     failed, _, _ = _deps(complete=Mock(return_value="   "))
     ai_assistant.ask(43, "Как подать заявку?", failed)
-    failed.release_question.assert_called_once_with(43)
+    failed.release_question.assert_called_once_with(43, session_date="2026-09-18")
     failed.append_exchange.assert_not_called()
 
 
@@ -365,3 +426,20 @@ def test_main_menu_and_router_expose_ai_entry(monkeypatch):
     assert "ai_start" in payloads
     assert bot._CALLBACK_STATIC["ai_from_faq"] is bot._start_ai_from_faq
     assert bot._MESSAGE_HANDLERS[bot.S.AI_QUESTION] is bot._on_ai_question
+
+
+def test_question_operation_uses_one_fixed_server_date_for_all_storage_calls():
+    deps, _, _ = _deps()
+    ai_assistant.ask(42, "Как подать заявку?", deps)
+
+    deps.get_operation_date.assert_called_once_with()
+    deps.reserve_question.assert_called_once_with(42, 5, session_date="2026-09-18")
+    deps.get_session.assert_called_once_with(
+        42, session_date="2026-09-18", create_if_missing=False
+    )
+    deps.append_exchange.assert_called_once_with(
+        42,
+        "Как подать заявку?",
+        "Оформите заявку",
+        session_date="2026-09-18",
+    )

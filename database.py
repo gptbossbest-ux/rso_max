@@ -2859,6 +2859,11 @@ def _server_date() -> str:
     return datetime.now().astimezone().date().isoformat()
 
 
+def server_local_date() -> str:
+    """Public clock boundary shared by an entire AI request operation."""
+    return _server_date()
+
+
 def _ensure_ai_session_locked(
     conn: sqlite3.Connection,
     chat_id: int,
@@ -2888,15 +2893,34 @@ def _ensure_ai_session_locked(
     ).fetchone()
 
 
-def get_ai_session(chat_id: int, *, session_date: str | None = None) -> dict:
+def get_ai_session(
+    chat_id: int,
+    *,
+    session_date: str | None = None,
+    create_if_missing: bool = True,
+) -> dict:
     """Return today's sanitized session, replacing any expired daily data."""
     today = session_date or _server_date()
     now = datetime.now().astimezone().isoformat(timespec="seconds")
     conn = get_conn()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        row = _ensure_ai_session_locked(conn, chat_id, today, now)
+        row = conn.execute(
+            "SELECT * FROM ai_daily_sessions WHERE chat_id=? AND session_date=?",
+            (chat_id, today),
+        ).fetchone()
+        if row is None and create_if_missing:
+            row = _ensure_ai_session_locked(conn, chat_id, today, now)
         conn.commit()
+        if row is None:
+            return {
+                "chat_id": chat_id,
+                "session_date": today,
+                "question_count": 0,
+                "history": [],
+                "faq_context": None,
+                "updated_at": now,
+            }
         result = dict(row)
         try:
             result["history"] = json.loads(result.pop("history_json"))
@@ -2976,7 +3000,13 @@ def append_ai_exchange(
     conn = get_conn()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        row = _ensure_ai_session_locked(conn, chat_id, today, now)
+        row = conn.execute(
+            "SELECT history_json FROM ai_daily_sessions WHERE chat_id=? AND session_date=?",
+            (chat_id, today),
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return
         try:
             history = json.loads(row["history_json"])
             if not isinstance(history, list):

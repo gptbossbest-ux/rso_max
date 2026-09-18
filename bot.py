@@ -481,6 +481,7 @@ def _ai_dependencies() -> ai_assistant.AIDependencies:
         send_buttons=send_buttons,
         send_main_menu=send_main_menu,
         is_configured=_yandexgpt_client.configured_for,
+        get_operation_date=db.server_local_date,
         logger=log,
         question_state=S.AI_QUESTION,
     )
