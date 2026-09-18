@@ -48,12 +48,59 @@ _INITIALS_NAME_RE = re.compile(
 _INTRO_NAME_RE = re.compile(
     r"(?i)\b(?:меня\s+зовут|моё\s+имя)\s+[а-яё-]+(?:\s+[а-яё-]+){1,2}"
 )
-_COMPLAINT_NAME_RE = re.compile(
-    r"(?i)\b[а-яё-]{2,}\s+[а-яё-]{2,}\s+(?=жалуется|сообщает|"
-    r"просит|обратился|обратилась|проживает)"
+_CONTEXTUAL_NAME_RE = re.compile(
+    r"(?i)\b(?P<first>[а-яё][а-яё-]{1,})\s+"
+    r"(?P<second>[а-яё][а-яё-]{1,})(?="
+    r"\s*,\s*(?:нет|не\s+работает|отсутствует)\b|"
+    r"\s+(?:жалуется|сообщает|просит|обратился|обратилась|проживает)\b)"
 )
-_RESIDENCE_ADDRESS_RE = re.compile(
-    r"(?i)\b(?:живу|нахожусь|проживаю|по\s+адресу)\s+[^,;\n]{2,100}"
+_GENERIC_UTILITY_WORDS = frozenset(
+    {
+        "весь",
+        "вся",
+        "все",
+        "без",
+        "дом",
+        "горячая",
+        "горячей",
+        "жильцы",
+        "жители",
+        "квартира",
+        "лифт",
+        "мусор",
+        "мусора",
+        "мой",
+        "моя",
+        "наш",
+        "наша",
+        "отопление",
+        "отопления",
+        "отходов",
+        "отходы",
+        "подъезд",
+        "ремонт",
+        "свет",
+        "света",
+        "сосед",
+        "соседи",
+        "соседка",
+        "тепла",
+        "тепло",
+        "вода",
+        "воды",
+        "холодная",
+        "холодной",
+        "электричество",
+        "электричества",
+        "этот",
+        "эта",
+    }
+)
+_STRUCTURED_ADDRESS_RE = re.compile(
+    r"(?i)\b(?:живу|нахожусь|проживаю|по(?:\s+адресу)?|на)\s+"
+    r"(?:(?:улиц(?:а|е)|ул\.)\s+)?"
+    r"[а-яё][а-яё-]{1,}(?:\s+[а-яё][а-яё-]{1,}){0,2}\s+"
+    r"(?:(?:д(?:ом)?\.?)\s*)?№?\s*\d{1,4}(?:[/.-]\d{1,4})?\b"
 )
 _ADDRESS_RE = re.compile(
     r"(?i)\b(?:адрес|улица|ул\.|проспект|пр-т|переулок|пер\.)"
@@ -83,6 +130,22 @@ _AMBIGUOUS_ACCOUNT_RE = re.compile(
 )
 
 
+def _is_suspicious_contextual_name(match: re.Match[str]) -> bool:
+    words = {match.group("first").lower(), match.group("second").lower()}
+    return not words.intersection(_GENERIC_UTILITY_WORDS)
+
+
+def _contains_suspicious_contextual_name(text: str) -> bool:
+    return any(
+        _is_suspicious_contextual_name(match)
+        for match in _CONTEXTUAL_NAME_RE.finditer(text)
+    )
+
+
+def _redact_contextual_name(match: re.Match[str]) -> str:
+    return "ФИО [удалено]" if _is_suspicious_contextual_name(match) else match.group(0)
+
+
 def sanitize_personal_data(text: str, known_values: Iterable[str] = ()) -> str:
     """Redact obvious PII plus exact customer data known by the application."""
     cleaned = str(text or "")
@@ -92,11 +155,11 @@ def sanitize_personal_data(text: str, known_values: Iterable[str] = ()) -> str:
     cleaned = _LONG_ID_RE.sub("[номер удалён]", cleaned)
     cleaned = _LABELED_NAME_RE.sub("ФИО [удалено]", cleaned)
     cleaned = _INTRO_NAME_RE.sub("ФИО [удалено]", cleaned)
-    cleaned = _COMPLAINT_NAME_RE.sub("ФИО [удалено] ", cleaned)
+    cleaned = _CONTEXTUAL_NAME_RE.sub(_redact_contextual_name, cleaned)
     cleaned = _FULL_NAME_RE.sub("ФИО [удалено]", cleaned)
     cleaned = _INITIALS_NAME_RE.sub("ФИО [удалено]", cleaned)
     cleaned = _TWO_PART_NAME_RE.sub("ФИО [удалено]", cleaned)
-    cleaned = _RESIDENCE_ADDRESS_RE.sub("адрес [удалён]", cleaned)
+    cleaned = _STRUCTURED_ADDRESS_RE.sub("адрес [удалён]", cleaned)
     cleaned = _ADDRESS_RE.sub("адрес [удалён]", cleaned)
     cleaned = _HOUSE_NUMBER_RE.sub(r"\1 [номер удалён]", cleaned)
     cleaned = _UNMARKED_ADDRESS_RE.sub("адрес [удалён]", cleaned)
@@ -121,8 +184,8 @@ def sanitize_ai_input(text: str, known_values: Iterable[str] = ()) -> str:
     raw_text = str(text or "")
     if (
         _AMBIGUOUS_ACCOUNT_RE.search(raw_text)
-        or _COMPLAINT_NAME_RE.search(raw_text)
-        or _RESIDENCE_ADDRESS_RE.search(raw_text)
+        or _contains_suspicious_contextual_name(raw_text)
+        or _STRUCTURED_ADDRESS_RE.search(raw_text)
     ):
         raise PersonalDataDetected("contextual personal data")
     cleaned = sanitize_personal_data(text, known_values)
@@ -134,8 +197,8 @@ def sanitize_ai_input(text: str, known_values: Iterable[str] = ()) -> str:
         or _RESIDUAL_PII_HINT_RE.search(pii_inspection)
         or _SHORT_ALNUM_ID_RE.search(pii_inspection)
         or _TWO_PART_NAME_RE.search(pii_inspection)
-        or _COMPLAINT_NAME_RE.search(pii_inspection)
-        or _RESIDENCE_ADDRESS_RE.search(pii_inspection)
+        or _contains_suspicious_contextual_name(pii_inspection)
+        or _STRUCTURED_ADDRESS_RE.search(pii_inspection)
         or _INITIALS_NAME_RE.search(pii_inspection)
         or _UNMARKED_ADDRESS_RE.search(pii_inspection)
     ):

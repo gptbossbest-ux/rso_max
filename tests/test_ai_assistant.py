@@ -126,7 +126,10 @@ def test_ambiguous_personal_data_is_never_sent_to_provider(source):
     "source",
     [
         "кучма леонид жалуется на отопление",
+        "кучма леонид, нет отопления",
         "живу ленина 10, нет воды",
+        "на ленина 10 нет воды",
+        "по ленина 10 нет воды",
         "AB123",
     ],
 )
@@ -145,6 +148,8 @@ def test_contextual_name_address_and_short_account_are_never_sent(source):
         ("Почему в доме 25 нет воды?", ("Почему", "доме", "нет воды")),
         ("вывоз отходов", ("вывоз отходов",)),
         ("Когда будет ремонт домов?", ("ремонт домов",)),
+        ("живу без горячей воды уже неделю", ("живу без горячей воды уже неделю",)),
+        ("весь подъезд жалуется на холод", ("весь подъезд жалуется на холод",)),
     ],
 )
 def test_normal_utility_questions_keep_meaning_and_reach_provider(
@@ -155,7 +160,12 @@ def test_normal_utility_questions_keep_meaning_and_reach_provider(
     sent = deps.complete.call_args.kwargs["question"]
     for part in required_parts:
         assert part in sent
-    if source in {"вывоз отходов", "Когда будет ремонт домов?"}:
+    if source in {
+        "вывоз отходов",
+        "Когда будет ремонт домов?",
+        "живу без горячей воды уже неделю",
+        "весь подъезд жалуется на холод",
+    }:
         assert sent == source
 
 
