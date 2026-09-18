@@ -133,14 +133,22 @@ def _now() -> datetime:
 _session_manager = SessionManager(user_states, clock=lambda: _now())
 
 
+def _get_session_manager() -> SessionManager:
+    """Return a manager bound to the current ``user_states`` object."""
+    global _session_manager
+    if _session_manager.states is not user_states:
+        _session_manager = SessionManager(user_states, clock=lambda: _now())
+    return _session_manager
+
+
 def _touch(state: dict) -> dict:
     """Обновляет last_active и возвращает state."""
-    return _session_manager.touch(state)
+    return _get_session_manager().touch(state)
 
 
 def _get_state(chat_id: int) -> dict:
     """Возвращает состояние сессии, создаёт пустое если нет."""
-    return _session_manager.get_state(chat_id)
+    return _get_session_manager().get_state(chat_id)
 
 
 def cleanup_user_states(
@@ -156,7 +164,7 @@ def cleanup_user_states(
     не указано напрямую, чтобы не привязываться к объекту на момент
     определения функции).
     """
-    removed = _session_manager.cleanup(states, ttl_minutes)
+    removed = _get_session_manager().cleanup(states, ttl_minutes)
     if removed:
         log.info("cleanup_user_states: удалено %d устаревших сессий", removed)
     return removed
@@ -287,12 +295,12 @@ def _reset_ls_brute(chat_id: int) -> None:
 
 def _clear_flow(st: dict) -> None:
     """Сбрасывает состояние всех незавершённых флоу и возвращает в меню."""
-    _session_manager.clear_flow(st)
+    _get_session_manager().clear_flow(st)
 
 
 def _reset_meter_input(st: dict) -> None:
     """Сбрасывает введённые значения показаний, ставит ожидание Т1."""
-    _session_manager.reset_meter_input(st)
+    _get_session_manager().reset_meter_input(st)
 
 
 def _request_ls(chat_id: int, after: str) -> None:

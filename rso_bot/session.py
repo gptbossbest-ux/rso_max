@@ -1,4 +1,10 @@
-"""Thread-safe in-memory session state management."""
+"""Synchronized operations for process-local in-memory session state.
+
+Only operations performed through :class:`SessionManager` use its lock.  The
+mutable mappings and session dictionaries returned to callers are not guarded
+against direct external mutation, so this module does not make a complete bot
+conversation atomic.
+"""
 
 from __future__ import annotations
 
@@ -16,7 +22,12 @@ Clock = Callable[[], datetime]
 
 
 class SessionManager:
-    """Manage the bot's process-local sessions without owning business logic."""
+    """Synchronize individual session operations without owning business logic.
+
+    The registry and mutations made by these methods are protected by this
+    instance's lock.  Callers still receive mutable dictionaries; direct access
+    to them, or access through another manager, is outside that protection.
+    """
 
     def __init__(
         self,

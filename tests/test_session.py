@@ -74,6 +74,57 @@ def test_touch_uses_runtime_patched_bot_clock(monkeypatch):
     assert state["last_active"] == second
 
 
+def test_wrappers_follow_user_states_rebinding_without_mutating_old_mapping(
+    monkeypatch,
+):
+    now = datetime(2026, 9, 18, 10, 0, tzinfo=timezone.utc)
+    stale = now - timedelta(minutes=31)
+    original_states = bot.user_states
+    original_manager = bot._get_session_manager()
+    original_states[1] = {"state": S.MENU, "last_active": stale}
+    rebound_states = {2: {"state": S.APPEAL_BODY, "last_active": stale}}
+
+    monkeypatch.setattr(bot, "_now", lambda: now)
+    monkeypatch.setattr(bot, "user_states", rebound_states)
+
+    rebound_manager = bot._get_session_manager()
+    assert rebound_manager is not original_manager
+    assert rebound_manager.states is rebound_states
+    assert bot._get_session_manager() is rebound_manager
+
+    created = bot._get_state(3)
+    assert created == {"state": S.MENU, "last_active": now}
+    assert bot._touch(created) is created
+
+    flow_state = {"state": S.APPOINTMENT_CONFIRM, "appeal": {}}
+    rebound_states[4] = flow_state
+    bot._clear_flow(flow_state)
+    assert flow_state == {"state": S.MENU}
+
+    meter_state = {
+        "state": S.WAITING_VALUE2,
+        "new_value1": 1,
+        "new_value2": 2,
+    }
+    rebound_states[5] = meter_state
+    bot._reset_meter_input(meter_state)
+    assert meter_state == {"state": S.WAITING_VALUE1}
+
+    assert bot.cleanup_user_states(None, 30) == 1
+    assert set(rebound_states) == {3, 4, 5}
+    assert original_states == {
+        1: {"state": S.MENU, "last_active": stale},
+    }
+
+    monkeypatch.setattr(bot, "user_states", original_states)
+    restored_manager = bot._get_session_manager()
+    assert restored_manager is not rebound_manager
+    assert restored_manager.states is original_states
+    assert bot._get_session_manager() is restored_manager
+    assert bot._get_state(1) is original_states[1]
+    assert set(rebound_states) == {3, 4, 5}
+
+
 def test_cleanup_uses_strict_ttl_boundary_and_preserves_missing_or_non_dict(
     monkeypatch,
 ):
