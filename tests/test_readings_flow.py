@@ -353,6 +353,46 @@ def test_confirm_database_error_preserves_state_and_allows_retry() -> None:
     assert "приняты!" in deps.send_message.call_args.args[1]
 
 
+def test_confirm_database_error_does_not_log_reading_details(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sentinel_ls = "SECRET-LS-908172"
+    sentinel_value1 = "918273.4"
+    sentinel_value2 = "564738.2"
+    exception_text = (
+        f"storage rejected {sentinel_ls} values {sentinel_value1}/{sentinel_value2}"
+    )
+    logger = logging.getLogger("test.readings.private-error")
+    deps = make_deps(
+        add_reading=MagicMock(side_effect=RuntimeError(exception_text)),
+        logger=logger,
+    )
+    state = {
+        "state": "confirm",
+        "ls": sentinel_ls,
+        "meters": [meter(two_tariff=True)],
+        "meter_idx": 0,
+        "new_value1": sentinel_value1,
+        "new_value2": sentinel_value2,
+    }
+    before = state.copy()
+
+    with caplog.at_level(logging.ERROR, logger=logger.name):
+        readings.confirm(7, state, deps)
+
+    output = caplog.text
+    assert "Не удалось сохранить показания счётчика" in output
+    assert sentinel_ls not in output
+    assert sentinel_value1 not in output
+    assert sentinel_value2 not in output
+    assert exception_text not in output
+    assert all(record.exc_info is None for record in caplog.records)
+    assert state == before
+    deps.clear_flow.assert_not_called()
+    deps.show_meter_select.assert_not_called()
+    assert "Попробуйте подтвердить" in deps.send_message.call_args.args[1]
+
+
 def test_retry_only_resets_confirmation_state() -> None:
     deps = make_deps()
     readings.retry(7, {"state": "waiting_value1"}, deps)

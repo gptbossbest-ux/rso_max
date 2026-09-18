@@ -219,8 +219,11 @@ def confirm(chat_id: int, state: State, deps: ReadingDependencies) -> None:
             state.get("new_value1"),
             state.get("new_value2"),
         )
-    except Exception:
-        deps.logger.exception("Не удалось сохранить показания счётчика")
+    except Exception:  # noqa: BLE001 - persistence failures must keep the flow retryable
+        # The exception raised by the persistence layer can contain account and
+        # meter values. Keep the operational signal while deliberately omitting
+        # both exception details and reading context from the log.
+        deps.logger.error("Не удалось сохранить показания счётчика")
         deps.send_message(
             chat_id,
             "Не удалось сохранить показания. Попробуйте подтвердить ещё раз позже.",
