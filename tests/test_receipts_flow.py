@@ -119,6 +119,25 @@ def test_read_error_reports_failure_without_calling_max() -> None:
     deps.http_client.post.assert_not_called()
 
 
+def test_nonstandard_storage_exception_is_contained_without_sensitive_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "PRIVATE-STORAGE-DETAIL"
+    logger = logging.getLogger("test.receipts.storage-error")
+    deps = make_upload_deps(
+        read_bytes=MagicMock(side_effect=RuntimeError(secret)), logger=logger
+    )
+
+    with caplog.at_level(logging.ERROR, logger=logger.name):
+        receipts.send_pdf(7, "100001", deps)
+
+    deps.send_message.assert_called_once_with(
+        7, "Не удалось отправить квитанцию. Попробуйте позже."
+    )
+    deps.http_client.post.assert_not_called()
+    assert secret not in caplog.text
+
+
 def test_valid_pdf_preserves_two_step_upload_and_attachment_contract() -> None:
     document = b"%PDF-1.7\x00\xffbinary"
     deps = make_upload_deps(read_bytes=MagicMock(return_value=document))
@@ -148,6 +167,22 @@ def test_valid_pdf_preserves_two_step_upload_and_attachment_contract() -> None:
         },
     )
     deps.send_message.assert_not_called()
+
+
+def test_failed_attachment_send_is_not_reported_as_success(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    logger = logging.getLogger("test.receipts.send-failure")
+    deps = make_upload_deps(send_raw=MagicMock(return_value=False), logger=logger)
+
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        receipts.send_pdf(7, "100001", deps)
+
+    deps.send_message.assert_called_once_with(
+        7, "Не удалось отправить квитанцию. Попробуйте позже."
+    )
+    assert "не подтвердил отправку" in caplog.text
+    assert "PDF-квитанция отправлена" not in caplog.text
 
 
 def test_large_binary_document_is_forwarded_without_text_decoding() -> None:
@@ -309,3 +344,11 @@ def test_after_ls_receipt_continuation_keeps_legacy_wrapper() -> None:
 
 def test_default_receipt_path_preserves_runtime_contract() -> None:
     assert bot._receipt_path("100001") == Path("KV/100001.pdf")
+
+
+@pytest.mark.parametrize(
+    "account", ["", ".", "..", "../secret", "..\\secret", "dir/receipt"]
+)
+def test_receipt_path_rejects_directory_traversal(account: str) -> None:
+    with pytest.raises(FileNotFoundError):
+        receipts.local_receipt_path(Path("KV"), account)

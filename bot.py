@@ -571,7 +571,7 @@ def _cancel_own_appointment(chat_id: int, appointment_id: int) -> None:
 
 def _receipt_path(ls: str) -> Path:
     """Return the runtime path used for an account's PDF receipt."""
-    return Path("KV") / f"{ls}.pdf"
+    return receipts.local_receipt_path(Path("KV"), ls)
 
 
 def _read_receipt_bytes(path: Path) -> bytes:

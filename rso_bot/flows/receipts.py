@@ -42,6 +42,19 @@ class ReceiptFlowDependencies:
     deliver_receipt: Callable[[int, str], None]
 
 
+def local_receipt_path(root: Path, account: str) -> Path:
+    """Build a receipt path without allowing an account to escape its root."""
+    if (
+        not account
+        or account in {".", ".."}
+        or "/" in account
+        or "\\" in account
+        or "\x00" in account
+    ):
+        raise FileNotFoundError
+    return root / f"{account}.pdf"
+
+
 def send_pdf(chat_id: int, account: str, deps: ReceiptUploadDependencies) -> None:
     """Upload a receipt PDF and send its attachment token to the MAX chat."""
     try:
@@ -52,6 +65,10 @@ def send_pdf(chat_id: int, account: str, deps: ReceiptUploadDependencies) -> Non
         return
     except OSError:
         deps.logger.error("PDF: не удалось прочитать файл квитанции")
+        deps.send_message(chat_id, "Не удалось отправить квитанцию. Попробуйте позже.")
+        return
+    except Exception:  # noqa: BLE001 - injected storage adapters may be non-standard
+        deps.logger.error("PDF: ошибка хранилища квитанций")
         deps.send_message(chat_id, "Не удалось отправить квитанцию. Попробуйте позже.")
         return
 
@@ -86,13 +103,19 @@ def send_pdf(chat_id: int, account: str, deps: ReceiptUploadDependencies) -> Non
 
         # MAX needs a short processing interval before the token can be used.
         deps.sleep(2)
-        deps.send_raw(
+        sent = deps.send_raw(
             chat_id,
             {
                 "text": f"Квитанция по ЛС {account}:",
                 "attachments": [{"type": "file", "payload": {"token": token}}],
             },
         )
+        if not sent:
+            deps.logger.error("PDF: MAX не подтвердил отправку вложения")
+            deps.send_message(
+                chat_id, "Не удалось отправить квитанцию. Попробуйте позже."
+            )
+            return
         deps.logger.info("PDF-квитанция отправлена")
     except Exception as exc:  # noqa: BLE001 - HTTP adapters may raise custom errors
         status_code = getattr(getattr(exc, "response", None), "status_code", None)
