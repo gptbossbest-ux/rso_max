@@ -106,7 +106,11 @@ def test_open_script_uses_smallest_root_and_logs_ambiguous_tree():
         99,
         2,
     )
-    assert deps.send_buttons.call_args.args[1] == "📌 Второй"
+    assert deps.send_buttons.call_args.args[1] == (
+        "📌 Второй\n\n"
+        "Если вы не получили ответ на ваш вопрос, "
+        "вы можете обратиться к ИИ-помощнику."
+    )
     assert deps.send_buttons.call_args.args[2][0][0]["payload"] == "ai_from_faq"
     assert state["state"] == "menu"
     assert "script" not in state
@@ -127,7 +131,11 @@ def test_terminal_node_returns_to_main_menu_and_clears_script():
 
     faq.show_script_node(42, deps)
 
-    assert deps.send_buttons.call_args.args[1] == "📌 Готовый ответ"
+    assert deps.send_buttons.call_args.args[1] == (
+        "📌 Готовый ответ\n\n"
+        "Если вы не получили ответ на ваш вопрос, "
+        "вы можете обратиться к ИИ-помощнику."
+    )
     assert deps.send_buttons.call_args.args[2][0][0]["payload"] == "ai_from_faq"
     assert state["state"] == "menu"
     assert "script" not in state
