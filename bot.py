@@ -30,12 +30,13 @@ from __future__ import annotations
 # Минцифры после установки с gosuslugi.ru/tls. Должно быть выполнено ДО
 # первого импорта httpx, иначе не подействует.
 import truststore
+
 truststore.inject_into_ssl()
 
+import json
 import logging
 import os
 import time
-import json
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 
@@ -44,11 +45,6 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 import client_api
 import database as db
-from rso_bot import max_transport, scheduler as bot_scheduler
-from rso_bot.flows import appeals, appointments, faq
-from rso_bot.jobs import appointment_reminders
-from rso_bot.session import SessionManager
-from rso_bot import states as session_states
 from config import (
     API,
     AUTH_BLOCK_MINUTES,
@@ -62,6 +58,12 @@ from config import (
     TIMEZONE_OFFSET,
     TOKEN,
 )
+from rso_bot import max_transport
+from rso_bot import scheduler as bot_scheduler
+from rso_bot import states as session_states
+from rso_bot.flows import appeals, appointments, faq, readings
+from rso_bot.jobs import appointment_reminders
+from rso_bot.session import SessionManager
 
 # ── Логгер ────────────────────────────────────────────────────────────────────
 
@@ -337,23 +339,15 @@ def _start_1c_auth(chat_id: int, after: str | None = None) -> None:
 # ── Ввод и валидация показаний ────────────────────────────────────────────────
 
 def _parse_reading(chat_id: int, text: str) -> float | None:
-    """Парсит показание. Возвращает None и уведомляет клиента, если не число."""
-    try:
-        return float(text.replace(",", "."))
-    except ValueError:
-        send_message(chat_id, "Введите числовое значение.")
-        return None
+    """Compatibility wrapper for parsing an entered meter reading."""
+    return readings.parse_reading(chat_id, text, _reading_dependencies())
 
 
 def _current_reading(ls: str, meter: dict, col: str, initial_key: str) -> float:
-    """
-    Текущее показание по колонке col: из последней записи в pokazaniya,
-    иначе — начальное значение из справочника счётчиков.
-    """
-    last = db.get_last_pokazaniya(ls, meter["meter_number"])
-    if last and last[col]:
-        return float(last[col])
-    return float(meter.get(initial_key, "0") or "0")
+    """Compatibility wrapper for resolving a meter's current reading."""
+    return readings.current_reading(
+        ls, meter, col, initial_key, _reading_dependencies()
+    )
 
 
 # ── Флоу подачи обращения (раздел 6.4, шаги 1–4) ────────────────────────────
@@ -462,95 +456,53 @@ def _navigate_script_node(chat_id: int, node_id: int) -> None:
 
 # ── Показания (адаптировано из предыдущей версии) ────────────────────────────
 
+def _reading_dependencies() -> readings.ReadingDependencies:
+    """Build reading dependencies from runtime patch points in this entry point."""
+    return readings.ReadingDependencies(
+        get_meters=db.get_schetchiki,
+        get_last_reading=db.get_last_pokazaniya,
+        add_reading=db.add_pokazaniya,
+        get_state=_get_state,
+        touch=_touch,
+        reset_meter_input=_reset_meter_input,
+        clear_flow=_clear_flow,
+        get_saved_ls=_get_saved_ls,
+        request_ls=_request_ls,
+        parse_input=_parse_reading,
+        get_current_value=_current_reading,
+        show_meter_select=_show_meter_select,
+        ask_meter_value=_ask_meter_value,
+        confirm_meter_reading=_confirm_meter_reading,
+        make_callback=_cb,
+        send_message=send_message,
+        send_buttons=send_buttons,
+        send_main_menu=send_main_menu,
+        logger=log,
+        integration_enabled=ENABLE_1C_INTEGRATION,
+        meter_select_state=S.METER_SELECT,
+        waiting_value1_state=S.WAITING_VALUE1,
+        waiting_value2_state=S.WAITING_VALUE2,
+        confirm_state=S.CONFIRM_POKAZANIYA,
+    )
+
 def _start_pokazaniya(chat_id: int) -> None:
-    ls = _get_saved_ls(chat_id)
-    if not ls:
-        _request_ls(chat_id, "pokazaniya")
-        return
-    _show_meter_select(chat_id, ls)
+    """Compatibility wrapper for starting the extracted readings flow."""
+    readings.start(chat_id, _reading_dependencies())
 
 
 def _show_meter_select(chat_id: int, ls: str) -> None:
-    meters = db.get_schetchiki(ls)
-    if not meters:
-        send_message(chat_id, "По вашему счёту счётчики не найдены.")
-        send_main_menu(chat_id)
-        return
-
-    meters_list = [dict(m) for m in meters]
-    st = _get_state(chat_id)
-    st["state"] = S.METER_SELECT
-    st["meters"] = meters_list
-    _touch(st)
-
-    rows = []
-    for i, m in enumerate(meters_list):
-        suffix = " (2Т)" if m["meter_type"] == "Двухтарифный" else ""
-        rows.append([_cb(f"{m['resource_type']} №{m['meter_number']}{suffix}",
-                         f"meter:{i}")])
-    rows.append([_cb("🏠 Главное меню", "main_menu")])
-    send_buttons(chat_id, "Выберите счётчик:", rows)
+    """Compatibility wrapper for displaying meter selection."""
+    readings.show_meter_select(chat_id, ls, _reading_dependencies())
 
 
 def _ask_meter_value(chat_id: int) -> None:
-    st = _get_state(chat_id)
-    meters  = st["meters"]
-    idx     = st["meter_idx"]
-    meter   = meters[idx]
-
-    # Какое поле запрашиваем — определяется состоянием, а не отдельным флагом
-    waiting_v2 = st.get("state") == S.WAITING_VALUE2
-
-    resource = meter["resource_type"]
-    number   = meter["meter_number"]
-    is_two   = meter["meter_type"] == "Двухтарифный"
-
-    if ENABLE_1C_INTEGRATION:
-        current_info = ""
-    else:
-        last = db.get_last_pokazaniya(st["ls"], number)
-        if last:
-            if is_two and last["value2"]:
-                current_info = f"Текущие: Т1={last['value1']}, Т2={last['value2']}"
-            else:
-                current_info = f"Текущее показание: {last['value1']}"
-            current_info += f" (от {(last['created_at'] or '')[:10]})"
-        else:
-            initial = meter.get("initial2" if waiting_v2 else "initial1", "0")
-            current_info = f"Начальное: {initial}"
-
-    info_line = f"\n{current_info}" if current_info else ""
-
-    if waiting_v2:
-        prompt = f"{resource} №{number}{info_line}\nВведите Т2 (ночь):"
-    elif is_two:
-        prompt = f"{resource} №{number} (двухтарифный){info_line}\nВведите Т1 (день):"
-    else:
-        prompt = f"{resource} №{number}{info_line}\nВведите показание:"
-
-    send_message(chat_id, prompt)
+    """Compatibility wrapper for prompting for the next meter value."""
+    readings.ask_meter_value(chat_id, _reading_dependencies())
 
 
 def _confirm_meter_reading(chat_id: int) -> None:
-    st = _get_state(chat_id)
-    meter = st["meters"][st["meter_idx"]]
-    v1 = st.get("new_value1")
-    v2 = st.get("new_value2")
-
-    if meter["meter_type"] == "Двухтарифный":
-        summary = f"{meter['resource_type']} №{meter['meter_number']}: Т1={v1}, Т2={v2}"
-    else:
-        summary = f"{meter['resource_type']} №{meter['meter_number']}: {v1}"
-
-    st["state"] = S.CONFIRM_POKAZANIYA
-    _touch(st)
-    send_buttons(chat_id,
-        f"Проверьте показания:\n{summary}",
-        [
-            [_cb("✅ Подтвердить", "meter_confirm")],
-            [_cb("✏️ Скорректировать", "meter_retry")],
-        ]
-    )
+    """Compatibility wrapper for displaying reading confirmation."""
+    readings.confirm_meter_reading(chat_id, _reading_dependencies())
 
 
 # ── Запись на приём (раздел 6-7 ТЗ) ──────────────────────────────────────────
@@ -720,11 +672,8 @@ def _cb_reopen_appeal(chat_id: int, st: dict, arg: str) -> None:
 
 
 def _cb_select_meter(chat_id: int, st: dict, arg: str) -> None:
-    """Выбор счётчика — начинаем ввод с Т1."""
-    st["meter_idx"] = int(arg)
-    _reset_meter_input(st)
-    _touch(st)
-    _ask_meter_value(chat_id)
+    """Compatibility wrapper for selecting a meter."""
+    readings.select_meter(chat_id, st, arg, _reading_dependencies())
 
 
 def _cb_select_date(chat_id: int, st: dict, arg: str) -> None:
@@ -772,48 +721,13 @@ def _cb_main_menu(chat_id: int, st: dict) -> None:
 
 
 def _cb_meter_confirm(chat_id: int, st: dict) -> None:
-    """
-    Показания подтверждены — сохраняем и возвращаемся к списку счётчиков,
-    чтобы клиент сам решил, вводить ли ещё один счётчик или закончить
-    (кнопка «🏠 Главное меню» есть в списке выбора).
-    """
-    if st.get("state") != S.CONFIRM_POKAZANIYA:
-        return
-
-    meter = st["meters"][st["meter_idx"]]
-    db.add_pokazaniya(
-        chat_id, st["ls"], meter["resource_type"], meter["meter_number"],
-        st.get("new_value1"), st.get("new_value2"),
-    )
-    if ENABLE_1C_INTEGRATION:
-        log.info("Показания сохранены в очередь 1С: ЛС=%s  счётчик=%s  chat_id=%s",
-                 st["ls"], meter["meter_number"], chat_id)
-    else:
-        log.info("Показания приняты: ЛС=%s  счётчик=%s  chat_id=%s",
-                 st["ls"], meter["meter_number"], chat_id)
-
-    ls = st["ls"]
-    _clear_flow(st)
-    _touch(st)
-
-    if ENABLE_1C_INTEGRATION:
-        send_message(
-            chat_id,
-            f"✅ Показания по счётчику {meter['resource_type']} №{meter['meter_number']} "
-            "сохранены и ожидают обработки в 1С.",
-        )
-    else:
-        send_message(chat_id, f"✅ Показания по счётчику {meter['resource_type']} №{meter['meter_number']} приняты!")
-    _show_meter_select(chat_id, ls)
+    """Compatibility wrapper for persisting a confirmed reading."""
+    readings.confirm(chat_id, st, _reading_dependencies())
 
 
 def _cb_meter_retry(chat_id: int, st: dict) -> None:
-    """Клиент решил ввести показания заново по текущему счётчику."""
-    if st.get("state") != S.CONFIRM_POKAZANIYA:
-        return
-    _reset_meter_input(st)
-    _touch(st)
-    _ask_meter_value(chat_id)
+    """Compatibility wrapper for restarting input for the selected meter."""
+    readings.retry(chat_id, st, _reading_dependencies())
 
 
 _CALLBACK_STATIC: dict[str, callable] = {
@@ -979,49 +893,13 @@ def _on_appointment_theme(chat_id: int, st: dict, text: str) -> None:
 
 
 def _on_value1(chat_id: int, st: dict, text: str) -> None:
-    """Ввод Т1 (или единственного показания для однотарифного счётчика)."""
-    meter = st["meters"][st["meter_idx"]]
-    val = _parse_reading(chat_id, text)
-    if val is None:
-        return
-
-    current = _current_reading(st.get("ls", ""), meter, "value1", "initial1")
-    if not ENABLE_1C_INTEGRATION and val < current:
-        send_message(chat_id,
-            f"Показание {val} не может быть меньше текущего {current}.\n"
-            f"Введите корректное значение:")
-        return
-
-    st["new_value1"] = str(val)
-
-    if meter["meter_type"] == "Двухтарифный":
-        # Переходим к вводу Т2 — состояние определяет, какое поле ждём
-        st["state"] = S.WAITING_VALUE2
-        _touch(st)
-        _ask_meter_value(chat_id)
-    else:
-        st["new_value2"] = None
-        _touch(st)
-        _confirm_meter_reading(chat_id)
+    """Compatibility wrapper for T1 or single-tariff input."""
+    readings.on_value1(chat_id, st, text, _reading_dependencies())
 
 
 def _on_value2(chat_id: int, st: dict, text: str) -> None:
-    """Ввод Т2 для двухтарифного счётчика."""
-    meter = st["meters"][st["meter_idx"]]
-    val = _parse_reading(chat_id, text)
-    if val is None:
-        return
-
-    current = _current_reading(st.get("ls", ""), meter, "value2", "initial2")
-    if not ENABLE_1C_INTEGRATION and val < current:
-        send_message(chat_id,
-            f"Показание Т2 {val} не может быть меньше текущего {current}.\n"
-            f"Введите корректное значение:")
-        return
-
-    st["new_value2"] = str(val)
-    _touch(st)
-    _confirm_meter_reading(chat_id)
+    """Compatibility wrapper for T2 input."""
+    readings.on_value2(chat_id, st, text, _reading_dependencies())
 
 
 # Состояние сессии → обработчик текстового ввода
