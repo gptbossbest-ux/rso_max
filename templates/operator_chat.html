@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Диалоги с клиентами{% endblock %}
+{% block head %}
+<style>
+.shift {display:flex;gap:8px;margin-bottom:14px}.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+.tab{padding:8px 12px;border:1px solid var(--border);border-radius:7px;cursor:pointer}.tab.unread{border-color:var(--warning)}
+.workspace{display:grid;grid-template-columns:260px 1fr;gap:14px}.profile,.chat{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px}
+.messages{height:430px;overflow:auto}.msg{margin:8px 0;padding:8px;border-radius:7px;background:var(--surface2)}.msg.operator{text-align:right;border-left:3px solid var(--accent)}
+.composer{display:flex;gap:8px;margin-top:10px}.composer input[type=text]{flex:1}
+</style>
+{% endblock %}
+{% block content %}
+<h1>💬 Диалоги с клиентами</h1>
+<div class="shift"><button class="btn btn-success" onclick="shift('start')">Начать смену</button><button class="btn btn-danger" onclick="shift('end')">Завершить смену</button><span id="shift-status"></span></div>
+<div id="tabs" class="tabs"></div>
+<div class="workspace"><div id="profile" class="profile">Выберите диалог</div><div class="chat"><div id="messages" class="messages"></div>
+<form id="composer" class="composer" enctype="multipart/form-data"><input class="form-control" name="body" type="text" maxlength="4000" placeholder="Ответ клиенту"><input name="image" type="file" accept="image/jpeg,.jpg,.jpeg"><button class="btn btn-primary">Отправить</button><button type="button" class="btn btn-danger" onclick="closeDialog()">Завершить</button></form></div></div>
+<script>
+const csrf={{ csrf_token|tojson }};let dialogs=[];let current=null;let last=0;
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function post(url,data=new FormData()){return fetch(url,{method:'POST',headers:{'X-CSRF-Token':csrf},body:data}).then(r=>r.json().then(j=>({ok:r.ok,...j})))}
+async function shift(action){const r=await post(`/operator-chat/shift/${action}`);document.getElementById('shift-status').textContent=r.ok?'Готово':r.error}
+async function refresh(){dialogs=await fetch('/operator-chat/api/dialogs').then(r=>r.json());const tabs=document.getElementById('tabs');tabs.innerHTML='';dialogs.forEach(d=>{const b=document.createElement('button');b.className='tab'+(d.unread?' unread':'');b.textContent=`Диалог №${d.id}${d.unread?' •':''}`;b.onclick=()=>select(d);tabs.appendChild(b)});if(current&&!dialogs.some(d=>d.id===current.id)){current=null;last=0}}
+function select(d){current=d;last=0;document.getElementById('messages').innerHTML='';let ai=[];try{ai=JSON.parse(d.ai_context_json||'[]')}catch(e){}document.getElementById('profile').innerHTML=`<b>${esc(d.authenticated?(d.client_fio||'Клиент'):'Неавторизованный клиент')}</b><p>ЛС: ${esc(d.client_ls||'—')}</p><p>Адрес: ${esc(d.client_address||'—')}</p><p>FAQ: ${esc(d.faq_context||'—')}</p><p>ИИ: ${ai.map(x=>esc(x.text||'')).join('<br>')||'—'}</p>`;pollMessages()}
+async function pollMessages(){if(!current)return;const ms=await fetch(`/operator-chat/api/dialogs/${current.id}/messages?after=${last}`).then(r=>r.ok?r.json():[]);for(const m of ms){last=Math.max(last,m.id);const e=document.createElement('div');e.className=`msg ${m.sender}`;e.textContent=(m.sender==='operator'?'Вы':m.sender==='client'?'Клиент':'Система')+': '+(m.body||'');if(m.image_path){const i=document.createElement('img');i.src=`/operator-chat/images/${m.id}`;i.style.maxWidth='300px';e.appendChild(i)}document.getElementById('messages').appendChild(e)}}
+document.getElementById('composer').onsubmit=async e=>{e.preventDefault();if(!current)return;const r=await post(`/operator-chat/api/dialogs/${current.id}/messages`,new FormData(e.target));if(r.ok){e.target.reset();pollMessages()}else alert(r.error)};
+async function closeDialog(){if(current&&confirm('Завершить диалог?')){await post(`/operator-chat/api/dialogs/${current.id}/close`);current=null;refresh()}}
+setInterval(()=>{post('/operator-chat/heartbeat');refresh();pollMessages()},2000);refresh();
+</script>
+{% endblock %}

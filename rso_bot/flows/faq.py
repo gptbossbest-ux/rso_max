@@ -33,6 +33,8 @@ class FaqDependencies:
     script_list_state: str
     script_node_state: str
     menu_state: str
+    operator_available: Callable[[], bool] = lambda: False
+    ai_available: Callable[[], bool] = lambda: True
 
 
 def show_scripts_list(chat_id: int, deps: FaqDependencies) -> None:
@@ -129,10 +131,9 @@ def show_script_node(chat_id: int, deps: FaqDependencies) -> None:
                 "Если вы не получили ответ на ваш вопрос, "
                 "вы можете обратиться к ИИ-помощнику."
             ),
-            [
-                [deps.make_callback("🤖 Спросить у ИИ-помощника", "ai_from_faq")],
-                [deps.make_callback("🏠 Главное меню", "main_menu")],
-            ],
+            ([[deps.make_callback("🤖 Спросить у ИИ-помощника", "ai_from_faq")]] if deps.ai_available() else [])
+            + ([[deps.make_callback("🎧 Связаться с оператором", "operator_start")]] if deps.operator_available() else [])
+            + [[deps.make_callback("🏠 Главное меню", "main_menu")]],
         )
     else:
         rows = [

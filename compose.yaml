@@ -65,6 +65,7 @@ services:
       FASTAPI_BASE_URL: http://api:8000
       DB_PATH: /app/data/database.sqlite
       LOG_FILE: /app/logs/web.log
+      OPERATOR_CHAT_IMAGE_DIR: /app/data/operator_chat_images
     depends_on:
       api:
         condition: service_healthy
@@ -92,6 +93,7 @@ services:
       DB_PATH: /app/data/database.sqlite
       LOG_FILE: /app/logs/bot.log
       BOT_HEALTH_FILE: /app/data/bot-heartbeat
+      OPERATOR_CHAT_IMAGE_DIR: /app/data/operator_chat_images
     depends_on:
       api:
         condition: service_healthy

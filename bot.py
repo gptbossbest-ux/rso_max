@@ -37,9 +37,11 @@ import logging
 import os
 import sqlite3
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -55,6 +57,7 @@ from config import (
     LOG_LEVEL,
     LOG_MAX_BYTES,
     MAX_AUTH_ATTEMPTS,
+    OPERATOR_CHAT_IMAGE_DIR,
     SESSION_TTL_MINUTES,
     TIMEZONE_OFFSET,
     TOKEN,
@@ -63,7 +66,7 @@ from config import (
     YANDEXGPT_FOLDER_ID,
     YANDEXGPT_TIMEOUT_SECONDS,
 )
-from rso_bot import max_transport
+from rso_bot import max_transport, operator_chat
 from rso_bot import scheduler as bot_scheduler
 from rso_bot import states as session_states
 from rso_bot.flows import (
@@ -228,16 +231,18 @@ def send_main_menu(chat_id: int, text: str = "Выберите действие:
     Главное меню — показывается сразу без авторизации (раздел 6.2 ТЗ).
     ЛС-зависимые функции спрашивают ЛС внутри своего флоу.
     """
-    rows = [
-        [_cb("📝 Подать обращение",         "appeal_start")],
-        [_cb("📋 Проверить статус обращения", "my_appeals")],
-        [_cb("📊 Передать показания",       "pokazaniya")],
-        [_cb("📚 Ответ на типовой вопрос",  "scripts_list")],
-        [_cb("🤖 Спросить у ИИ-помощника", "ai_start")],
-        [_cb("📄 Последняя квитанция",      "kvitanciya")],
-        [_cb("🗓️ Записаться на приём",      "appointment_start")],
+    enabled = operator_chat.get_module_settings()
+    options = [
+        ("appeal", "📝 Подать обращение", "appeal_start"),
+        ("appeal_status", "📋 Проверить статус обращения", "my_appeals"),
+        ("readings", "📊 Передать показания", "pokazaniya"),
+        ("faq", "📚 Ответ на типовой вопрос", "scripts_list"),
+        ("ai", "🤖 Спросить у ИИ-помощника", "ai_start"),
+        ("receipt", "📄 Последняя квитанция", "kvitanciya"),
+        ("appointment", "🗓️ Записаться на приём", "appointment_start"),
     ]
-    if ENABLE_1C_INTEGRATION and not _get_saved_ls(chat_id):
+    rows = [[_cb(label, payload)] for key, label, payload in options if enabled.get(key)]
+    if enabled.get("auth") and ENABLE_1C_INTEGRATION and not _get_saved_ls(chat_id):
         rows.insert(0, [_cb("🔐 Авторизоваться", "auth_1c")])
     send_buttons(chat_id, text, rows)
 
@@ -415,6 +420,8 @@ def _faq_dependencies() -> faq.FaqDependencies:
         script_list_state=S.SCRIPT_LIST,
         script_node_state=S.SCRIPT_NODE,
         menu_state=S.MENU,
+        operator_available=operator_chat.has_active_operators,
+        ai_available=lambda: operator_chat.module_enabled("ai"),
     )
 
 
@@ -484,6 +491,8 @@ def _ai_dependencies() -> ai_assistant.AIDependencies:
         get_operation_date=db.server_local_date,
         logger=log,
         question_state=S.AI_QUESTION,
+        operator_available=operator_chat.has_active_operators,
+        appeal_available=lambda: operator_chat.module_enabled("appeal"),
     )
 
 
@@ -499,6 +508,134 @@ def _start_ai_from_faq(chat_id: int, state: dict) -> None:
 def _on_ai_question(chat_id: int, state: dict, text: str) -> None:
     del state
     ai_assistant.ask(chat_id, text, _ai_dependencies())
+
+
+# ── Диалог с оператором ──────────────────────────────────────────────────────
+
+def _operator_profile(chat_id: int) -> dict | None:
+    user = db.get_bot_user(chat_id)
+    if not user or not user["ls"]:
+        return None
+    account = db.get_ls(user["ls"])
+    return {
+        "ls": user["ls"],
+        "fio": (account["fio"] if account else None) or user["fio"],
+        "address": account["address"] if account else None,
+    }
+
+
+def _start_operator_chat(chat_id: int) -> None:
+    settings = operator_chat.get_settings()
+    if not settings["enabled"] or not operator_chat.has_active_operators():
+        rows = []
+        if operator_chat.module_enabled("appeal"):
+            rows.append([_cb("📝 Оформить обращение", "appeal_start")])
+        rows.append([_cb("🏠 Главное меню", "main_menu")])
+        suffix = " Вы можете оформить обращение." if operator_chat.module_enabled("appeal") else ""
+        send_buttons(chat_id, f"Сейчас нет доступных операторов.{suffix}", rows)
+        return
+    profile = _operator_profile(chat_id)
+    if settings["require_auth"] and not profile:
+        _request_ls(chat_id, "operator")
+        return
+    state = _get_state(chat_id)
+    ai_session = db.get_ai_session(chat_id, create_if_missing=False)
+    dialog = operator_chat.request_dialog(
+        chat_id, profile=profile, faq_context=state.get("ai_faq_context") or ai_session.get("faq_context"),
+        ai_messages=ai_session.get("history", [])[-5:],
+    )
+    if dialog["status"] == "unavailable":
+        send_message(chat_id, "Сейчас нет доступных операторов.")
+        return
+    if dialog["status"] == "auth_required":
+        _request_ls(chat_id, "operator")
+        return
+    state["state"] = S.OPERATOR_CHAT
+    _touch(state)
+    if dialog["status"] == "waiting":
+        position = operator_chat.queue_position(dialog["id"])
+        send_buttons(chat_id, f"Все операторы заняты. Ваша позиция в очереди: {position}.", [[_cb("❌ Отменить ожидание", "operator_cancel")]])
+    else:
+        send_message(chat_id, "👨‍💻 Оператор подключился к диалогу. Напишите ваш вопрос.")
+
+
+def _cancel_operator_wait(chat_id: int, state: dict) -> None:
+    if operator_chat.cancel_waiting(chat_id):
+        _clear_flow(state)
+        send_main_menu(chat_id, "Ожидание оператора отменено.")
+    else:
+        send_message(chat_id, "Ожидание уже завершено.")
+
+
+def _rate_operator(chat_id: int, dialog_id: int, rating: int) -> None:
+    if operator_chat.rate_dialog(chat_id, dialog_id, rating):
+        send_main_menu(chat_id, "Спасибо за оценку!")
+    else:
+        send_message(chat_id, "Оценка уже сохранена или диалог недоступен.")
+
+
+def _on_operator_text(chat_id: int, state: dict, text: str) -> None:
+    dialog = operator_chat.get_open_dialog_for_chat(chat_id)
+    if not dialog:
+        _clear_flow(state)
+        send_main_menu(chat_id, "Диалог с оператором завершён.")
+    elif dialog["status"] == "waiting":
+        send_message(chat_id, f"Вы в очереди. Позиция: {operator_chat.queue_position(dialog['id'])}.")
+    else:
+        operator_chat.add_message(dialog["id"], "client", text)
+
+
+def _attachment_url(attachment: dict) -> str | None:
+    if attachment.get("type") not in {"image", "photo"}:
+        return None
+    payload = attachment.get("payload") or {}
+    for key in ("url", "photo_url"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            return value
+    photos = payload.get("photos")
+    if isinstance(photos, dict):
+        for value in photos.values():
+            if isinstance(value, dict) and isinstance(value.get("url"), str):
+                return value["url"]
+    return None
+
+
+def _handle_operator_attachments(chat_id: int, dialog: dict, message: dict) -> None:
+    attachments = message.get("attachments") or (message.get("body") or {}).get("attachments") or []
+    image_url = next((_attachment_url(item) for item in attachments if isinstance(item, dict)), None)
+    if not image_url:
+        send_message(chat_id, "Поддерживаются только JPG-изображения до 5 МБ.")
+        return
+    parsed = urlparse(image_url)
+    host = (parsed.hostname or "").lower()
+    api_host = (urlparse(API).hostname or "").lower()
+    if parsed.scheme != "https" or not (host == api_host or host.endswith(".max.ru")):
+        send_message(chat_id, "Не удалось безопасно загрузить изображение.")
+        return
+    try:
+        with httpx.stream("GET", image_url, timeout=10, follow_redirects=False) as response:
+            response.raise_for_status()
+            if int(response.headers.get("content-length", "0") or 0) > operator_chat.MAX_IMAGE_BYTES:
+                raise ValueError("oversize")
+            buffer = bytearray()
+            for chunk in response.iter_bytes(64 * 1024):
+                buffer.extend(chunk)
+                if len(buffer) > operator_chat.MAX_IMAGE_BYTES:
+                    raise ValueError("oversize")
+            data = bytes(buffer)
+            content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+        operator_chat.validate_jpeg(data, content_type)
+        os.makedirs(OPERATOR_CHAT_IMAGE_DIR, mode=0o700, exist_ok=True)
+        name = f"{uuid.uuid4().hex}.jpg"
+        path = os.path.join(OPERATOR_CHAT_IMAGE_DIR, name)
+        with open(path, "xb") as stream:
+            stream.write(data)
+        caption = (message.get("body") or {}).get("text", "").strip()
+        operator_chat.add_message(dialog["id"], "client", caption, image_path=name)
+    except (httpx.HTTPError, OSError, ValueError, TypeError):
+        log.warning("operator image rejected chat_id=%s", chat_id)
+        send_message(chat_id, "Не удалось принять JPG. Проверьте формат и размер до 5 МБ.")
 
 
 # ── Показания (адаптировано из предыдущей версии) ────────────────────────────
@@ -726,6 +863,14 @@ def _cb_select_date(chat_id: int, st: dict, arg: str) -> None:
     appointments.select_date(chat_id, st, arg, _appointment_dependencies())
 
 
+def _cb_operator_rate(chat_id: int, st: dict, arg: str) -> None:
+    del st
+    dialog, separator, rating = arg.partition("-")
+    if not separator:
+        raise ValueError("invalid rating payload")
+    _rate_operator(chat_id, int(dialog), int(rating))
+
+
 # Префикс payload → (обработчик, приводить ли аргумент к int)
 _CALLBACK_PREFIXES: dict[str, callable] = {
     "confirm":     _cb_confirm_appeal,
@@ -738,6 +883,7 @@ _CALLBACK_PREFIXES: dict[str, callable] = {
     "appt_date":   _cb_select_date,
     "appt_time":   lambda chat_id, st, arg: _ask_theme(chat_id, arg),
     "appt_cancel": lambda chat_id, st, arg: _cancel_own_appointment(chat_id, int(arg)),
+    "operator_rate": _cb_operator_rate,
 }
 
 
@@ -802,6 +948,8 @@ _CALLBACK_STATIC: dict[str, callable] = {
     "ai_more":           lambda chat_id, st: _start_ai(chat_id),
     "ai_new":            _cb_ai_new,
     "ai_appeal":         _cb_ai_appeal,
+    "operator_start":    lambda chat_id, st: _start_operator_chat(chat_id),
+    "operator_cancel":   _cancel_operator_wait,
     "appeal_draft_submit": _cb_appeal_draft_submit,
     "appeal_draft_edit": _cb_appeal_draft_edit,
     "kvitanciya":        _cb_kvitanciya,
@@ -824,6 +972,25 @@ def handle_callback(update: dict) -> None:
     st = _get_state(chat_id)
     _touch(st)
     log.debug("callback chat_id=%s payload=%s", chat_id, payload)
+
+    module_by_payload = {
+        "auth_1c": "auth", "appeal_start": "appeal", "my_appeals": "appeal_status",
+        "pokazaniya": "readings", "scripts_list": "faq", "ai_start": "ai",
+        "ai_from_faq": "ai", "ai_more": "ai", "ai_new": "ai", "kvitanciya": "receipt",
+        "appointment_start": "appointment", "ai_appeal": "appeal",
+        "appeal_draft_submit": "appeal", "appeal_draft_edit": "appeal",
+    }
+    prefix_module = {
+        "confirm": "appeal_status", "reopen": "appeal_status", "cat": "appeal",
+        "script": "faq", "script_node": "faq", "meter": "readings",
+        "appt_branch": "appointment", "appt_date": "appointment",
+        "appt_time": "appointment", "appt_cancel": "appointment",
+    }
+    module = module_by_payload.get(payload) or prefix_module.get(payload.partition(":")[0])
+    if module and not operator_chat.module_enabled(module):
+        _clear_flow(st)
+        send_main_menu(chat_id, "Раздел временно недоступен.")
+        return
 
     # Payload с аргументом: "префикс:значение"
     if ":" in payload:
@@ -856,6 +1023,7 @@ _AFTER_LS_ACTIONS: dict[str, callable] = {
     "kvitanciya": _deliver_kvitanciya,
     "appointment": lambda chat_id, ls: _start_appointment_flow(chat_id, ls),
     "appeal":     lambda chat_id, ls: _submit_appeal(chat_id, ls),
+    "operator":   lambda chat_id, ls: _start_operator_chat(chat_id),
 }
 
 
@@ -919,6 +1087,17 @@ _MESSAGE_HANDLERS: dict[str, callable] = {
     S.WAITING_VALUE1:    _on_value1,
     S.WAITING_VALUE2:    _on_value2,
     S.AI_QUESTION:       _on_ai_question,
+    S.OPERATOR_CHAT:     _on_operator_text,
+}
+
+_STATE_MODULES = {
+    S.APPEAL_CATEGORY: "appeal", S.APPEAL_BODY: "appeal",
+    S.REOPEN_COMMENT: "appeal_status", S.SCRIPT_LIST: "faq", S.SCRIPT_NODE: "faq",
+    S.AI_QUESTION: "ai", S.METER_SELECT: "readings", S.WAITING_VALUE1: "readings",
+    S.WAITING_VALUE2: "readings", S.CONFIRM_POKAZANIYA: "readings",
+    S.APPOINTMENT_BRANCH: "appointment", S.APPOINTMENT_DATE: "appointment",
+    S.APPOINTMENT_TIME: "appointment", S.APPOINTMENT_THEME: "appointment",
+    S.APPOINTMENT_CONFIRM: "appointment",
 }
 
 _RESET_COMMANDS = ("/start", "/help", "/menu")
@@ -936,6 +1115,15 @@ def handle_message(message: dict) -> None:
         len(text),
     )
 
+    open_dialog = operator_chat.get_open_dialog_for_chat(chat_id)
+    if open_dialog:
+        attachments = message.get("attachments") or (message.get("body") or {}).get("attachments")
+        if attachments:
+            _handle_operator_attachments(chat_id, open_dialog, message)
+        elif text:
+            _on_operator_text(chat_id, _get_state(chat_id), text)
+        return
+
     if not text:
         return
 
@@ -948,6 +1136,19 @@ def handle_message(message: dict) -> None:
 
     st = _get_state(chat_id)
     _touch(st)
+
+    module = _STATE_MODULES.get(st.get("state"))
+    if st.get("state") in {S.AWAIT_LS, S.AWAIT_LS_1C}:
+        module = {
+            "my_appeals": "appeal_status", "pokazaniya": "readings",
+            "kvitanciya": "receipt", "appointment": "appointment", "appeal": "appeal",
+        }.get(st.get("after_ls"), module)
+        if st.get("state") == S.AWAIT_LS_1C and not st.get("after_ls"):
+            module = "auth"
+    if module and not operator_chat.module_enabled(module):
+        _clear_flow(st)
+        send_main_menu(chat_id, "Раздел временно недоступен.")
+        return
 
     handler = _MESSAGE_HANDLERS.get(st.get("state", S.MENU))
     if handler:
@@ -999,6 +1200,24 @@ def _task_cleanup_ai_sessions() -> None:
             log.info("APScheduler cleanup_ai_sessions: удалено %d", removed)
     except sqlite3.Error as exc:
         log.error("APScheduler cleanup_ai_sessions ошибка: %s", exc)
+
+
+def _task_operator_chat_maintenance() -> None:
+    try:
+        events = operator_chat.process_timeouts()
+        for item in events["requeued"]:
+            send_message(item["chat_id"], "Извините, оператор не на связи, мы направляем вас к другому оператору.")
+        for item in events["assigned"]:
+            send_message(item["chat_id"], "👨‍💻 Оператор подключился к диалогу.")
+        for item in events["warned"]:
+            settings = operator_chat.get_settings()
+            send_message(item["chat_id"], f"Диалог будет закрыт через {settings['warning_before_min']} мин. без новых сообщений.")
+        for item in events["closed"]:
+            buttons = [[_cb(str(value), f"operator_rate:{item['id']}-{value}") for value in range(1, 6)]]
+            send_buttons(item["chat_id"], "Диалог закрыт по бездействию. Оцените работу оператора от 1 до 5.", buttons)
+        operator_chat.cleanup_history(OPERATOR_CHAT_IMAGE_DIR)
+    except Exception as exc:  # noqa: BLE001 - scheduler isolation boundary
+        log.exception("operator chat maintenance failed: %s", exc)
 
 
 def _format_appointment_reminder(appointment, when_label: str) -> str:
@@ -1059,6 +1278,7 @@ def _scheduler_dependencies() -> bot_scheduler.SchedulerDependencies:
         scheduler_factory=BackgroundScheduler,
         logger=log,
         cleanup_ai_sessions=_task_cleanup_ai_sessions,
+        operator_chat_maintenance=_task_operator_chat_maintenance,
     )
 
 

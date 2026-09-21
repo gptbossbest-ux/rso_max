@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Операторы и меню{% endblock %}
+{% block content %}
+<h1>🎧 Операторские диалоги и главное меню</h1>
+{% with messages=get_flashed_messages(with_categories=true) %}{% for category,message in messages %}<div class="alert alert-{{category}}">{{message}}</div>{% endfor %}{% endwith %}
+<form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<div class="card"><div class="card-header">Операторские диалоги</div><div class="card-body">
+<label><input type="checkbox" name="enabled" {% if settings.enabled %}checked{% endif %}> Включены</label><br>
+<label><input type="checkbox" name="require_auth" {% if settings.require_auth %}checked{% endif %}> Требовать авторизацию клиента</label>
+{% for key,label,minv,maxv in [('heartbeat_timeout_min','Таймаут heartbeat, мин',1,60),('max_active_dialogs','Максимум активных диалогов',1,50),('inactivity_timeout_min','Закрытие по бездействию, мин',5,1440),('warning_before_min','Предупреждение за, мин',1,1439),('retention_days','Хранение истории, дней',1,3650)] %}<div class="form-group"><label>{{label}}</label><input class="form-control" type="number" name="{{key}}" min="{{minv}}" max="{{maxv}}" value="{{settings[key]}}" required></div>{% endfor %}
+</div></div>
+<div class="card"><div class="card-header">Модули главного меню</div><div class="card-body">{% set labels={'auth':'Авторизация','appeal':'Новое обращение','appeal_status':'Статус обращений','readings':'Показания','faq':'FAQ','ai':'ИИ-помощник','receipt':'Квитанция','appointment':'Запись на приём'} %}{% for key,enabled in modules.items() %}<label style="display:block;margin:8px"><input type="checkbox" name="module_{{key}}" {% if enabled %}checked{% endif %}> {{labels[key]}}</label>{% endfor %}</div></div>
+<button class="btn btn-primary">Сохранить</button></form>
+<div class="card"><div class="card-header">Оценки операторов</div><div class="card-body"><table class="table"><tr><th>Оператор</th><th>Средняя</th><th>Оценок</th></tr>{% for r in ratings %}<tr><td>{{r.name}}</td><td>{{r.average_rating or '—'}}</td><td>{{r.rating_count}}</td></tr>{% endfor %}</table></div></div>
+{% endblock %}

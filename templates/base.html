@@ -213,6 +213,12 @@
            class="nav-item {% if request.endpoint == 'appointments_list' %}active{% endif %}">
             🗓️ Записи на приём
         </a>
+        {% if user.role == 'operator' %}
+        <a href="{{ url_for('operator_chat_page') }}"
+           class="nav-item {% if request.endpoint and request.endpoint.startswith('operator_') %}active{% endif %}">
+            💬 Диалоги с клиентами
+        </a>
+        {% endif %}
         {% if user.role == 'admin' %}
         <div class="nav-label">Администратор</div>
         <a href="{{ url_for('branches_page') }}"
@@ -238,6 +244,10 @@
         <a href="{{ url_for('ai_settings_page') }}"
            class="nav-item {% if request.endpoint == 'ai_settings_page' %}active{% endif %}">
             🤖 ИИ-помощник
+        </a>
+        <a href="{{ url_for('operator_chat_settings_page') }}"
+           class="nav-item {% if request.endpoint == 'operator_chat_settings_page' %}active{% endif %}">
+            🎧 Операторы и меню
         </a>
         {% endif %}
         <div class="nav-label">История</div>

@@ -96,6 +96,9 @@ YANDEXGPT_API_URL: str = os.getenv(
     "https://llm.api.cloud.yandex.net/foundationModels/v1/completion",
 ).strip()
 YANDEXGPT_TIMEOUT_SECONDS: float = float(os.getenv("YANDEXGPT_TIMEOUT_SECONDS", "20"))
+OPERATOR_CHAT_IMAGE_DIR: str = os.getenv(
+    "OPERATOR_CHAT_IMAGE_DIR", "runtime/operator_chat_images"
+).strip()
 
 # ── Маркерные слова для автоматического повышения приоритета ──────────────────
 # Используются в FastAPI (Этап 2), здесь только хранятся

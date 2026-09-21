@@ -310,22 +310,29 @@ class AIDependencies:
     get_operation_date: Callable[[], str]
     logger: logging.Logger
     question_state: str
+    operator_available: Callable[[], bool] = lambda: False
+    appeal_available: Callable[[], bool] = lambda: True
 
 
 def _fallback_buttons(deps: AIDependencies) -> list[list[Button]]:
-    return [
-        [deps.make_callback("📝 Оформить обращение", "ai_appeal")],
-        [deps.make_callback("🏠 Главное меню", "main_menu")],
-    ]
+    rows = []
+    if deps.appeal_available():
+        rows.append([deps.make_callback("📝 Оформить обращение", "ai_appeal")])
+    rows.append([deps.make_callback("🏠 Главное меню", "main_menu")])
+    return rows
 
 
 def _answer_buttons(deps: AIDependencies) -> list[list[Button]]:
-    return [
-        [deps.make_callback("📝 Оформить обращение", "ai_appeal")],
+    rows = [
         [deps.make_callback("❓ Задать ещё вопрос", "ai_more")],
         [deps.make_callback("🧹 Новый диалог", "ai_new")],
         [deps.make_callback("🏠 Главное меню", "main_menu")],
     ]
+    if deps.appeal_available():
+        rows.insert(0, [deps.make_callback("📝 Оформить обращение", "ai_appeal")])
+    if deps.operator_available():
+        rows.insert(1, [deps.make_callback("🎧 Связаться с оператором", "operator_start")])
+    return rows
 
 
 def start(chat_id: int, deps: AIDependencies, faq_context: str | None = None) -> None:

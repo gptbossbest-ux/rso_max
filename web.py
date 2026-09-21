@@ -28,6 +28,7 @@ import logging
 import os
 import secrets
 import sqlite3
+import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
 from functools import wraps
@@ -37,9 +38,11 @@ from flask import (
     Flask,
     abort,
     flash,
+    jsonify,
     redirect,
     render_template,
     request,
+    send_file,
     session,
     url_for,
 )
@@ -48,16 +51,20 @@ from werkzeug.security import check_password_hash
 import client_api
 import database as db
 from config import (
+    API,
     DB_PATH,
     ENABLE_1C_INTEGRATION,
     LOG_BACKUP_COUNT,
     LOG_FILE,
     LOG_LEVEL,
     LOG_MAX_BYTES,
+    OPERATOR_CHAT_IMAGE_DIR,
     SECRET_KEY,
+    TOKEN,
     YANDEXGPT_API_KEY,
     YANDEXGPT_FOLDER_ID,
 )
+from rso_bot import operator_chat
 
 # ── Логгер ────────────────────────────────────────────────────────────────────
 
@@ -197,13 +204,27 @@ def admin_required(f):
     return decorated
 
 
+def operator_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        user = _validated_session_user()
+        if user is None:
+            return redirect(url_for("login"))
+        if user["must_change_password"]:
+            return redirect(url_for("change_own_password"))
+        if user["role"] != "operator":
+            abort(403)
+        return f(*args, **kwargs)
+    return decorated
+
+
 def csrf_protected(f):
     """Require a session-bound token for browser form mutations."""
 
     @wraps(f)
     def decorated(*args, **kwargs):
         expected = session.get(_CSRF_SESSION_KEY)
-        submitted = request.form.get("csrf_token", "")
+        submitted = request.form.get("csrf_token", "") or request.headers.get("X-CSRF-Token", "")
         if (
             not isinstance(expected, str)
             or not expected
@@ -738,6 +759,230 @@ def user_role(user_id: int):
         db.change_role(user_id, request.form.get("role", "operator"))
         flash("Роль изменена", "success")
     return redirect(url_for("users_page"))
+
+
+# ── Операторские диалоги ────────────────────────────────────────────────────
+
+def _max_headers() -> dict[str, str]:
+    return {"Authorization": TOKEN, "Content-Type": "application/json"}
+
+
+def _send_max_text(chat_id: int, text: str) -> bool:
+    import httpx
+    try:
+        response = httpx.post(
+            f"{API}/messages", headers=_max_headers(), params={"chat_id": chat_id},
+            json={"text": text}, timeout=5,
+        )
+        return response.status_code == 200
+    except httpx.HTTPError:
+        log.warning("MAX недоступен при отправке сообщения операторского диалога chat_id=%s", chat_id)
+        return False
+
+
+def _send_max_buttons(chat_id: int, text: str, buttons: list[list[dict]]) -> bool:
+    import httpx
+    try:
+        response = httpx.post(
+            f"{API}/messages", headers=_max_headers(), params={"chat_id": chat_id},
+            json={"text": text, "attachments": [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]},
+            timeout=5,
+        )
+        return response.status_code == 200
+    except httpx.HTTPError:
+        log.warning("MAX недоступен при отправке кнопок chat_id=%s", chat_id)
+        return False
+
+
+def _assign_and_notify() -> None:
+    for item in operator_chat.assign_waiting():
+        _send_max_text(item["chat_id"], "👨‍💻 Оператор подключился к диалогу.")
+
+
+def _send_max_jpeg(chat_id: int, path: str, caption: str = "") -> bool:
+    import httpx
+    headers = {"Authorization": TOKEN}
+    try:
+        meta = httpx.post(f"{API}/uploads", headers=headers, params={"type": "image"}, timeout=10)
+        meta.raise_for_status()
+        upload_url = meta.json().get("url")
+        if not isinstance(upload_url, str) or not upload_url:
+            return False
+        with open(path, "rb") as stream:
+            uploaded = httpx.post(
+                upload_url, headers=headers,
+                files={"data": ("image.jpg", stream, "image/jpeg")}, timeout=30,
+            )
+        uploaded.raise_for_status()
+        token = uploaded.json().get("token")
+        if not isinstance(token, str) or not token:
+            return False
+        response = httpx.post(
+            f"{API}/messages", headers=_max_headers(), params={"chat_id": chat_id},
+            json={"text": caption or "Оператор отправил изображение.",
+                  "attachments": [{"type": "image", "payload": {"token": token}}]},
+            timeout=10,
+        )
+        return response.status_code == 200
+    except (httpx.HTTPError, OSError, ValueError, TypeError):
+        log.warning("MAX недоступен при отправке изображения chat_id=%s", chat_id)
+        return False
+
+
+@app.route("/operator-chat")
+@operator_required
+def operator_chat_page():
+    return render_template(
+        "operator_chat.html", user=session["user"], csrf_token=_csrf_token(),
+        dialogs=operator_chat.list_operator_dialogs(_operator_id()),
+    )
+
+
+@app.post("/operator-chat/shift/start")
+@operator_required
+@csrf_protected
+def operator_shift_start():
+    operator_chat.start_shift(_operator_id())
+    _assign_and_notify()
+    return jsonify(ok=True)
+
+
+@app.post("/operator-chat/shift/end")
+@operator_required
+@csrf_protected
+def operator_shift_end():
+    try:
+        operator_chat.end_shift(_operator_id())
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 409
+    return jsonify(ok=True)
+
+
+@app.post("/operator-chat/heartbeat")
+@operator_required
+@csrf_protected
+def operator_heartbeat():
+    active = operator_chat.heartbeat(_operator_id())
+    if active:
+        _assign_and_notify()
+    return jsonify(ok=active)
+
+
+@app.get("/operator-chat/api/dialogs")
+@operator_required
+def operator_dialogs_api():
+    return jsonify(operator_chat.list_operator_dialogs(_operator_id()))
+
+
+@app.get("/operator-chat/api/dialogs/<int:dialog_id>/messages")
+@operator_required
+def operator_messages_api(dialog_id: int):
+    try:
+        messages = operator_chat.list_messages(
+            dialog_id, _operator_id(), int(request.args.get("after", "0")),
+        )
+    except (PermissionError, ValueError):
+        abort(404)
+    return jsonify(messages)
+
+
+@app.post("/operator-chat/api/dialogs/<int:dialog_id>/messages")
+@operator_required
+@csrf_protected
+def operator_send_message(dialog_id: int):
+    dialog = operator_chat.get_dialog_for_operator(dialog_id, _operator_id())
+    if not dialog:
+        abort(404)
+    body = request.form.get("body", "").strip()
+    upload = request.files.get("image")
+    relative_path = None
+    absolute_path = None
+    try:
+        if upload and upload.filename:
+            data = upload.read(operator_chat.MAX_IMAGE_BYTES + 1)
+            operator_chat.validate_jpeg(data, upload.mimetype)
+            os.makedirs(OPERATOR_CHAT_IMAGE_DIR, mode=0o700, exist_ok=True)
+            relative_path = f"{uuid.uuid4().hex}.jpg"
+            absolute_path = os.path.join(OPERATOR_CHAT_IMAGE_DIR, relative_path)
+            with open(absolute_path, "xb") as stream:
+                stream.write(data)
+        message = operator_chat.add_message(
+            dialog_id, "operator", body, user_id=_operator_id(), image_path=relative_path,
+        )
+    except (ValueError, PermissionError) as exc:
+        if absolute_path:
+            try:
+                os.remove(absolute_path)
+            except OSError:
+                pass
+        return jsonify(ok=False, error=str(exc)), 400
+    delivered = (
+        _send_max_jpeg(dialog["chat_id"], absolute_path, f"Оператор: {body}" if body else "")
+        if absolute_path else _send_max_text(dialog["chat_id"], f"Оператор: {body}")
+    )
+    return jsonify(ok=True, delivered=delivered, message=message)
+
+
+@app.post("/operator-chat/api/dialogs/<int:dialog_id>/close")
+@operator_required
+@csrf_protected
+def operator_close_dialog(dialog_id: int):
+    try:
+        chat_id = operator_chat.close_dialog(dialog_id, _operator_id())
+    except PermissionError:
+        abort(404)
+    buttons = [[{"type": "callback", "text": str(value), "payload": f"operator_rate:{dialog_id}-{value}"} for value in range(1, 6)]]
+    _send_max_buttons(chat_id, "Оператор завершил диалог. Оцените его работу от 1 до 5.", buttons)
+    _assign_and_notify()
+    return jsonify(ok=True)
+
+
+@app.get("/operator-chat/images/<int:message_id>")
+@operator_required
+def operator_chat_image(message_id: int):
+    conn = db.get_conn()
+    row = conn.execute(
+        """SELECT m.image_path,d.operator_id,d.status FROM operator_messages m
+           JOIN operator_dialogs d ON d.id=m.dialog_id WHERE m.id=?""", (message_id,),
+    ).fetchone()
+    conn.close()
+    if not row or row["operator_id"] != _operator_id() or row["status"] != "active" or not row["image_path"]:
+        abort(404)
+    root = os.path.realpath(OPERATOR_CHAT_IMAGE_DIR)
+    path = os.path.realpath(os.path.join(root, row["image_path"]))
+    if os.path.dirname(path) != root:
+        abort(404)
+    return send_file(path, mimetype="image/jpeg", conditional=True)
+
+
+@app.route("/operator-chat/settings", methods=["GET", "POST"])
+@admin_required
+def operator_chat_settings_page():
+    if request.method == "POST":
+        expected = session.get(_CSRF_SESSION_KEY, "")
+        if not secrets.compare_digest(expected, request.form.get("csrf_token", "")):
+            abort(400)
+        try:
+            operator_chat.update_settings(
+                enabled=request.form.get("enabled") == "on",
+                require_auth=request.form.get("require_auth") == "on",
+                heartbeat_timeout_min=request.form.get("heartbeat_timeout_min"),
+                max_active_dialogs=request.form.get("max_active_dialogs"),
+                inactivity_timeout_min=request.form.get("inactivity_timeout_min"),
+                warning_before_min=request.form.get("warning_before_min"),
+                retention_days=request.form.get("retention_days"),
+            )
+            operator_chat.update_module_settings({key: request.form.get(f"module_{key}") == "on" for key in operator_chat.MODULE_KEYS})
+        except (ValueError, TypeError) as exc:
+            flash(str(exc), "error")
+        else:
+            flash("Настройки сохранены", "success")
+            return redirect(url_for("operator_chat_settings_page"))
+    return render_template(
+        "operator_chat_settings.html", user=session["user"], csrf_token=_csrf_token(),
+        settings=operator_chat.get_settings(), modules=operator_chat.get_module_settings(),
+        ratings=operator_chat.rating_report(),
+    )
 
 
 APPOINTMENT_STATUSES = {

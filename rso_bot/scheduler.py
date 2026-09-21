@@ -22,6 +22,7 @@ class SchedulerDependencies:
     scheduler_factory: SchedulerFactory
     logger: logging.Logger
     cleanup_ai_sessions: JobCallback | None = None
+    operator_chat_maintenance: JobCallback | None = None
 
 
 def register_jobs(scheduler: Any, deps: SchedulerDependencies) -> None:
@@ -68,6 +69,15 @@ def register_jobs(scheduler: Any, deps: SchedulerDependencies) -> None:
             id="cleanup_ai_sessions",
             max_instances=1,
             misfire_grace_time=300,
+        )
+    if deps.operator_chat_maintenance is not None:
+        scheduler.add_job(
+            deps.operator_chat_maintenance,
+            trigger="interval",
+            minutes=1,
+            id="operator_chat_maintenance",
+            max_instances=1,
+            misfire_grace_time=60,
         )
 
 

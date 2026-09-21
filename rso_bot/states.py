@@ -19,6 +19,7 @@ class S:
     SCRIPT_NODE = "script_node"
 
     AI_QUESTION = "ai_question"
+    OPERATOR_CHAT = "operator_chat"
 
     METER_SELECT = "meter_select"
     WAITING_VALUE1 = "waiting_value1"

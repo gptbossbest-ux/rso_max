@@ -362,6 +362,91 @@ def init_db() -> None:
             updated_at     TEXT NOT NULL
         )
     """)
+
+    # Операторские диалоги: настройки, смены, FIFO-очередь и история.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS operator_chat_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            enabled INTEGER NOT NULL DEFAULT 1,
+            require_auth INTEGER NOT NULL DEFAULT 1,
+            heartbeat_timeout_min INTEGER NOT NULL DEFAULT 5,
+            max_active_dialogs INTEGER NOT NULL DEFAULT 5,
+            inactivity_timeout_min INTEGER NOT NULL DEFAULT 30,
+            warning_before_min INTEGER NOT NULL DEFAULT 5,
+            retention_days INTEGER NOT NULL DEFAULT 30
+        )
+    """)
+    c.execute("INSERT OR IGNORE INTO operator_chat_settings (id) VALUES (1)")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS operator_shifts (
+            user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            active INTEGER NOT NULL DEFAULT 0,
+            started_at TEXT,
+            heartbeat_at TEXT,
+            ended_at TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS operator_dialogs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            operator_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            status TEXT NOT NULL CHECK(status IN ('waiting','active','closed','timed_out','cancelled')),
+            queue_seq INTEGER,
+            authenticated INTEGER NOT NULL DEFAULT 0,
+            client_fio TEXT,
+            client_ls TEXT,
+            client_address TEXT,
+            faq_context TEXT,
+            ai_context_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            assigned_at TEXT,
+            last_activity_at TEXT NOT NULL,
+            warned_at TEXT,
+            closed_at TEXT,
+            closed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            rating INTEGER CHECK(rating BETWEEN 1 AND 5),
+            rated_at TEXT
+        )
+    """)
+    c.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_operator_dialog_open_chat
+        ON operator_dialogs(chat_id) WHERE status IN ('waiting','active')
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS ix_operator_dialog_queue
+        ON operator_dialogs(status, queue_seq, created_at)
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS operator_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dialog_id INTEGER NOT NULL REFERENCES operator_dialogs(id) ON DELETE CASCADE,
+            sender TEXT NOT NULL CHECK(sender IN ('client','operator','system')),
+            sender_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            message_type TEXT NOT NULL DEFAULT 'text' CHECK(message_type IN ('text','image')),
+            body TEXT,
+            image_path TEXT,
+            created_at TEXT NOT NULL,
+            read_at TEXT
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS ix_operator_messages_dialog ON operator_messages(dialog_id,id)")
+
+    # Центральные feature flags главного меню. Данные модулей не удаляются.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS module_settings (
+            module_key TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 1
+        )
+    """)
+    for module_key in (
+        "auth", "appeal", "appeal_status", "readings", "faq", "ai",
+        "receipt", "appointment",
+    ):
+        c.execute(
+            "INSERT OR IGNORE INTO module_settings (module_key, enabled) VALUES (?, 1)",
+            (module_key,),
+        )
     # TODO Этап 10 (табличный редактор скриптов): при сохранении рёбер
     # добавить валидацию на отсутствие циклов в графе (DFS/топологическая сортировка).
     # Цикл в скрипте приведёт к бесконечному навигационному циклу в боте.
