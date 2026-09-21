@@ -141,6 +141,22 @@ def test_terminal_node_returns_to_main_menu_and_clears_script():
     assert "script" not in state
 
 
+def test_terminal_node_does_not_invite_disabled_ai():
+    deps, state = _dependencies()
+    object.__setattr__(deps, "ai_available", lambda: False)
+    state.update({
+        "state": "script_node",
+        "script": {
+            "nodes": {5: {"id": 5, "title": "Готовый ответ", "is_terminal": True}},
+            "edges_by_from": {}, "current": 5,
+        },
+    })
+    faq.show_script_node(42, deps)
+    text, rows = deps.send_buttons.call_args.args[1:]
+    assert "ИИ-помощнику" not in text
+    assert all(button["payload"] != "ai_from_faq" for row in rows for button in row)
+
+
 def test_navigate_can_move_to_child_and_back_to_parent():
     deps, state = _dependencies()
     state["script"] = {

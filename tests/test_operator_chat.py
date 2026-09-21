@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
+import httpx
 import pytest
 
+import bot
 import database as db
 import web
 from rso_bot import operator_chat
@@ -178,7 +182,7 @@ def test_web_api_enforces_assignment_and_csrf(operator_db, monkeypatch):
     assert client.get(f"/operator-chat/api/dialogs/{dialog['id']}/messages").status_code == 404
     _login_session(client, owner, "web-owner", "operator")
     assert client.post(f"/operator-chat/api/dialogs/{dialog['id']}/messages", data={"body": "reply"}).status_code == 400
-    monkeypatch.setattr(web, "_send_max_text", lambda *_: True)
+    monkeypatch.setattr(web, "_send_max_text", lambda *_: (True, None))
     response = client.post(
         f"/operator-chat/api/dialogs/{dialog['id']}/messages",
         data={"body": "reply"}, headers={"X-CSRF-Token": "csrf"},
@@ -205,5 +209,251 @@ def test_retention_removes_content_but_preserves_rating(operator_db):
     count = conn.execute("SELECT COUNT(*) n FROM operator_messages WHERE dialog_id=?", (dialog["id"],)).fetchone()["n"]
     conn.close()
     assert saved["rating"] == 4
+    assert saved["chat_id"] == 0
     assert saved["client_ls"] is None
     assert count == 0
+
+
+def test_outbox_failure_retry_and_idempotency(operator_db):
+    _settings(max_active_dialogs=2)
+    owner = _operator("delivery")
+    operator_chat.start_shift(owner)
+    dialog = operator_chat.request_dialog(40, profile=None, faq_context=None, ai_messages=[])
+    message = operator_chat.add_message(dialog["id"], "operator", "reply", user_id=owner)
+    outbox = operator_chat.get_outbox_item_for_message(message["id"])
+    calls = []
+
+    def fail(item):
+        calls.append(item["id"])
+        return False, "max_http_429"
+
+    result = operator_chat.deliver_outbox(fail, only_id=outbox["id"])
+    assert result == [{"id": outbox["id"], "status": "failed", "error": "max_http_429"}]
+    assert len(calls) == 1
+    assert operator_chat.deliver_outbox(fail, only_id=outbox["id"]) == []
+    assert operator_chat.retry_message(message["id"], owner)
+    result = operator_chat.deliver_outbox(lambda item: (True, None), only_id=outbox["id"])
+    assert result[0]["status"] == "delivered"
+    assert operator_chat.deliver_outbox(lambda item: pytest.fail("duplicate"), only_id=outbox["id"]) == []
+    saved = operator_chat.list_messages(dialog["id"], owner)
+    assert next(row for row in saved if row["id"] == message["id"])["delivery_status"] == "delivered"
+
+
+def test_waiting_timeout_is_bounded_and_notified(operator_db):
+    _settings(max_active_dialogs=1, inactivity_timeout_min=30)
+    owner = _operator("wait-ttl")
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    operator_chat.start_shift(owner, now=base)
+    operator_chat.request_dialog(41, profile=None, faq_context=None, ai_messages=[], now=base)
+    waiting = operator_chat.request_dialog(42, profile=None, faq_context=None, ai_messages=[], now=base)
+    events = operator_chat.process_timeouts(now=base + timedelta(minutes=31))
+    assert [row["id"] for row in events["waiting_closed"]] == [waiting["id"]]
+    assert operator_chat.get_open_dialog_for_chat(42) is None
+
+
+def test_cleanup_retries_unlink_and_sweeps_old_orphan(operator_db, monkeypatch):
+    _settings(retention_days=1)
+    owner = _operator("cleanup")
+    old = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    operator_chat.start_shift(owner, now=old)
+    dialog = operator_chat.request_dialog(43, profile=None, faq_context=None, ai_messages=[], now=old)
+    image_root = Path(f".operator-images-{uuid.uuid4().hex}")
+    image_root.mkdir()
+    image = image_root / "kept.jpg"
+    image.write_bytes(b"\xff\xd8\xffx")
+    orphan = image_root / "orphan.jpg"
+    orphan.write_bytes(b"\xff\xd8\xffx")
+    os.utime(orphan, (old.timestamp(), old.timestamp()))
+    message = operator_chat.add_message(dialog["id"], "client", "private", image_path=image.name, now=old)
+    operator_chat.close_dialog(dialog["id"], owner, now=old)
+    original = Path.unlink
+    failed = {"done": False}
+
+    def fail_once(path, *args, **kwargs):
+        if path.name == image.name and not failed["done"]:
+            failed["done"] = True
+            raise OSError("busy")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_once)
+    operator_chat.cleanup_history(image_root, now=old + timedelta(days=2))
+    assert not orphan.exists()
+    conn = db.get_conn()
+    assert conn.execute("SELECT cleanup_pending FROM operator_messages WHERE id=?", (message["id"],)).fetchone()[0] == 1
+    conn.close()
+    operator_chat.cleanup_history(image_root, now=old + timedelta(days=2))
+    conn = db.get_conn()
+    assert conn.execute("SELECT 1 FROM operator_messages WHERE id=?", (message["id"],)).fetchone() is None
+    conn.close()
+    image_root.rmdir()
+
+
+@pytest.mark.parametrize("url,allowed", [
+    ("https://iu.oneme.ru/file.jpg", True),
+    ("http://iu.oneme.ru/file.jpg", False),
+    ("https://iu.oneme.ru.evil.test/file.jpg", False),
+    ("https://127.0.0.1/file.jpg", False),
+    ("https://user@iu.oneme.ru/file.jpg", False),
+])
+def test_max_image_exact_allowlist(url, allowed):
+    assert bot._is_allowed_max_image_url(url) is allowed
+
+
+def test_operator_workspace_has_per_dialog_poll_guards():
+    source = Path("templates/operator_chat.html").read_text(encoding="utf-8")
+    for token in ("AbortController", "generation", "cursors", "seen", "current.id!==dialogId"):
+        assert token in source
+
+
+def test_history_api_is_admin_only_and_excludes_active(operator_db):
+    _settings(max_active_dialogs=2)
+    owner = _operator("history-owner")
+    ok, _ = db.create_user("history-admin", "sufficient-password", "Admin", "admin")
+    assert ok
+    admin = db.get_user("history-admin")["id"]
+    operator_chat.start_shift(owner)
+    closed = operator_chat.request_dialog(50, profile=None, faq_context=None, ai_messages=[])
+    operator_chat.close_dialog(closed["id"], owner)
+    active = operator_chat.request_dialog(51, profile=None, faq_context=None, ai_messages=[])
+    client = web.app.test_client()
+    _login_session(client, owner, "history-owner", "operator")
+    assert client.get("/operator-chat/api/history").status_code == 302
+    assert client.get(f"/operator-chat/api/history/{closed['id']}").status_code == 302
+    _login_session(client, admin, "history-admin", "admin")
+    listing = client.get("/operator-chat/api/history")
+    assert listing.status_code == 200
+    assert [row["id"] for row in listing.json] == [closed["id"]]
+    assert client.get(f"/operator-chat/api/history/{closed['id']}").status_code == 200
+    assert client.get(f"/operator-chat/api/history/{active['id']}").status_code == 404
+
+
+def test_migration_preserves_pre_delivery_messages(monkeypatch):
+    path = os.path.abspath(f".operator-migration-{uuid.uuid4().hex}.sqlite")
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE operator_messages(id INTEGER PRIMARY KEY, dialog_id INTEGER)")
+    conn.execute("INSERT INTO operator_messages(id,dialog_id) VALUES(1,99)")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(db, "DB_PATH", path)
+    try:
+        db.init_db()
+        conn = sqlite3.connect(path)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(operator_messages)")}
+        assert {"delivery_status", "delivery_attempts", "last_error", "cleanup_pending"} <= columns
+        assert conn.execute("SELECT dialog_id FROM operator_messages WHERE id=1").fetchone()[0] == 99
+        conn.close()
+    finally:
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(path + suffix)
+            except FileNotFoundError:
+                pass
+
+
+def test_jpeg_delivery_retries_only_attachment_not_ready(monkeypatch):
+    path = Path(f".operator-upload-{uuid.uuid4().hex}.jpg")
+    path.write_bytes(b"\xff\xd8\xffx")
+
+    class Response:
+        def __init__(self, status, payload):
+            self.status_code = status
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                request = httpx.Request("POST", "https://example.test")
+                raise httpx.HTTPStatusError("failed", request=request, response=httpx.Response(self.status_code, request=request))
+
+    responses = iter([
+        Response(200, {"url": "https://upload.test"}),
+        Response(200, {"token": "token"}),
+        Response(400, {"code": "attachment.not.ready"}),
+        Response(200, {}),
+    ])
+    calls = []
+
+    def post(*args, **kwargs):
+        calls.append(args[0])
+        return next(responses)
+
+    monkeypatch.setattr(httpx, "post", post)
+    monkeypatch.setattr(web.time, "sleep", lambda _seconds: None)
+    try:
+        assert web._send_max_jpeg(1, str(path), "caption") == (True, None)
+        assert len(calls) == 4
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("result,error", [
+    (httpx.TimeoutException("timeout"), "max_timeout"),
+    (httpx.ConnectError("connect"), "max_transport"),
+])
+def test_text_delivery_records_transport_failures(monkeypatch, result, error):
+    def fail(*_args, **_kwargs):
+        raise result
+
+    monkeypatch.setattr(httpx, "post", fail)
+    assert web._send_max_text(1, "text") == (False, error)
+
+
+def test_official_max_attachment_contract_and_redirect_rejection(monkeypatch):
+    url = "https://iu.oneme.ru/image.jpg"
+    attachment = {"type": "image", "payload": {"url": url}}
+    assert bot._attachment_url(attachment) == url
+
+    class Stream:
+        def __init__(self, status):
+            self.status_code = status
+            self.headers = {"content-type": "image/jpeg", "content-length": "4"}
+            self.request = httpx.Request("GET", url)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def iter_bytes(self, _size):
+            yield b"\xff\xd8\xffx"
+
+    send = []
+    monkeypatch.setattr(bot, "send_message", lambda _chat, text: send.append(text))
+    monkeypatch.setattr(bot.httpx, "stream", lambda *_args, **_kwargs: Stream(302))
+    monkeypatch.setattr(bot.operator_chat, "add_message", lambda *_args, **_kwargs: pytest.fail("redirect followed"))
+    bot._handle_operator_attachments(1, {"id": 2}, {"attachments": [attachment]})
+    assert send and "Не удалось принять JPG" in send[-1]
+
+
+def test_inbound_jpeg_db_failure_removes_saved_file(monkeypatch):
+    root = Path(f".operator-inbound-{uuid.uuid4().hex}")
+    root.mkdir()
+    url = "https://iu.oneme.ru/image.jpg"
+
+    class Stream:
+        def __init__(self):
+            self.status_code = 200
+            self.headers = {"content-type": "image/jpeg", "content-length": "4"}
+            self.request = httpx.Request("GET", url)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def iter_bytes(self, _size):
+            yield b"\xff\xd8\xffx"
+
+    monkeypatch.setattr(bot, "OPERATOR_CHAT_IMAGE_DIR", str(root))
+    monkeypatch.setattr(bot.httpx, "stream", lambda *_args, **_kwargs: Stream())
+    monkeypatch.setattr(bot.operator_chat, "add_message", lambda *_args, **_kwargs: (_ for _ in ()).throw(sqlite3.Error("db")))
+    monkeypatch.setattr(bot, "send_message", lambda *_args: True)
+    bot._handle_operator_attachments(
+        1, {"id": 2}, {"attachments": [{"type": "image", "payload": {"url": url}}]},
+    )
+    assert not list(root.glob("*.jpg"))
+    root.rmdir()

@@ -249,6 +249,10 @@
            class="nav-item {% if request.endpoint == 'operator_chat_settings_page' %}active{% endif %}">
             🎧 Операторы и меню
         </a>
+        <a href="{{ url_for('operator_chat_history_page') }}"
+           class="nav-item {% if request.endpoint and request.endpoint.startswith('operator_chat_history') %}active{% endif %}">
+            💬 История диалогов
+        </a>
         {% endif %}
         <div class="nav-label">История</div>
         <a href="{{ url_for('legacy_list') }}"

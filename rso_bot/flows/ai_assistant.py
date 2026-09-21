@@ -322,6 +322,10 @@ def _fallback_buttons(deps: AIDependencies) -> list[list[Button]]:
     return rows
 
 
+def _appeal_hint(deps: AIDependencies) -> str:
+    return " Вы можете оформить обращение." if deps.appeal_available() else ""
+
+
 def _answer_buttons(deps: AIDependencies) -> list[list[Button]]:
     rows = [
         [deps.make_callback("❓ Задать ещё вопрос", "ai_more")],
@@ -340,7 +344,7 @@ def start(chat_id: int, deps: AIDependencies, faq_context: str | None = None) ->
     if not settings["enabled"] or not deps.is_configured(settings["model"]):
         deps.send_buttons(
             chat_id,
-            "⚠️ ИИ-помощник сейчас недоступен. Вы можете оформить обращение.",
+            "⚠️ ИИ-помощник сейчас недоступен." + _appeal_hint(deps),
             _fallback_buttons(deps),
         )
         return
@@ -392,7 +396,7 @@ def ask(chat_id: int, text: str, deps: AIDependencies) -> None:
         deps.touch(state)
         deps.send_buttons(
             chat_id,
-            "Вы достигли дневного лимита вопросов к ИИ. Вы можете оформить обращение.",
+            "Вы достигли дневного лимита вопросов к ИИ." + _appeal_hint(deps),
             _fallback_buttons(deps),
         )
         return
@@ -425,7 +429,7 @@ def ask(chat_id: int, text: str, deps: AIDependencies) -> None:
         deps.logger.warning("YandexGPT request failed chat_id=%s", chat_id)
         deps.send_buttons(
             chat_id,
-            "⚠️ ИИ-помощник временно недоступен. Попробуйте позже или оформите обращение.",
+            "⚠️ ИИ-помощник временно недоступен. Попробуйте позже." + _appeal_hint(deps),
             _fallback_buttons(deps),
         )
         return

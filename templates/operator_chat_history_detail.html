@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}Диалог №{{ dialog.id }}{% endblock %}
+{% block content %}
+<h1>Диалог №{{ dialog.id }}</h1>
+<div class="card"><div class="card-body"><p>Клиент: {{ dialog.client_fio or 'Неавторизованный/удалён' }}</p><p>ЛС: {{ dialog.client_ls or '—' }}</p><p>Адрес: {{ dialog.client_address or '—' }}</p><p>Оператор: {{ dialog.operator_name or '—' }}</p><p>FAQ: {{ dialog.faq_context or '—' }}</p><p>Оценка: {{ dialog.rating or '—' }}</p></div></div>
+<div class="card"><div class="card-body">{% for m in messages %}<div style="margin:8px 0;padding:8px;background:var(--surface2);border-radius:6px"><b>{{ m.sender }}</b>: {{ m.body or '' }} <small>{{ m.delivery_status }}</small>{% if m.image_path %}<br><img src="{{ url_for('operator_chat_history_image', message_id=m.id) }}" style="max-width:420px">{% endif %}</div>{% endfor %}</div></div>
+{% endblock %}

@@ -124,13 +124,14 @@ def show_script_node(chat_id: int, deps: FaqDependencies) -> None:
         state["state"] = deps.menu_state
         state.pop("script", None)
         deps.touch(state)
+        invitation = (
+            "\n\nЕсли вы не получили ответ на ваш вопрос, "
+            "вы можете обратиться к ИИ-помощнику."
+            if deps.ai_available() else ""
+        )
         deps.send_buttons(
             chat_id,
-            (
-                f"📌 {text}\n\n"
-                "Если вы не получили ответ на ваш вопрос, "
-                "вы можете обратиться к ИИ-помощнику."
-            ),
+            f"📌 {text}{invitation}",
             ([[deps.make_callback("🤖 Спросить у ИИ-помощника", "ai_from_faq")]] if deps.ai_available() else [])
             + ([[deps.make_callback("🎧 Связаться с оператором", "operator_start")]] if deps.operator_available() else [])
             + [[deps.make_callback("🏠 Главное меню", "main_menu")]],

@@ -427,10 +427,42 @@ def init_db() -> None:
             body TEXT,
             image_path TEXT,
             created_at TEXT NOT NULL,
-            read_at TEXT
+            read_at TEXT,
+            delivery_status TEXT NOT NULL DEFAULT 'delivered'
+                CHECK(delivery_status IN ('pending','sending','delivered','failed')),
+            delivery_attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            delivered_at TEXT,
+            cleanup_pending INTEGER NOT NULL DEFAULT 0
         )
     """)
+    _ensure_column(c, "operator_messages", "delivery_status", "TEXT NOT NULL DEFAULT 'delivered'")
+    _ensure_column(c, "operator_messages", "delivery_attempts", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(c, "operator_messages", "last_error", "TEXT")
+    _ensure_column(c, "operator_messages", "delivered_at", "TEXT")
+    _ensure_column(c, "operator_messages", "cleanup_pending", "INTEGER NOT NULL DEFAULT 0")
     c.execute("CREATE INDEX IF NOT EXISTS ix_operator_messages_dialog ON operator_messages(dialog_id,id)")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS operator_outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_key TEXT UNIQUE NOT NULL,
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER REFERENCES operator_messages(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK(kind IN ('text','image','buttons')),
+            body TEXT NOT NULL,
+            image_path TEXT,
+            buttons_json TEXT,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending','sending','delivered','failed')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            next_retry_at TEXT,
+            lease_at TEXT,
+            created_at TEXT NOT NULL,
+            delivered_at TEXT
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS ix_operator_outbox_due ON operator_outbox(status,next_retry_at,id)")
 
     # Центральные feature flags главного меню. Данные модулей не удаляются.
     c.execute("""

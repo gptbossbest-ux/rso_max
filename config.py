@@ -99,6 +99,11 @@ YANDEXGPT_TIMEOUT_SECONDS: float = float(os.getenv("YANDEXGPT_TIMEOUT_SECONDS", 
 OPERATOR_CHAT_IMAGE_DIR: str = os.getenv(
     "OPERATOR_CHAT_IMAGE_DIR", "runtime/operator_chat_images"
 ).strip()
+MAX_IMAGE_DOWNLOAD_HOSTS: tuple[str, ...] = tuple(
+    host.strip().lower()
+    for host in os.getenv("MAX_IMAGE_DOWNLOAD_HOSTS", "iu.oneme.ru").split(",")
+    if host.strip()
+)
 
 # ── Маркерные слова для автоматического повышения приоритета ──────────────────
 # Используются в FastAPI (Этап 2), здесь только хранятся

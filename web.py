@@ -28,6 +28,7 @@ import logging
 import os
 import secrets
 import sqlite3
+import time
 import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -767,20 +768,24 @@ def _max_headers() -> dict[str, str]:
     return {"Authorization": TOKEN, "Content-Type": "application/json"}
 
 
-def _send_max_text(chat_id: int, text: str) -> bool:
+def _send_max_text(chat_id: int, text: str) -> tuple[bool, str | None]:
     import httpx
     try:
         response = httpx.post(
             f"{API}/messages", headers=_max_headers(), params={"chat_id": chat_id},
             json={"text": text}, timeout=5,
         )
-        return response.status_code == 200
+        if response.status_code == 200:
+            return True, None
+        return False, f"max_http_{response.status_code}"
+    except httpx.TimeoutException:
+        return False, "max_timeout"
     except httpx.HTTPError:
         log.warning("MAX недоступен при отправке сообщения операторского диалога chat_id=%s", chat_id)
-        return False
+        return False, "max_transport"
 
 
-def _send_max_buttons(chat_id: int, text: str, buttons: list[list[dict]]) -> bool:
+def _send_max_buttons(chat_id: int, text: str, buttons: list[list[dict]]) -> tuple[bool, str | None]:
     import httpx
     try:
         response = httpx.post(
@@ -788,18 +793,22 @@ def _send_max_buttons(chat_id: int, text: str, buttons: list[list[dict]]) -> boo
             json={"text": text, "attachments": [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]},
             timeout=5,
         )
-        return response.status_code == 200
+        if response.status_code == 200:
+            return True, None
+        return False, f"max_http_{response.status_code}"
+    except httpx.TimeoutException:
+        return False, "max_timeout"
     except httpx.HTTPError:
         log.warning("MAX недоступен при отправке кнопок chat_id=%s", chat_id)
-        return False
+        return False, "max_transport"
 
 
 def _assign_and_notify() -> None:
-    for item in operator_chat.assign_waiting():
-        _send_max_text(item["chat_id"], "👨‍💻 Оператор подключился к диалогу.")
+    operator_chat.assign_waiting()
+    _flush_outbox()
 
 
-def _send_max_jpeg(chat_id: int, path: str, caption: str = "") -> bool:
+def _send_max_jpeg(chat_id: int, path: str, caption: str = "") -> tuple[bool, str | None]:
     import httpx
     headers = {"Authorization": TOKEN}
     try:
@@ -807,7 +816,7 @@ def _send_max_jpeg(chat_id: int, path: str, caption: str = "") -> bool:
         meta.raise_for_status()
         upload_url = meta.json().get("url")
         if not isinstance(upload_url, str) or not upload_url:
-            return False
+            return False, "upload_contract"
         with open(path, "rb") as stream:
             uploaded = httpx.post(
                 upload_url, headers=headers,
@@ -816,17 +825,52 @@ def _send_max_jpeg(chat_id: int, path: str, caption: str = "") -> bool:
         uploaded.raise_for_status()
         token = uploaded.json().get("token")
         if not isinstance(token, str) or not token:
-            return False
-        response = httpx.post(
-            f"{API}/messages", headers=_max_headers(), params={"chat_id": chat_id},
-            json={"text": caption or "Оператор отправил изображение.",
-                  "attachments": [{"type": "image", "payload": {"token": token}}]},
-            timeout=10,
-        )
-        return response.status_code == 200
+            return False, "upload_contract"
+        for attempt in range(3):
+            response = httpx.post(
+                f"{API}/messages", headers=_max_headers(), params={"chat_id": chat_id},
+                json={"text": caption or "Оператор отправил изображение.",
+                      "attachments": [{"type": "image", "payload": {"token": token}}]},
+                timeout=10,
+            )
+            if response.status_code == 200:
+                return True, None
+            code = ""
+            try:
+                payload = response.json()
+                code = str(payload.get("code") or payload.get("error") or "") if isinstance(payload, dict) else ""
+            except ValueError:
+                pass
+            if "attachment.not.ready" not in code.lower():
+                return False, f"max_http_{response.status_code}"
+            if attempt < 2:
+                time.sleep(0.2 * (2 ** attempt))
+        return False, "attachment_not_ready"
+    except httpx.TimeoutException:
+        return False, "max_timeout"
     except (httpx.HTTPError, OSError, ValueError, TypeError):
         log.warning("MAX недоступен при отправке изображения chat_id=%s", chat_id)
-        return False
+        return False, "max_transport"
+
+
+def _deliver_outbox_item(item: dict) -> tuple[bool, str | None]:
+    if item["kind"] == "text":
+        return _send_max_text(item["chat_id"], item["body"])
+    if item["kind"] == "buttons":
+        try:
+            buttons = json.loads(item["buttons_json"] or "[]")
+        except (TypeError, ValueError):
+            return False, "invalid_buttons"
+        return _send_max_buttons(item["chat_id"], item["body"], buttons)
+    root = os.path.realpath(OPERATOR_CHAT_IMAGE_DIR)
+    path = os.path.realpath(os.path.join(root, item["image_path"] or ""))
+    if os.path.dirname(path) != root:
+        return False, "invalid_image_path"
+    return _send_max_jpeg(item["chat_id"], path, item["body"])
+
+
+def _flush_outbox(only_id: int | None = None) -> list[dict]:
+    return operator_chat.deliver_outbox(_deliver_outbox_item, only_id=only_id)
 
 
 @app.route("/operator-chat")
@@ -906,6 +950,9 @@ def operator_send_message(dialog_id: int):
             absolute_path = os.path.join(OPERATOR_CHAT_IMAGE_DIR, relative_path)
             with open(absolute_path, "xb") as stream:
                 stream.write(data)
+    except (ValueError, OSError) as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+    try:
         message = operator_chat.add_message(
             dialog_id, "operator", body, user_id=_operator_id(), image_path=relative_path,
         )
@@ -916,11 +963,31 @@ def operator_send_message(dialog_id: int):
             except OSError:
                 pass
         return jsonify(ok=False, error=str(exc)), 400
-    delivered = (
-        _send_max_jpeg(dialog["chat_id"], absolute_path, f"Оператор: {body}" if body else "")
-        if absolute_path else _send_max_text(dialog["chat_id"], f"Оператор: {body}")
-    )
-    return jsonify(ok=True, delivered=delivered, message=message)
+    except Exception:
+        if absolute_path:
+            try:
+                os.remove(absolute_path)
+            except OSError:
+                pass
+        raise
+    outbox = operator_chat.get_outbox_item_for_message(message["id"])
+    result = _flush_outbox(outbox["id"] if outbox else None)
+    status = result[0]["status"] if result else "pending"
+    message["delivery_status"] = status
+    message["last_error"] = result[0]["error"] if result else None
+    return jsonify(ok=True, delivered=status == "delivered", delivery_status=status, message=message)
+
+
+@app.post("/operator-chat/api/messages/<int:message_id>/retry")
+@operator_required
+@csrf_protected
+def operator_retry_message(message_id: int):
+    if not operator_chat.retry_message(message_id, _operator_id()):
+        abort(404)
+    outbox = operator_chat.get_outbox_item_for_message(message_id)
+    result = _flush_outbox(outbox["id"] if outbox else None)
+    status = result[0]["status"] if result else "pending"
+    return jsonify(ok=True, delivered=status == "delivered", delivery_status=status)
 
 
 @app.post("/operator-chat/api/dialogs/<int:dialog_id>/close")
@@ -928,11 +995,10 @@ def operator_send_message(dialog_id: int):
 @csrf_protected
 def operator_close_dialog(dialog_id: int):
     try:
-        chat_id = operator_chat.close_dialog(dialog_id, _operator_id())
+        operator_chat.close_dialog(dialog_id, _operator_id())
     except PermissionError:
         abort(404)
-    buttons = [[{"type": "callback", "text": str(value), "payload": f"operator_rate:{dialog_id}-{value}"} for value in range(1, 6)]]
-    _send_max_buttons(chat_id, "Оператор завершил диалог. Оцените его работу от 1 до 5.", buttons)
+    _flush_outbox()
     _assign_and_notify()
     return jsonify(ok=True)
 
@@ -950,7 +1016,7 @@ def operator_chat_image(message_id: int):
         abort(404)
     root = os.path.realpath(OPERATOR_CHAT_IMAGE_DIR)
     path = os.path.realpath(os.path.join(root, row["image_path"]))
-    if os.path.dirname(path) != root:
+    if os.path.dirname(path) != root or not os.path.isfile(path):
         abort(404)
     return send_file(path, mimetype="image/jpeg", conditional=True)
 
@@ -983,6 +1049,60 @@ def operator_chat_settings_page():
         settings=operator_chat.get_settings(), modules=operator_chat.get_module_settings(),
         ratings=operator_chat.rating_report(),
     )
+
+
+@app.get("/operator-chat/history")
+@admin_required
+def operator_chat_history_page():
+    return render_template(
+        "operator_chat_history.html", user=session["user"],
+        dialogs=operator_chat.list_history(),
+    )
+
+
+@app.get("/operator-chat/api/history")
+@admin_required
+def operator_chat_history_api():
+    return jsonify(operator_chat.list_history())
+
+
+@app.get("/operator-chat/api/history/<int:dialog_id>")
+@admin_required
+def operator_chat_history_detail_api(dialog_id: int):
+    dialog = operator_chat.get_history_dialog(dialog_id)
+    if not dialog:
+        abort(404)
+    return jsonify(dialog=dialog, messages=operator_chat.list_history_messages(dialog_id))
+
+
+@app.get("/operator-chat/history/<int:dialog_id>")
+@admin_required
+def operator_chat_history_detail(dialog_id: int):
+    dialog = operator_chat.get_history_dialog(dialog_id)
+    if not dialog:
+        abort(404)
+    return render_template(
+        "operator_chat_history_detail.html", user=session["user"], dialog=dialog,
+        messages=operator_chat.list_history_messages(dialog_id),
+    )
+
+
+@app.get("/operator-chat/history/images/<int:message_id>")
+@admin_required
+def operator_chat_history_image(message_id: int):
+    conn = db.get_conn()
+    row = conn.execute(
+        """SELECT m.image_path FROM operator_messages m JOIN operator_dialogs d ON d.id=m.dialog_id
+           WHERE m.id=? AND d.status IN ('closed','timed_out','cancelled')""", (message_id,),
+    ).fetchone()
+    conn.close()
+    if not row or not row["image_path"]:
+        abort(404)
+    root = os.path.realpath(OPERATOR_CHAT_IMAGE_DIR)
+    path = os.path.realpath(os.path.join(root, row["image_path"]))
+    if os.path.dirname(path) != root or not os.path.isfile(path):
+        abort(404)
+    return send_file(path, mimetype="image/jpeg", conditional=True)
 
 
 APPOINTMENT_STATUSES = {

@@ -408,6 +408,17 @@ def test_limit_and_provider_failure_have_safe_appeal_fallback():
     assert "временно недоступен" in failed.send_buttons.call_args.args[1]
 
 
+def test_failure_does_not_invite_disabled_appeal():
+    deps, _, _ = _deps(
+        complete=Mock(side_effect=ai_assistant.AIServiceError()),
+        appeal_available=lambda: False,
+    )
+    ai_assistant.ask(43, "Вопрос", deps)
+    text, rows = deps.send_buttons.call_args.args[1:]
+    assert "оформ" not in text.lower()
+    assert all(button["payload"] != "ai_appeal" for row in rows for button in row)
+
+
 def test_empty_answer_after_sanitizing_is_safe_failure():
     failed, _, _ = _deps(complete=Mock(return_value="   "))
     ai_assistant.ask(43, "Как подать заявку?", failed)

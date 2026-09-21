@@ -33,6 +33,7 @@ import truststore
 
 truststore.inject_into_ssl()
 
+import json
 import logging
 import os
 import sqlite3
@@ -57,6 +58,7 @@ from config import (
     LOG_LEVEL,
     LOG_MAX_BYTES,
     MAX_AUTH_ATTEMPTS,
+    MAX_IMAGE_DOWNLOAD_HOSTS,
     OPERATOR_CHAT_IMAGE_DIR,
     SESSION_TTL_MINUTES,
     TIMEZONE_OFFSET,
@@ -556,7 +558,7 @@ def _start_operator_chat(chat_id: int) -> None:
         position = operator_chat.queue_position(dialog["id"])
         send_buttons(chat_id, f"Все операторы заняты. Ваша позиция в очереди: {position}.", [[_cb("❌ Отменить ожидание", "operator_cancel")]])
     else:
-        send_message(chat_id, "👨‍💻 Оператор подключился к диалогу. Напишите ваш вопрос.")
+        _flush_operator_outbox()
 
 
 def _cancel_operator_wait(chat_id: int, state: dict) -> None:
@@ -569,6 +571,9 @@ def _cancel_operator_wait(chat_id: int, state: dict) -> None:
 
 def _rate_operator(chat_id: int, dialog_id: int, rating: int) -> None:
     if operator_chat.rate_dialog(chat_id, dialog_id, rating):
+        state = _get_state(chat_id)
+        _clear_flow(state)
+        _touch(state)
         send_main_menu(chat_id, "Спасибо за оценку!")
     else:
         send_message(chat_id, "Оценка уже сохранена или диалог недоступен.")
@@ -601,21 +606,33 @@ def _attachment_url(attachment: dict) -> str | None:
     return None
 
 
+def _is_allowed_max_image_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return bool(
+        parsed.scheme == "https"
+        and parsed.hostname
+        and parsed.hostname.lower() in MAX_IMAGE_DOWNLOAD_HOSTS
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.port in {None, 443}
+    )
+
+
 def _handle_operator_attachments(chat_id: int, dialog: dict, message: dict) -> None:
     attachments = message.get("attachments") or (message.get("body") or {}).get("attachments") or []
     image_url = next((_attachment_url(item) for item in attachments if isinstance(item, dict)), None)
     if not image_url:
         send_message(chat_id, "Поддерживаются только JPG-изображения до 5 МБ.")
         return
-    parsed = urlparse(image_url)
-    host = (parsed.hostname or "").lower()
-    api_host = (urlparse(API).hostname or "").lower()
-    if parsed.scheme != "https" or not (host == api_host or host.endswith(".max.ru")):
+    if not _is_allowed_max_image_url(image_url):
         send_message(chat_id, "Не удалось безопасно загрузить изображение.")
         return
     try:
         with httpx.stream("GET", image_url, timeout=10, follow_redirects=False) as response:
-            response.raise_for_status()
+            if response.status_code != 200:
+                raise httpx.HTTPStatusError(
+                    "unexpected image response", request=response.request, response=response
+                )
             if int(response.headers.get("content-length", "0") or 0) > operator_chat.MAX_IMAGE_BYTES:
                 raise ValueError("oversize")
             buffer = bytearray()
@@ -632,10 +649,76 @@ def _handle_operator_attachments(chat_id: int, dialog: dict, message: dict) -> N
         with open(path, "xb") as stream:
             stream.write(data)
         caption = (message.get("body") or {}).get("text", "").strip()
-        operator_chat.add_message(dialog["id"], "client", caption, image_path=name)
-    except (httpx.HTTPError, OSError, ValueError, TypeError):
+        try:
+            operator_chat.add_message(dialog["id"], "client", caption, image_path=name)
+        except Exception:
+            Path(path).unlink(missing_ok=True)
+            raise
+    except (httpx.HTTPError, OSError, sqlite3.Error, ValueError, TypeError):
         log.warning("operator image rejected chat_id=%s", chat_id)
         send_message(chat_id, "Не удалось принять JPG. Проверьте формат и размер до 5 МБ.")
+
+
+def _send_operator_jpeg(chat_id: int, path: str, caption: str) -> tuple[bool, str | None]:
+    headers = {"Authorization": TOKEN}
+    try:
+        meta = httpx.post(f"{API}/uploads", headers=headers, params={"type": "image"}, timeout=10)
+        meta.raise_for_status()
+        upload_url = meta.json().get("url")
+        if not isinstance(upload_url, str) or not upload_url:
+            return False, "upload_contract"
+        with open(path, "rb") as stream:
+            uploaded = httpx.post(
+                upload_url, headers=headers,
+                files={"data": ("image.jpg", stream, "image/jpeg")}, timeout=30,
+            )
+        uploaded.raise_for_status()
+        token = uploaded.json().get("token")
+        if not isinstance(token, str) or not token:
+            return False, "upload_contract"
+        for attempt in range(3):
+            response = httpx.post(
+                f"{API}/messages", headers={"Authorization": TOKEN, "Content-Type": "application/json"},
+                params={"chat_id": chat_id},
+                json={"text": caption or "Оператор отправил изображение.",
+                      "attachments": [{"type": "image", "payload": {"token": token}}]}, timeout=10,
+            )
+            if response.status_code == 200:
+                return True, None
+            try:
+                error = response.json()
+                code = str(error.get("code") or error.get("error") or "") if isinstance(error, dict) else ""
+            except ValueError:
+                code = ""
+            if "attachment.not.ready" not in code.lower():
+                return False, f"max_http_{response.status_code}"
+            if attempt < 2:
+                time.sleep(0.2 * (2**attempt))
+        return False, "attachment_not_ready"
+    except httpx.TimeoutException:
+        return False, "max_timeout"
+    except (httpx.HTTPError, OSError, ValueError, TypeError):
+        return False, "max_transport"
+
+
+def _deliver_operator_outbox(item: dict) -> tuple[bool, str | None]:
+    if item["kind"] == "text":
+        return (True, None) if send_message(item["chat_id"], item["body"]) else (False, "max_delivery_failed")
+    if item["kind"] == "buttons":
+        try:
+            buttons = json.loads(item["buttons_json"] or "[]")
+        except (TypeError, ValueError):
+            return False, "invalid_buttons"
+        return (True, None) if send_buttons(item["chat_id"], item["body"], buttons) else (False, "max_delivery_failed")
+    root = Path(OPERATOR_CHAT_IMAGE_DIR).resolve()
+    path = (root / (item.get("image_path") or "")).resolve()
+    if path.parent != root:
+        return False, "invalid_image_path"
+    return _send_operator_jpeg(item["chat_id"], str(path), item.get("body") or "")
+
+
+def _flush_operator_outbox(only_id: int | None = None) -> list[dict]:
+    return operator_chat.deliver_outbox(_deliver_operator_outbox, only_id=only_id)
 
 
 # ── Показания (адаптировано из предыдущей версии) ────────────────────────────
@@ -962,6 +1045,29 @@ _CALLBACK_STATIC: dict[str, callable] = {
     "meter_retry":       _cb_meter_retry,
 }
 
+_CALLBACK_STATIC_MODULES = {
+    "auth_1c": "auth", "appeal_start": "appeal", "my_appeals": "appeal_status",
+    "pokazaniya": "readings", "meter_confirm": "readings", "meter_retry": "readings",
+    "scripts_list": "faq", "ai_start": "ai", "ai_from_faq": "ai", "ai_more": "ai",
+    "ai_new": "ai", "ai_appeal": "appeal", "appeal_draft_submit": "appeal",
+    "appeal_draft_edit": "appeal", "kvitanciya": "receipt",
+    "appointment_start": "appointment", "appt_skip_theme": "appointment",
+    "appt_confirm": "appointment",
+}
+_CALLBACK_STATIC_EXEMPT = {"main_menu", "cancel", "operator_start", "operator_cancel"}
+_CALLBACK_PREFIX_MODULES = {
+    "confirm": "appeal_status", "reopen": "appeal_status", "cat": "appeal",
+    "script": "faq", "script_node": "faq", "meter": "readings",
+    "appt_branch": "appointment", "appt_date": "appointment",
+    "appt_time": "appointment", "appt_cancel": "appointment",
+}
+_CALLBACK_PREFIX_EXEMPT = {"operator_rate"}
+
+
+def _reject_disabled(chat_id: int, state: dict) -> None:
+    _clear_flow(state)
+    send_main_menu(chat_id, "Раздел временно недоступен.")
+
 
 def handle_callback(update: dict) -> None:
     chat_id = update["message"]["recipient"]["chat_id"]
@@ -973,30 +1079,17 @@ def handle_callback(update: dict) -> None:
     _touch(st)
     log.debug("callback chat_id=%s payload=%s", chat_id, payload)
 
-    module_by_payload = {
-        "auth_1c": "auth", "appeal_start": "appeal", "my_appeals": "appeal_status",
-        "pokazaniya": "readings", "scripts_list": "faq", "ai_start": "ai",
-        "ai_from_faq": "ai", "ai_more": "ai", "ai_new": "ai", "kvitanciya": "receipt",
-        "appointment_start": "appointment", "ai_appeal": "appeal",
-        "appeal_draft_submit": "appeal", "appeal_draft_edit": "appeal",
-    }
-    prefix_module = {
-        "confirm": "appeal_status", "reopen": "appeal_status", "cat": "appeal",
-        "script": "faq", "script_node": "faq", "meter": "readings",
-        "appt_branch": "appointment", "appt_date": "appointment",
-        "appt_time": "appointment", "appt_cancel": "appointment",
-    }
-    module = module_by_payload.get(payload) or prefix_module.get(payload.partition(":")[0])
-    if module and not operator_chat.module_enabled(module):
-        _clear_flow(st)
-        send_main_menu(chat_id, "Раздел временно недоступен.")
-        return
-
     # Payload с аргументом: "префикс:значение"
     if ":" in payload:
         prefix, _, arg = payload.partition(":")
         handler = _CALLBACK_PREFIXES.get(prefix)
         if handler:
+            module = _CALLBACK_PREFIX_MODULES.get(prefix)
+            if prefix not in _CALLBACK_PREFIX_EXEMPT and (
+                module is None or not operator_chat.module_enabled(module)
+            ):
+                _reject_disabled(chat_id, st)
+                return
             try:
                 handler(chat_id, st, arg)
             except (ValueError, KeyError, IndexError) as exc:
@@ -1008,6 +1101,12 @@ def handle_callback(update: dict) -> None:
     # Статичный payload без аргумента
     handler = _CALLBACK_STATIC.get(payload)
     if handler:
+        module = _CALLBACK_STATIC_MODULES.get(payload)
+        if payload not in _CALLBACK_STATIC_EXEMPT and (
+            module is None or not operator_chat.module_enabled(module)
+        ):
+            _reject_disabled(chat_id, st)
+            return
         handler(chat_id, st)
         return
 
@@ -1091,6 +1190,7 @@ _MESSAGE_HANDLERS: dict[str, callable] = {
 }
 
 _STATE_MODULES = {
+    S.AWAIT_LS: "auth", S.AWAIT_LS_1C: "auth",
     S.APPEAL_CATEGORY: "appeal", S.APPEAL_BODY: "appeal",
     S.REOPEN_COMMENT: "appeal_status", S.SCRIPT_LIST: "faq", S.SCRIPT_NODE: "faq",
     S.AI_QUESTION: "ai", S.METER_SELECT: "readings", S.WAITING_VALUE1: "readings",
@@ -1099,6 +1199,7 @@ _STATE_MODULES = {
     S.APPOINTMENT_TIME: "appointment", S.APPOINTMENT_THEME: "appointment",
     S.APPOINTMENT_CONFIRM: "appointment",
 }
+_STATE_EXEMPT = {S.OPERATOR_CHAT}
 
 _RESET_COMMANDS = ("/start", "/help", "/menu")
 
@@ -1137,20 +1238,22 @@ def handle_message(message: dict) -> None:
     st = _get_state(chat_id)
     _touch(st)
 
-    module = _STATE_MODULES.get(st.get("state"))
-    if st.get("state") in {S.AWAIT_LS, S.AWAIT_LS_1C}:
+    state_name = st.get("state")
+    module = _STATE_MODULES.get(state_name)
+    if state_name in {S.AWAIT_LS, S.AWAIT_LS_1C}:
         module = {
             "my_appeals": "appeal_status", "pokazaniya": "readings",
             "kvitanciya": "receipt", "appointment": "appointment", "appeal": "appeal",
         }.get(st.get("after_ls"), module)
-        if st.get("state") == S.AWAIT_LS_1C and not st.get("after_ls"):
+        if state_name == S.AWAIT_LS_1C and not st.get("after_ls"):
             module = "auth"
-    if module and not operator_chat.module_enabled(module):
-        _clear_flow(st)
-        send_main_menu(chat_id, "Раздел временно недоступен.")
+    handler = _MESSAGE_HANDLERS.get(state_name)
+    if handler and state_name not in _STATE_EXEMPT and (
+        module is None or not operator_chat.module_enabled(module)
+    ):
+        _reject_disabled(chat_id, st)
         return
 
-    handler = _MESSAGE_HANDLERS.get(st.get("state", S.MENU))
     if handler:
         try:
             handler(chat_id, st, text)
@@ -1204,20 +1307,11 @@ def _task_cleanup_ai_sessions() -> None:
 
 def _task_operator_chat_maintenance() -> None:
     try:
-        events = operator_chat.process_timeouts()
-        for item in events["requeued"]:
-            send_message(item["chat_id"], "Извините, оператор не на связи, мы направляем вас к другому оператору.")
-        for item in events["assigned"]:
-            send_message(item["chat_id"], "👨‍💻 Оператор подключился к диалогу.")
-        for item in events["warned"]:
-            settings = operator_chat.get_settings()
-            send_message(item["chat_id"], f"Диалог будет закрыт через {settings['warning_before_min']} мин. без новых сообщений.")
-        for item in events["closed"]:
-            buttons = [[_cb(str(value), f"operator_rate:{item['id']}-{value}") for value in range(1, 6)]]
-            send_buttons(item["chat_id"], "Диалог закрыт по бездействию. Оцените работу оператора от 1 до 5.", buttons)
+        operator_chat.process_timeouts()
+        _flush_operator_outbox()
         operator_chat.cleanup_history(OPERATOR_CHAT_IMAGE_DIR)
-    except Exception as exc:  # noqa: BLE001 - scheduler isolation boundary
-        log.exception("operator chat maintenance failed: %s", exc)
+    except Exception:
+        log.exception("operator chat maintenance failed")
 
 
 def _format_appointment_reminder(appointment, when_label: str) -> str:
