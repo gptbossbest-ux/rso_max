@@ -14,7 +14,7 @@
 <div class="shift"><button class="btn btn-success" onclick="shift('start')">Начать смену</button><button class="btn btn-danger" onclick="shift('end')">Завершить смену</button><span id="shift-status"></span></div>
 <div id="tabs" class="tabs"></div>
 <div class="workspace"><div id="profile" class="profile">Выберите диалог</div><div class="chat"><div id="messages" class="messages"></div>
-<form id="composer" class="composer" enctype="multipart/form-data"><input class="form-control" name="body" type="text" maxlength="4000" placeholder="Ответ клиенту"><input name="image" type="file" accept="image/jpeg,.jpg,.jpeg"><button class="btn btn-primary">Отправить</button><button type="button" class="btn btn-danger" onclick="closeDialog()">Завершить</button></form></div></div>
+<form id="composer" class="composer" enctype="multipart/form-data"><input class="form-control" name="body" type="text" maxlength="3990" placeholder="Ответ клиенту"><input name="image" type="file" accept="image/jpeg,.jpg,.jpeg"><button class="btn btn-primary">Отправить</button><button type="button" class="btn btn-danger" onclick="closeDialog()">Завершить</button></form></div></div>
 <script>
 const csrf={{ csrf_token|tojson }};let dialogs=[];let current=null;let generation=0;
 const cursors=new Map(),seen=new Map(),inFlight=new Map();

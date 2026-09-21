@@ -681,7 +681,10 @@ def set_outbox_upload_token(outbox_id: int, token: str) -> str:
 
 def _retryable_delivery_error(error: str) -> bool:
     return bool(
-        error in {"max_timeout", "attachment_not_ready"}
+        error in {
+            "max_timeout", "max_transport", "transport_error",
+            "attachment_not_ready",
+        }
         or error == "max_http_429"
         or error.startswith("max_http_5")
     )
@@ -689,7 +692,7 @@ def _retryable_delivery_error(error: str) -> bool:
 
 def deliver_outbox(deliver: Delivery, *, now: datetime | None = None, max_items: int = 50,
                    only_id: int | None = None) -> list[dict[str, Any]]:
-    """Claim due rows with per-dialog causal ordering and bounded retries.
+    """Claim due rows with per-recipient causal ordering and bounded retries.
 
     Delivery is necessarily at-least-once: if MAX accepts a request and this
     process dies before committing ``delivered``, the expired lease is retried.
@@ -708,7 +711,7 @@ def deliver_outbox(deliver: Delivery, *, now: datetime | None = None, max_items:
                    AND (? IS NULL OR o.id=?)
                    AND NOT EXISTS (
                      SELECT 1 FROM operator_outbox earlier
-                     WHERE earlier.dialog_id=o.dialog_id AND earlier.id<o.id
+                     WHERE earlier.chat_id=o.chat_id AND earlier.id<o.id
                        AND earlier.status!='delivered'
                        AND NOT (earlier.status='failed' AND earlier.next_retry_at IS NULL)
                    ) ORDER BY o.id LIMIT 1""",

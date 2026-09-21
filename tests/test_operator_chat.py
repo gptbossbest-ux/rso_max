@@ -574,6 +574,103 @@ def test_timeout_supersedes_pending_warning_before_close_notice(operator_db):
     assert sent[0]["status"] == "delivered"
 
 
+def test_transport_failure_is_scheduled_then_delivered(operator_db, monkeypatch):
+    _settings(max_active_dialogs=1)
+    owner = _operator("transport-retry")
+    base = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(owner, now=base)
+    dialog = operator_chat.request_dialog(
+        68, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+    conn = db.get_conn()
+    outbox = dict(conn.execute(
+        "SELECT * FROM operator_outbox WHERE dialog_id=?", (dialog["id"],),
+    ).fetchone())
+    conn.close()
+    calls = 0
+
+    class Response:
+        status_code = 200
+
+    def post(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ConnectError(
+                "dns failure", request=httpx.Request("POST", "https://example.test"),
+            )
+        return Response()
+
+    monkeypatch.setattr(httpx, "post", post)
+    failed = operator_chat.deliver_outbox(
+        web._deliver_outbox_item, now=base, only_id=outbox["id"],
+    )
+    assert failed[0] == {
+        "id": outbox["id"], "status": "failed",
+        "error": "max_transport", "retryable": True,
+    }
+    assert operator_chat.deliver_outbox(
+        web._deliver_outbox_item, now=base + timedelta(seconds=1),
+        only_id=outbox["id"],
+    ) == []
+    delivered = operator_chat.deliver_outbox(
+        web._deliver_outbox_item, now=base + timedelta(seconds=3),
+        only_id=outbox["id"],
+    )
+    assert delivered[0]["status"] == "delivered"
+    assert calls == 2
+
+
+def test_outbox_orders_old_close_before_new_dialog_assignment(operator_db):
+    _settings(max_active_dialogs=1)
+    owner = _operator("recipient-order")
+    base = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(owner, now=base)
+    old_dialog = operator_chat.request_dialog(
+        69, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+    operator_chat.deliver_outbox(lambda _item: (True, None), now=base)
+    operator_chat.close_dialog(old_dialog["id"], owner, now=base)
+    conn = db.get_conn()
+    old_close = dict(conn.execute(
+        "SELECT * FROM operator_outbox WHERE dialog_id=? ORDER BY id DESC LIMIT 1",
+        (old_dialog["id"],),
+    ).fetchone())
+    conn.close()
+    failed = operator_chat.deliver_outbox(
+        lambda _item: (False, "max_transport"), now=base,
+        only_id=old_close["id"],
+    )
+    assert failed[0]["retryable"] is True
+    new_dialog = operator_chat.request_dialog(
+        69, profile=None, faq_context=None, ai_messages=[],
+        now=base + timedelta(seconds=1),
+    )
+    conn = db.get_conn()
+    new_assignment = dict(conn.execute(
+        "SELECT * FROM operator_outbox WHERE dialog_id=? ORDER BY id LIMIT 1",
+        (new_dialog["id"],),
+    ).fetchone())
+    conn.close()
+    assert operator_chat.deliver_outbox(
+        lambda _item: pytest.fail("new dialog overtook old close"),
+        now=base + timedelta(seconds=1), only_id=new_assignment["id"],
+    ) == []
+    assert operator_chat.deliver_outbox(
+        lambda _item: (True, None), now=base + timedelta(seconds=3),
+        only_id=old_close["id"],
+    )[0]["status"] == "delivered"
+    assert operator_chat.deliver_outbox(
+        lambda _item: (True, None), now=base + timedelta(seconds=3),
+        only_id=new_assignment["id"],
+    )[0]["status"] == "delivered"
+
+
+def test_operator_composer_matches_server_message_limit():
+    template = Path("templates/operator_chat.html").read_text(encoding="utf-8")
+    assert 'name="body" type="text" maxlength="3990"' in template
+
+
 def test_non_retryable_4xx_dead_letters_until_manual_retry(operator_db):
     _settings(max_active_dialogs=2)
     owner = _operator("dead-letter")
