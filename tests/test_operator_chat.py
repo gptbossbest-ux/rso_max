@@ -5,15 +5,23 @@ import sqlite3
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 
 import httpx
 import pytest
+from PIL import Image
 
 import bot
 import database as db
 import web
 from rso_bot import operator_chat
+
+
+def _jpeg_bytes(size=(2, 2)) -> bytes:
+    output = BytesIO()
+    Image.new("RGB", size, "red").save(output, format="JPEG")
+    return output.getvalue()
 
 
 @pytest.fixture()
@@ -104,13 +112,18 @@ def test_messages_object_auth_close_and_unique_rating(operator_db):
     owner, other = _operator("owner"), _operator("other")
     operator_chat.start_shift(owner)
     dialog = operator_chat.request_dialog(6, profile=None, faq_context=None, ai_messages=[])
+    operator_chat.deliver_outbox(lambda _item: (True, None))
     operator_chat.add_message(dialog["id"], "client", "hello")
     with pytest.raises(PermissionError):
         operator_chat.list_messages(dialog["id"], other)
-    operator_chat.add_message(dialog["id"], "operator", "reply", user_id=owner)
+    reply = operator_chat.add_message(dialog["id"], "operator", "reply", user_id=owner)
     assert len(operator_chat.list_messages(dialog["id"], owner)) == 3
     with pytest.raises(PermissionError):
         operator_chat.close_dialog(dialog["id"], other)
+    with pytest.raises(ValueError):
+        operator_chat.close_dialog(dialog["id"], owner)
+    outbox = operator_chat.get_outbox_item_for_message(reply["id"])
+    operator_chat.deliver_outbox(lambda _item: (True, None), only_id=outbox["id"])
     assert operator_chat.close_dialog(dialog["id"], owner) == 6
     assert operator_chat.rate_dialog(6, dialog["id"], 5)
     assert not operator_chat.rate_dialog(6, dialog["id"], 1)
@@ -126,7 +139,9 @@ def test_context_is_limited_and_jpeg_validation(operator_db):
     history = [{"role": "user", "text": str(index)} for index in range(8)]
     row = operator_chat.request_dialog(7, profile={"ls": "1", "fio": "F", "address": "A"}, faq_context="full", ai_messages=history)
     assert row["ai_context_json"].count('"role"') == 5
-    operator_chat.validate_jpeg(b"\xff\xd8\xffpayload", "image/jpeg")
+    normalized = operator_chat.normalize_jpeg(_jpeg_bytes() + b"<script>polyglot</script>", "image/jpeg")
+    assert b"polyglot" not in normalized
+    operator_chat.validate_jpeg(_jpeg_bytes(), "image/jpeg")
     with pytest.raises(ValueError):
         operator_chat.validate_jpeg(b"GIF89a", "image/gif")
     with pytest.raises(ValueError):
@@ -183,6 +198,7 @@ def test_web_api_enforces_assignment_and_csrf(operator_db, monkeypatch):
     _login_session(client, owner, "web-owner", "operator")
     assert client.post(f"/operator-chat/api/dialogs/{dialog['id']}/messages", data={"body": "reply"}).status_code == 400
     monkeypatch.setattr(web, "_send_max_text", lambda *_: (True, None))
+    web._flush_outbox()
     response = client.post(
         f"/operator-chat/api/dialogs/{dialog['id']}/messages",
         data={"body": "reply"}, headers={"X-CSRF-Token": "csrf"},
@@ -219,6 +235,7 @@ def test_outbox_failure_retry_and_idempotency(operator_db):
     owner = _operator("delivery")
     operator_chat.start_shift(owner)
     dialog = operator_chat.request_dialog(40, profile=None, faq_context=None, ai_messages=[])
+    operator_chat.deliver_outbox(lambda _item: (True, None))
     message = operator_chat.add_message(dialog["id"], "operator", "reply", user_id=owner)
     outbox = operator_chat.get_outbox_item_for_message(message["id"])
     calls = []
@@ -228,7 +245,9 @@ def test_outbox_failure_retry_and_idempotency(operator_db):
         return False, "max_http_429"
 
     result = operator_chat.deliver_outbox(fail, only_id=outbox["id"])
-    assert result == [{"id": outbox["id"], "status": "failed", "error": "max_http_429"}]
+    assert result == [{
+        "id": outbox["id"], "status": "failed", "error": "max_http_429", "retryable": True,
+    }]
     assert len(calls) == 1
     assert operator_chat.deliver_outbox(fail, only_id=outbox["id"]) == []
     assert operator_chat.retry_message(message["id"], owner)
@@ -260,9 +279,9 @@ def test_cleanup_retries_unlink_and_sweeps_old_orphan(operator_db, monkeypatch):
     image_root = Path(f".operator-images-{uuid.uuid4().hex}")
     image_root.mkdir()
     image = image_root / "kept.jpg"
-    image.write_bytes(b"\xff\xd8\xffx")
+    image.write_bytes(_jpeg_bytes())
     orphan = image_root / "orphan.jpg"
-    orphan.write_bytes(b"\xff\xd8\xffx")
+    orphan.write_bytes(_jpeg_bytes())
     os.utime(orphan, (old.timestamp(), old.timestamp()))
     message = operator_chat.add_message(dialog["id"], "client", "private", image_path=image.name, now=old)
     operator_chat.close_dialog(dialog["id"], owner, now=old)
@@ -340,6 +359,8 @@ def test_migration_preserves_pre_delivery_messages(monkeypatch):
         conn = sqlite3.connect(path)
         columns = {row[1] for row in conn.execute("PRAGMA table_info(operator_messages)")}
         assert {"delivery_status", "delivery_attempts", "last_error", "cleanup_pending"} <= columns
+        outbox_columns = {row[1] for row in conn.execute("PRAGMA table_info(operator_outbox)")}
+        assert {"dialog_id", "upload_token"} <= outbox_columns
         assert conn.execute("SELECT dialog_id FROM operator_messages WHERE id=1").fetchone()[0] == 99
         conn.close()
     finally:
@@ -352,7 +373,7 @@ def test_migration_preserves_pre_delivery_messages(monkeypatch):
 
 def test_jpeg_delivery_retries_only_attachment_not_ready(monkeypatch):
     path = Path(f".operator-upload-{uuid.uuid4().hex}.jpg")
-    path.write_bytes(b"\xff\xd8\xffx")
+    path.write_bytes(_jpeg_bytes())
 
     class Response:
         def __init__(self, status, payload):
@@ -418,7 +439,7 @@ def test_official_max_attachment_contract_and_redirect_rejection(monkeypatch):
             return False
 
         def iter_bytes(self, _size):
-            yield b"\xff\xd8\xffx"
+            yield _jpeg_bytes()
 
     send = []
     monkeypatch.setattr(bot, "send_message", lambda _chat, text: send.append(text))
@@ -436,7 +457,7 @@ def test_inbound_jpeg_db_failure_removes_saved_file(monkeypatch):
     class Stream:
         def __init__(self):
             self.status_code = 200
-            self.headers = {"content-type": "image/jpeg", "content-length": "4"}
+            self.headers = {"content-type": "image/jpeg", "content-length": str(len(_jpeg_bytes()))}
             self.request = httpx.Request("GET", url)
 
         def __enter__(self):
@@ -446,7 +467,7 @@ def test_inbound_jpeg_db_failure_removes_saved_file(monkeypatch):
             return False
 
         def iter_bytes(self, _size):
-            yield b"\xff\xd8\xffx"
+            yield _jpeg_bytes()
 
     monkeypatch.setattr(bot, "OPERATOR_CHAT_IMAGE_DIR", str(root))
     monkeypatch.setattr(bot.httpx, "stream", lambda *_args, **_kwargs: Stream())
@@ -457,3 +478,256 @@ def test_inbound_jpeg_db_failure_removes_saved_file(monkeypatch):
     )
     assert not list(root.glob("*.jpg"))
     root.rmdir()
+
+
+def test_failed_reply_blocks_close_until_manual_retry(operator_db):
+    _settings(max_active_dialogs=2)
+    owner = _operator("close-order")
+    operator_chat.start_shift(owner)
+    dialog = operator_chat.request_dialog(60, profile=None, faq_context=None, ai_messages=[])
+    operator_chat.deliver_outbox(lambda _item: (True, None))
+    message = operator_chat.add_message(dialog["id"], "operator", "reply", user_id=owner)
+    outbox = operator_chat.get_outbox_item_for_message(message["id"])
+    failed = operator_chat.deliver_outbox(
+        lambda _item: (False, "max_http_500"), only_id=outbox["id"],
+    )
+    assert failed[0]["retryable"] is True
+    with pytest.raises(ValueError, match="доставьте"):
+        operator_chat.close_dialog(dialog["id"], owner)
+    assert operator_chat.retry_message(message["id"], owner)
+    assert operator_chat.deliver_outbox(
+        lambda _item: (True, None), only_id=outbox["id"],
+    )[0]["status"] == "delivered"
+    operator_chat.close_dialog(dialog["id"], owner)
+
+
+def test_failed_requeue_blocks_later_assignment_notification(operator_db, monkeypatch):
+    _settings(max_active_dialogs=1, heartbeat_timeout_min=5)
+    first, second = _operator("stale-first"), _operator("fresh-second")
+    base = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(first, now=base)
+    monkeypatch.setattr(operator_chat.random, "choice", lambda values: min(values))
+    dialog = operator_chat.request_dialog(61, profile=None, faq_context=None, ai_messages=[], now=base)
+    operator_chat.deliver_outbox(lambda _item: (True, None), now=base)
+    later = base + timedelta(minutes=6)
+    operator_chat.start_shift(second, now=later)
+    events = operator_chat.process_timeouts(now=later)
+    assert events["assigned"][0]["operator_id"] == second
+    conn = db.get_conn()
+    rows = conn.execute(
+        "SELECT * FROM operator_outbox WHERE dialog_id=? ORDER BY id", (dialog["id"],),
+    ).fetchall()
+    conn.close()
+    requeue, assigned = dict(rows[-2]), dict(rows[-1])
+    assert "направляем вас" in requeue["body"]
+    assert assigned["body"] == "👨‍💻 Оператор подключился к диалогу. Напишите ваш вопрос."
+    assert operator_chat.deliver_outbox(
+        lambda _item: pytest.fail("later event overtook"), now=later, only_id=assigned["id"],
+    ) == []
+    operator_chat.deliver_outbox(
+        lambda _item: (False, "max_http_500"), now=later, only_id=requeue["id"],
+    )
+    assert operator_chat.deliver_outbox(
+        lambda _item: pytest.fail("later event overtook retry"),
+        now=later + timedelta(seconds=3), only_id=assigned["id"],
+    ) == []
+    assert operator_chat.deliver_outbox(
+        lambda _item: (True, None), now=later + timedelta(seconds=3), only_id=requeue["id"],
+    )[0]["status"] == "delivered"
+    delivered = operator_chat.deliver_outbox(
+        lambda item: (item["id"] == assigned["id"], None),
+        now=later + timedelta(seconds=3), only_id=assigned["id"],
+    )
+    assert delivered[0]["status"] == "delivered"
+
+
+def test_timeout_supersedes_pending_warning_before_close_notice(operator_db):
+    _settings(
+        max_active_dialogs=1, heartbeat_timeout_min=5,
+        inactivity_timeout_min=30, warning_before_min=5,
+    )
+    owner = _operator("warning-order")
+    base = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(owner, now=base)
+    dialog = operator_chat.request_dialog(
+        67, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+    operator_chat.deliver_outbox(lambda _item: (True, None), now=base)
+    warning_time = base + timedelta(minutes=26)
+    operator_chat.heartbeat(owner, now=warning_time)
+    assert operator_chat.process_timeouts(now=warning_time)["warned"]
+    close_time = base + timedelta(minutes=31)
+    operator_chat.heartbeat(owner, now=close_time)
+    assert operator_chat.process_timeouts(now=close_time)["closed"]
+    conn = db.get_conn()
+    rows = [dict(row) for row in conn.execute(
+        "SELECT * FROM operator_outbox WHERE dialog_id=? ORDER BY id", (dialog["id"],),
+    ).fetchall()]
+    conn.close()
+    warning, close_notice = rows[-2:]
+    assert warning["last_error"] == "superseded_by_timeout"
+    assert warning["next_retry_at"] is None
+    sent = operator_chat.deliver_outbox(
+        lambda item: (item["id"] == close_notice["id"], None),
+        now=close_time, only_id=close_notice["id"],
+    )
+    assert sent[0]["status"] == "delivered"
+
+
+def test_non_retryable_4xx_dead_letters_until_manual_retry(operator_db):
+    _settings(max_active_dialogs=2)
+    owner = _operator("dead-letter")
+    operator_chat.start_shift(owner)
+    dialog = operator_chat.request_dialog(62, profile=None, faq_context=None, ai_messages=[])
+    operator_chat.deliver_outbox(lambda _item: (True, None))
+    message = operator_chat.add_message(dialog["id"], "operator", "reply", user_id=owner)
+    outbox = operator_chat.get_outbox_item_for_message(message["id"])
+    result = operator_chat.deliver_outbox(
+        lambda _item: (False, "max_http_400"), only_id=outbox["id"],
+    )[0]
+    assert result["retryable"] is False
+    saved = operator_chat.get_outbox_item_for_message(message["id"])
+    assert saved["attempts"] == operator_chat.MAX_OUTBOX_ATTEMPTS
+    assert saved["next_retry_at"] is None
+    assert operator_chat.deliver_outbox(lambda _item: pytest.fail("automatic retry")) == []
+    assert operator_chat.retry_message(message["id"], owner)
+    assert operator_chat.deliver_outbox(
+        lambda _item: (True, None), only_id=outbox["id"],
+    )[0]["status"] == "delivered"
+
+
+def test_retryable_5xx_stops_at_max_attempts(operator_db):
+    _settings(max_active_dialogs=2)
+    owner = _operator("retry-limit")
+    operator_chat.start_shift(owner)
+    base = operator_chat.utc_now()
+    dialog = operator_chat.request_dialog(63, profile=None, faq_context=None, ai_messages=[], now=base)
+    operator_chat.deliver_outbox(lambda _item: (True, None), now=base)
+    message = operator_chat.add_message(dialog["id"], "operator", "reply", user_id=owner, now=base)
+    outbox = operator_chat.get_outbox_item_for_message(message["id"])
+    for attempt in range(operator_chat.MAX_OUTBOX_ATTEMPTS):
+        result = operator_chat.deliver_outbox(
+            lambda _item: (False, "max_http_503"),
+            now=base + timedelta(minutes=attempt + 1), only_id=outbox["id"],
+        )
+        assert result
+    assert result[0]["retryable"] is False
+    assert operator_chat.deliver_outbox(
+        lambda _item: pytest.fail("sixth attempt"), now=base + timedelta(days=1),
+        only_id=outbox["id"],
+    ) == []
+
+
+def test_operator_prefix_respects_max_message_size(operator_db):
+    _settings(max_active_dialogs=2)
+    owner = _operator("max-length")
+    operator_chat.start_shift(owner)
+    dialog = operator_chat.request_dialog(64, profile=None, faq_context=None, ai_messages=[])
+    operator_chat.add_message(
+        dialog["id"], "operator", "x" * operator_chat.MAX_OPERATOR_BODY, user_id=owner,
+    )
+    with pytest.raises(ValueError):
+        operator_chat.add_message(
+            dialog["id"], "operator", "x" * (operator_chat.MAX_OPERATOR_BODY + 1), user_id=owner,
+        )
+
+
+def test_jpeg_rejects_fake_and_oversized_dimensions():
+    with pytest.raises(ValueError):
+        operator_chat.normalize_jpeg(b"\xff\xd8\xffnot-a-jpeg", "image/jpeg")
+    with pytest.raises(ValueError, match="размеры"):
+        operator_chat.normalize_jpeg(_jpeg_bytes((operator_chat.MAX_IMAGE_DIMENSION + 1, 1)), "image/jpeg")
+
+
+def test_history_image_denies_cleanup_pending_and_expired(operator_db):
+    _settings(max_active_dialogs=2, retention_days=30)
+    owner = _operator("image-history-owner")
+    ok, _ = db.create_user("image-history-admin", "sufficient-password", "Admin", "admin")
+    assert ok
+    admin = db.get_user("image-history-admin")["id"]
+    operator_chat.start_shift(owner)
+    dialog = operator_chat.request_dialog(65, profile=None, faq_context=None, ai_messages=[])
+    message = operator_chat.add_message(
+        dialog["id"], "client", "image", image_path="private.jpg",
+    )
+    operator_chat.close_dialog(dialog["id"], owner)
+    client = web.app.test_client()
+    _login_session(client, admin, "image-history-admin", "admin")
+    conn = db.get_conn()
+    conn.execute("UPDATE operator_messages SET cleanup_pending=1 WHERE id=?", (message["id"],))
+    conn.commit()
+    conn.close()
+    assert client.get(f"/operator-chat/history/images/{message['id']}").status_code == 404
+    conn = db.get_conn()
+    conn.execute("UPDATE operator_messages SET cleanup_pending=0 WHERE id=?", (message["id"],))
+    conn.execute(
+        "UPDATE operator_dialogs SET closed_at=? WHERE id=?",
+        ((operator_chat.utc_now() - timedelta(days=31)).isoformat(timespec="seconds"), dialog["id"]),
+    )
+    conn.commit()
+    conn.close()
+    assert client.get(f"/operator-chat/history/images/{message['id']}").status_code == 404
+
+
+def test_image_outbox_reuses_persisted_upload_token(operator_db, monkeypatch):
+    _settings(max_active_dialogs=2)
+    owner = _operator("token-reuse")
+    operator_chat.start_shift(owner)
+    base = operator_chat.utc_now()
+    dialog = operator_chat.request_dialog(66, profile=None, faq_context=None, ai_messages=[], now=base)
+    operator_chat.deliver_outbox(lambda _item: (True, None), now=base)
+    root = Path(f".operator-token-{uuid.uuid4().hex}")
+    root.mkdir()
+    image = root / "image.jpg"
+    image.write_bytes(_jpeg_bytes())
+    message = operator_chat.add_message(
+        dialog["id"], "operator", "photo", user_id=owner, image_path=image.name, now=base,
+    )
+    outbox = operator_chat.get_outbox_item_for_message(message["id"])
+
+    class Response:
+        def __init__(self, status, payload):
+            self.status_code = status
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                request = httpx.Request("POST", "https://example.test")
+                response = httpx.Response(self.status_code, request=request)
+                raise httpx.HTTPStatusError("failed", request=request, response=response)
+
+    responses = iter([
+        Response(200, {"url": "https://upload.test"}),
+        Response(200, {"token": "stable-token"}),
+        Response(400, {"code": "attachment.not.ready"}),
+        Response(400, {"code": "attachment.not.ready"}),
+        Response(400, {"code": "attachment.not.ready"}),
+        Response(200, {}),
+    ])
+    calls = []
+
+    def post(url, **_kwargs):
+        calls.append(url)
+        return next(responses)
+
+    monkeypatch.setattr(web, "OPERATOR_CHAT_IMAGE_DIR", str(root))
+    monkeypatch.setattr(httpx, "post", post)
+    monkeypatch.setattr(web.time, "sleep", lambda _seconds: None)
+    try:
+        first = operator_chat.deliver_outbox(
+            web._deliver_outbox_item, now=base, only_id=outbox["id"],
+        )
+        assert first[0]["error"] == "attachment_not_ready"
+        assert operator_chat.get_outbox_item_for_message(message["id"])["upload_token"] == "stable-token"
+        second = operator_chat.deliver_outbox(
+            web._deliver_outbox_item, now=base + timedelta(minutes=1), only_id=outbox["id"],
+        )
+        assert second[0]["status"] == "delivered"
+        assert sum(url.endswith("/uploads") for url in calls) == 1
+        assert calls.count("https://upload.test") == 1
+    finally:
+        image.unlink(missing_ok=True)
+        root.rmdir()

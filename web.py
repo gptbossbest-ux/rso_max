@@ -808,24 +808,31 @@ def _assign_and_notify() -> None:
     _flush_outbox()
 
 
-def _send_max_jpeg(chat_id: int, path: str, caption: str = "") -> tuple[bool, str | None]:
+def _send_max_jpeg(
+    chat_id: int, path: str, caption: str = "", *, outbox_id: int | None = None,
+    upload_token: str | None = None,
+) -> tuple[bool, str | None]:
     import httpx
     headers = {"Authorization": TOKEN}
     try:
-        meta = httpx.post(f"{API}/uploads", headers=headers, params={"type": "image"}, timeout=10)
-        meta.raise_for_status()
-        upload_url = meta.json().get("url")
-        if not isinstance(upload_url, str) or not upload_url:
-            return False, "upload_contract"
-        with open(path, "rb") as stream:
-            uploaded = httpx.post(
-                upload_url, headers=headers,
-                files={"data": ("image.jpg", stream, "image/jpeg")}, timeout=30,
-            )
-        uploaded.raise_for_status()
-        token = uploaded.json().get("token")
-        if not isinstance(token, str) or not token:
-            return False, "upload_contract"
+        token = upload_token
+        if not token:
+            meta = httpx.post(f"{API}/uploads", headers=headers, params={"type": "image"}, timeout=10)
+            meta.raise_for_status()
+            upload_url = meta.json().get("url")
+            if not isinstance(upload_url, str) or not upload_url:
+                return False, "upload_contract"
+            with open(path, "rb") as stream:
+                uploaded = httpx.post(
+                    upload_url, headers=headers,
+                    files={"data": ("image.jpg", stream, "image/jpeg")}, timeout=30,
+                )
+            uploaded.raise_for_status()
+            token = uploaded.json().get("token")
+            if not isinstance(token, str) or not token:
+                return False, "upload_contract"
+            if outbox_id is not None:
+                token = operator_chat.set_outbox_upload_token(outbox_id, token)
         for attempt in range(3):
             response = httpx.post(
                 f"{API}/messages", headers=_max_headers(), params={"chat_id": chat_id},
@@ -848,6 +855,8 @@ def _send_max_jpeg(chat_id: int, path: str, caption: str = "") -> tuple[bool, st
         return False, "attachment_not_ready"
     except httpx.TimeoutException:
         return False, "max_timeout"
+    except httpx.HTTPStatusError as exc:
+        return False, f"max_http_{exc.response.status_code}"
     except (httpx.HTTPError, OSError, ValueError, TypeError):
         log.warning("MAX недоступен при отправке изображения chat_id=%s", chat_id)
         return False, "max_transport"
@@ -866,7 +875,10 @@ def _deliver_outbox_item(item: dict) -> tuple[bool, str | None]:
     path = os.path.realpath(os.path.join(root, item["image_path"] or ""))
     if os.path.dirname(path) != root:
         return False, "invalid_image_path"
-    return _send_max_jpeg(item["chat_id"], path, item["body"])
+    return _send_max_jpeg(
+        item["chat_id"], path, item["body"], outbox_id=item["id"],
+        upload_token=item.get("upload_token"),
+    )
 
 
 def _flush_outbox(only_id: int | None = None) -> list[dict]:
@@ -944,7 +956,7 @@ def operator_send_message(dialog_id: int):
     try:
         if upload and upload.filename:
             data = upload.read(operator_chat.MAX_IMAGE_BYTES + 1)
-            operator_chat.validate_jpeg(data, upload.mimetype)
+            data = operator_chat.normalize_jpeg(data, upload.mimetype)
             os.makedirs(OPERATOR_CHAT_IMAGE_DIR, mode=0o700, exist_ok=True)
             relative_path = f"{uuid.uuid4().hex}.jpg"
             absolute_path = os.path.join(OPERATOR_CHAT_IMAGE_DIR, relative_path)
@@ -998,6 +1010,8 @@ def operator_close_dialog(dialog_id: int):
         operator_chat.close_dialog(dialog_id, _operator_id())
     except PermissionError:
         abort(404)
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 409
     _flush_outbox()
     _assign_and_notify()
     return jsonify(ok=True)
@@ -1090,10 +1104,15 @@ def operator_chat_history_detail(dialog_id: int):
 @app.get("/operator-chat/history/images/<int:message_id>")
 @admin_required
 def operator_chat_history_image(message_id: int):
+    settings = operator_chat.get_settings()
+    cutoff = (
+        operator_chat.utc_now() - timedelta(days=int(settings["retention_days"]))
+    ).isoformat(timespec="seconds")
     conn = db.get_conn()
     row = conn.execute(
         """SELECT m.image_path FROM operator_messages m JOIN operator_dialogs d ON d.id=m.dialog_id
-           WHERE m.id=? AND d.status IN ('closed','timed_out','cancelled')""", (message_id,),
+           WHERE m.id=? AND m.cleanup_pending=0 AND d.closed_at>=?
+             AND d.status IN ('closed','timed_out','cancelled')""", (message_id, cutoff),
     ).fetchone()
     conn.close()
     if not row or not row["image_path"]:

@@ -7,21 +7,29 @@ The module never logs message bodies or customer profile fields.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import random
 import sqlite3
+import warnings
 from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from PIL import Image, ImageOps, UnidentifiedImageError
+
 import database as db
 
 ACTIVE_STATUSES = ("waiting", "active")
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
-JPEG_SIGNATURES = (b"\xff\xd8\xff",)
+MAX_IMAGE_DIMENSION = 8192
+MAX_IMAGE_PIXELS = 40_000_000
+MAX_OUTBOX_ATTEMPTS = 5
+OPERATOR_PREFIX = "Оператор: "
+MAX_OPERATOR_BODY = 4000 - len(OPERATOR_PREFIX)
 MODULE_KEYS = (
     "auth", "appeal", "appeal_status", "readings", "faq", "ai",
     "receipt", "appointment",
@@ -51,6 +59,7 @@ def _enqueue_outbox_locked(
     *,
     event_key: str,
     chat_id: int,
+    dialog_id: int | None = None,
     kind: str,
     body: str,
     message_id: int | None = None,
@@ -60,10 +69,10 @@ def _enqueue_outbox_locked(
 ) -> int:
     conn.execute(
         """INSERT OR IGNORE INTO operator_outbox
-           (event_key,chat_id,message_id,kind,body,image_path,buttons_json,status,created_at)
-           VALUES(?,?,?,?,?,?,?,'pending',?)""",
+           (event_key,dialog_id,chat_id,message_id,kind,body,image_path,buttons_json,status,created_at)
+           VALUES(?,?,?,?,?,?,?,?,'pending',?)""",
         (
-            event_key, chat_id, message_id, kind, body, image_path,
+            event_key, dialog_id, chat_id, message_id, kind, body, image_path,
             json.dumps(buttons, ensure_ascii=False) if buttons else None, _iso(now),
         ),
     )
@@ -276,7 +285,10 @@ def request_dialog(
             )
             _enqueue_outbox_locked(
                 conn, event_key=f"dialog:{dialog_id}:assigned:1", chat_id=chat_id,
-                kind="text", body="👨‍💻 Оператор подключился к диалогу.", now=now,
+                dialog_id=dialog_id,
+                kind="text",
+                body="👨‍💻 Оператор подключился к диалогу. Напишите ваш вопрос.",
+                now=now,
             )
         row = conn.execute("SELECT * FROM operator_dialogs WHERE id=?", (dialog_id,)).fetchone()
     return dict(row)
@@ -338,8 +350,8 @@ def assign_waiting(now: datetime | None = None) -> list[dict[str, Any]]:
             ).fetchone()["n"]
             _enqueue_outbox_locked(
                 conn, event_key=f"dialog:{waiting['id']}:assigned:{assignment_no}",
-                chat_id=waiting["chat_id"], kind="text",
-                body="👨‍💻 Оператор подключился к диалогу.", now=now,
+                dialog_id=waiting["id"], chat_id=waiting["chat_id"], kind="text",
+                body="👨‍💻 Оператор подключился к диалогу. Напишите ваш вопрос.", now=now,
             )
             assigned.append({"dialog_id": waiting["id"], "chat_id": waiting["chat_id"], "operator_id": operator_id})
     return assigned
@@ -362,7 +374,9 @@ def add_message(dialog_id: int, sender: str, body: str | None, *, user_id: int |
     body = (body or "").strip()
     if not body and not image_path:
         raise ValueError("Пустое сообщение")
-    if len(body) > 4000:
+    if sender == "operator" and len(body) > MAX_OPERATOR_BODY:
+        raise ValueError(f"Сообщение должно быть не длиннее {MAX_OPERATOR_BODY} символов")
+    if sender != "operator" and len(body) > 4000:
         raise ValueError("Сообщение слишком длинное")
     with _connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -383,8 +397,9 @@ def add_message(dialog_id: int, sender: str, body: str | None, *, user_id: int |
         if sender == "operator":
             _enqueue_outbox_locked(
                 conn, event_key=f"message:{message_id}", chat_id=dialog["chat_id"],
+                dialog_id=dialog_id,
                 message_id=message_id, kind="image" if image_path else "text",
-                body=f"Оператор: {body}" if body else "Оператор отправил изображение.",
+                body=f"{OPERATOR_PREFIX}{body}" if body else "Оператор отправил изображение.",
                 image_path=image_path, now=now,
             )
         if sender != "operator":
@@ -445,6 +460,13 @@ def close_dialog(dialog_id: int, operator_id: int, now: datetime | None = None) 
         ).fetchone()
         if not row:
             raise PermissionError
+        undelivered = conn.execute(
+            """SELECT COUNT(*) n FROM operator_messages
+               WHERE dialog_id=? AND sender='operator' AND delivery_status!='delivered'""",
+            (dialog_id,),
+        ).fetchone()["n"]
+        if undelivered:
+            raise ValueError("Сначала доставьте все ответы клиенту")
         conn.execute(
             "UPDATE operator_dialogs SET status='closed',closed_at=?,closed_by=? WHERE id=?",
             (_iso(now), operator_id, dialog_id),
@@ -452,6 +474,7 @@ def close_dialog(dialog_id: int, operator_id: int, now: datetime | None = None) 
         chat_id = row["chat_id"]
         _enqueue_outbox_locked(
             conn, event_key=f"dialog:{dialog_id}:closed", chat_id=chat_id, kind="buttons",
+            dialog_id=dialog_id,
             body="Оператор завершил диалог. Оцените его работу от 1 до 5.",
             buttons=_rating_buttons(dialog_id), now=now,
         )
@@ -529,6 +552,12 @@ def process_timeouts(now: datetime | None = None) -> dict[str, list[dict[str, An
             (_fresh_cutoff(settings, now),),
         ).fetchall()
         for row in stale:
+            conn.execute(
+                """UPDATE operator_outbox SET status='failed',attempts=?,next_retry_at=NULL,
+                   last_error='superseded_by_requeue' WHERE dialog_id=? AND status!='delivered'
+                   AND event_key LIKE ?""",
+                (MAX_OUTBOX_ATTEMPTS, row["id"], f"dialog:{row['id']}:assigned:%"),
+            )
             queue_seq = conn.execute("SELECT COALESCE(MAX(queue_seq),0)+1 n FROM operator_dialogs").fetchone()["n"]
             conn.execute(
                 """UPDATE operator_dialogs SET status='waiting',operator_id=NULL,queue_seq=?,
@@ -538,6 +567,7 @@ def process_timeouts(now: datetime | None = None) -> dict[str, list[dict[str, An
             result["requeued"].append(dict(row))
             _enqueue_outbox_locked(
                 conn, event_key=f"dialog:{row['id']}:requeued:{row['assigned_at']}", chat_id=row["chat_id"],
+                dialog_id=row["id"],
                 kind="text",
                 body="Извините, оператор не на связи, мы направляем вас к другому оператору.",
                 now=now,
@@ -553,6 +583,7 @@ def process_timeouts(now: datetime | None = None) -> dict[str, list[dict[str, An
             result["warned"].append(dict(row))
             _enqueue_outbox_locked(
                 conn, event_key=f"dialog:{row['id']}:warning:{row['last_activity_at']}", chat_id=row["chat_id"],
+                dialog_id=row["id"],
                 kind="text",
                 body=f"Диалог будет закрыт через {settings['warning_before_min']} мин. без новых сообщений.",
                 now=now,
@@ -562,10 +593,17 @@ def process_timeouts(now: datetime | None = None) -> dict[str, list[dict[str, An
             (close_at,),
         ).fetchall()
         for row in closes:
+            conn.execute(
+                """UPDATE operator_outbox SET status='failed',attempts=?,next_retry_at=NULL,
+                   last_error='superseded_by_timeout' WHERE dialog_id=? AND status!='delivered'
+                   AND event_key LIKE ?""",
+                (MAX_OUTBOX_ATTEMPTS, row["id"], f"dialog:{row['id']}:warning:%"),
+            )
             conn.execute("UPDATE operator_dialogs SET status='timed_out',closed_at=? WHERE id=?", (_iso(now), row["id"]))
             result["closed"].append(dict(row))
             _enqueue_outbox_locked(
                 conn, event_key=f"dialog:{row['id']}:timed_out", chat_id=row["chat_id"],
+                dialog_id=row["id"],
                 kind="buttons",
                 body="Диалог закрыт по бездействию. Оцените работу оператора от 1 до 5.",
                 buttons=_rating_buttons(row["id"]), now=now,
@@ -583,6 +621,7 @@ def process_timeouts(now: datetime | None = None) -> dict[str, list[dict[str, An
             result["waiting_closed"].append(dict(row))
             _enqueue_outbox_locked(
                 conn, event_key=f"dialog:{row['id']}:waiting_timeout", chat_id=row["chat_id"],
+                dialog_id=row["id"],
                 kind="text", body="Время ожидания оператора истекло. Пожалуйста, попробуйте позже.",
                 now=now,
             )
@@ -611,7 +650,8 @@ def retry_message(message_id: int, operator_id: int, now: datetime | None = None
         if not row:
             return False
         conn.execute(
-            "UPDATE operator_outbox SET status='pending',next_retry_at=?,last_error=NULL WHERE id=?",
+            """UPDATE operator_outbox SET status='pending',attempts=0,next_retry_at=?,
+               lease_at=NULL,last_error=NULL WHERE id=?""",
             (_iso(now), row["id"]),
         )
         conn.execute(
@@ -624,24 +664,58 @@ def retry_message(message_id: int, operator_id: int, now: datetime | None = None
 Delivery = Callable[[dict[str, Any]], tuple[bool, str | None]]
 
 
+def set_outbox_upload_token(outbox_id: int, token: str) -> str:
+    """Persist an image token once so later retries never create a new upload."""
+    if not token:
+        raise ValueError("empty upload token")
+    with _connection() as conn:
+        conn.execute(
+            "UPDATE operator_outbox SET upload_token=? WHERE id=? AND upload_token IS NULL",
+            (token, outbox_id),
+        )
+        row = conn.execute("SELECT upload_token FROM operator_outbox WHERE id=?", (outbox_id,)).fetchone()
+    if not row:
+        raise LookupError(outbox_id)
+    return str(row["upload_token"])
+
+
+def _retryable_delivery_error(error: str) -> bool:
+    return bool(
+        error in {"max_timeout", "attachment_not_ready"}
+        or error == "max_http_429"
+        or error.startswith("max_http_5")
+    )
+
+
 def deliver_outbox(deliver: Delivery, *, now: datetime | None = None, max_items: int = 50,
                    only_id: int | None = None) -> list[dict[str, Any]]:
-    """Claim and deliver due rows once; concurrent workers cannot claim the same row."""
+    """Claim due rows with per-dialog causal ordering and bounded retries.
+
+    Delivery is necessarily at-least-once: if MAX accepts a request and this
+    process dies before committing ``delivered``, the expired lease is retried.
+    MAX exposes no idempotency key for this endpoint, so that narrow ambiguous
+    success-before-DB-commit window can produce one duplicate.
+    """
     now = now or utc_now()
     results: list[dict[str, Any]] = []
     for _ in range(max_items):
         with _connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            params: list[Any] = [_iso(now), _iso(now - timedelta(minutes=2))]
-            id_clause = ""
-            if only_id is not None:
-                id_clause = " AND id=?"
-                params.append(only_id)
             row = conn.execute(
-                """SELECT * FROM operator_outbox
-                   WHERE ((status IN ('pending','failed') AND (next_retry_at IS NULL OR next_retry_at<=?))
-                      OR (status='sending' AND lease_at<=?))""" + id_clause + " ORDER BY id LIMIT 1",
-                params,
+                """SELECT o.* FROM operator_outbox o
+                   WHERE ((o.status='pending' OR (o.status='failed' AND o.next_retry_at<=?))
+                      OR (o.status='sending' AND o.lease_at<=?))
+                   AND (? IS NULL OR o.id=?)
+                   AND NOT EXISTS (
+                     SELECT 1 FROM operator_outbox earlier
+                     WHERE earlier.dialog_id=o.dialog_id AND earlier.id<o.id
+                       AND earlier.status!='delivered'
+                       AND NOT (earlier.status='failed' AND earlier.next_retry_at IS NULL)
+                   ) ORDER BY o.id LIMIT 1""",
+                (
+                    _iso(now), _iso(now - timedelta(minutes=2)),
+                    only_id, only_id,
+                ),
             ).fetchone()
             if not row:
                 break
@@ -660,12 +734,17 @@ def deliver_outbox(deliver: Delivery, *, now: datetime | None = None, max_items:
         safe_error = (error or "delivery_failed")[:80]
         with _connection() as conn:
             status = "delivered" if success else "failed"
-            retry_at = None if success else _iso(now + timedelta(seconds=min(300, 2 ** min(item["attempts"], 8))))
+            retryable = not success and _retryable_delivery_error(safe_error)
+            retry_at = (
+                _iso(now + timedelta(seconds=min(300, 2 ** min(item["attempts"], 8))))
+                if retryable and item["attempts"] < MAX_OUTBOX_ATTEMPTS else None
+            )
+            attempts = item["attempts"] if retry_at is not None or success else MAX_OUTBOX_ATTEMPTS
             conn.execute(
-                """UPDATE operator_outbox SET status=?,last_error=?,next_retry_at=?,
+                """UPDATE operator_outbox SET status=?,attempts=?,last_error=?,next_retry_at=?,
                    delivered_at=CASE WHEN ?='delivered' THEN ? ELSE delivered_at END
                    WHERE id=? AND status='sending'""",
-                (status, None if success else safe_error, retry_at, status, _iso(now), item["id"]),
+                (status, attempts, None if success else safe_error, retry_at, status, _iso(now), item["id"]),
             )
             if item.get("message_id"):
                 conn.execute(
@@ -680,7 +759,11 @@ def deliver_outbox(deliver: Delivery, *, now: datetime | None = None, max_items:
                            WHERE id=(SELECT dialog_id FROM operator_messages WHERE id=?)""",
                         (_iso(now), item["message_id"]),
                     )
-        results.append({"id": item["id"], "status": status, "error": None if success else safe_error})
+        results.append({
+            "id": item["id"], "status": status,
+            "error": None if success else safe_error,
+            "retryable": bool(retry_at),
+        })
         if only_id is not None:
             break
     return results
@@ -755,10 +838,40 @@ def cleanup_history(image_root: str | os.PathLike[str], now: datetime | None = N
     return scrubbed
 
 
-def validate_jpeg(data: bytes, content_type: str | None) -> None:
+def normalize_jpeg(data: bytes, content_type: str | None) -> bytes:
+    """Fully decode and re-encode a bounded JPEG, stripping metadata/trailing data."""
     if not data or len(data) > MAX_IMAGE_BYTES:
         raise ValueError("Изображение должно быть не более 5 МБ")
-    if content_type not in {"image/jpeg", "image/jpg"} or not data.startswith(JPEG_SIGNATURES):
+    if content_type not in {"image/jpeg", "image/jpg"}:
         raise ValueError("Поддерживаются только JPG-изображения")
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data)) as probe:
+                if probe.format != "JPEG":
+                    raise ValueError("Поддерживаются только JPG-изображения")
+                width, height = probe.size
+                if (
+                    width <= 0 or height <= 0
+                    or width > MAX_IMAGE_DIMENSION or height > MAX_IMAGE_DIMENSION
+                    or width * height > MAX_IMAGE_PIXELS
+                ):
+                    raise ValueError("Недопустимые размеры изображения")
+                probe.verify()
+            with Image.open(io.BytesIO(data)) as decoded:
+                decoded.load()
+                normalized = ImageOps.exif_transpose(decoded).convert("RGB")
+                output = io.BytesIO()
+                normalized.save(output, format="JPEG", quality=90, optimize=True)
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning, UnidentifiedImageError, OSError) as exc:
+        raise ValueError("Повреждённое JPG-изображение") from exc
+    result = output.getvalue()
+    if len(result) > MAX_IMAGE_BYTES:
+        raise ValueError("Изображение после обработки превышает 5 МБ")
+    return result
+
+
+def validate_jpeg(data: bytes, content_type: str | None) -> None:
+    normalize_jpeg(data, content_type)
 
 

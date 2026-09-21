@@ -446,11 +446,13 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS operator_outbox (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             event_key TEXT UNIQUE NOT NULL,
+            dialog_id INTEGER REFERENCES operator_dialogs(id) ON DELETE CASCADE,
             chat_id INTEGER NOT NULL,
             message_id INTEGER REFERENCES operator_messages(id) ON DELETE CASCADE,
             kind TEXT NOT NULL CHECK(kind IN ('text','image','buttons')),
             body TEXT NOT NULL,
             image_path TEXT,
+            upload_token TEXT,
             buttons_json TEXT,
             status TEXT NOT NULL DEFAULT 'pending'
                 CHECK(status IN ('pending','sending','delivered','failed')),
@@ -462,6 +464,13 @@ def init_db() -> None:
             delivered_at TEXT
         )
     """)
+    _ensure_column(c, "operator_outbox", "dialog_id", "INTEGER REFERENCES operator_dialogs(id) ON DELETE CASCADE")
+    _ensure_column(c, "operator_outbox", "upload_token", "TEXT")
+    c.execute(
+        """UPDATE operator_outbox SET dialog_id=(
+             SELECT dialog_id FROM operator_messages WHERE id=operator_outbox.message_id
+           ) WHERE dialog_id IS NULL AND message_id IS NOT NULL"""
+    )
     c.execute("CREATE INDEX IF NOT EXISTS ix_operator_outbox_due ON operator_outbox(status,next_retry_at,id)")
 
     # Центральные feature flags главного меню. Данные модулей не удаляются.

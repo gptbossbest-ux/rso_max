@@ -642,7 +642,7 @@ def _handle_operator_attachments(chat_id: int, dialog: dict, message: dict) -> N
                     raise ValueError("oversize")
             data = bytes(buffer)
             content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
-        operator_chat.validate_jpeg(data, content_type)
+        data = operator_chat.normalize_jpeg(data, content_type)
         os.makedirs(OPERATOR_CHAT_IMAGE_DIR, mode=0o700, exist_ok=True)
         name = f"{uuid.uuid4().hex}.jpg"
         path = os.path.join(OPERATOR_CHAT_IMAGE_DIR, name)
@@ -659,23 +659,44 @@ def _handle_operator_attachments(chat_id: int, dialog: dict, message: dict) -> N
         send_message(chat_id, "Не удалось принять JPG. Проверьте формат и размер до 5 МБ.")
 
 
-def _send_operator_jpeg(chat_id: int, path: str, caption: str) -> tuple[bool, str | None]:
+def _send_operator_payload(chat_id: int, body: dict) -> tuple[bool, str | None]:
+    try:
+        response = httpx.post(
+            f"{API}/messages", headers=_MAX_HEADERS, params={"chat_id": chat_id},
+            json=body, timeout=5,
+        )
+        if response.status_code == 200:
+            return True, None
+        return False, f"max_http_{response.status_code}"
+    except httpx.TimeoutException:
+        return False, "max_timeout"
+    except httpx.HTTPError:
+        return False, "max_transport"
+
+
+def _send_operator_jpeg(
+    chat_id: int, path: str, caption: str, *, outbox_id: int,
+    upload_token: str | None,
+) -> tuple[bool, str | None]:
     headers = {"Authorization": TOKEN}
     try:
-        meta = httpx.post(f"{API}/uploads", headers=headers, params={"type": "image"}, timeout=10)
-        meta.raise_for_status()
-        upload_url = meta.json().get("url")
-        if not isinstance(upload_url, str) or not upload_url:
-            return False, "upload_contract"
-        with open(path, "rb") as stream:
-            uploaded = httpx.post(
-                upload_url, headers=headers,
-                files={"data": ("image.jpg", stream, "image/jpeg")}, timeout=30,
-            )
-        uploaded.raise_for_status()
-        token = uploaded.json().get("token")
-        if not isinstance(token, str) or not token:
-            return False, "upload_contract"
+        token = upload_token
+        if not token:
+            meta = httpx.post(f"{API}/uploads", headers=headers, params={"type": "image"}, timeout=10)
+            meta.raise_for_status()
+            upload_url = meta.json().get("url")
+            if not isinstance(upload_url, str) or not upload_url:
+                return False, "upload_contract"
+            with open(path, "rb") as stream:
+                uploaded = httpx.post(
+                    upload_url, headers=headers,
+                    files={"data": ("image.jpg", stream, "image/jpeg")}, timeout=30,
+                )
+            uploaded.raise_for_status()
+            token = uploaded.json().get("token")
+            if not isinstance(token, str) or not token:
+                return False, "upload_contract"
+            token = operator_chat.set_outbox_upload_token(outbox_id, token)
         for attempt in range(3):
             response = httpx.post(
                 f"{API}/messages", headers={"Authorization": TOKEN, "Content-Type": "application/json"},
@@ -697,24 +718,32 @@ def _send_operator_jpeg(chat_id: int, path: str, caption: str) -> tuple[bool, st
         return False, "attachment_not_ready"
     except httpx.TimeoutException:
         return False, "max_timeout"
+    except httpx.HTTPStatusError as exc:
+        return False, f"max_http_{exc.response.status_code}"
     except (httpx.HTTPError, OSError, ValueError, TypeError):
         return False, "max_transport"
 
 
 def _deliver_operator_outbox(item: dict) -> tuple[bool, str | None]:
     if item["kind"] == "text":
-        return (True, None) if send_message(item["chat_id"], item["body"]) else (False, "max_delivery_failed")
+        return _send_operator_payload(item["chat_id"], {"text": item["body"]})
     if item["kind"] == "buttons":
         try:
             buttons = json.loads(item["buttons_json"] or "[]")
         except (TypeError, ValueError):
             return False, "invalid_buttons"
-        return (True, None) if send_buttons(item["chat_id"], item["body"], buttons) else (False, "max_delivery_failed")
+        return _send_operator_payload(
+            item["chat_id"],
+            {"text": item["body"], "attachments": [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]},
+        )
     root = Path(OPERATOR_CHAT_IMAGE_DIR).resolve()
     path = (root / (item.get("image_path") or "")).resolve()
     if path.parent != root:
         return False, "invalid_image_path"
-    return _send_operator_jpeg(item["chat_id"], str(path), item.get("body") or "")
+    return _send_operator_jpeg(
+        item["chat_id"], str(path), item.get("body") or "", outbox_id=item["id"],
+        upload_token=item.get("upload_token"),
+    )
 
 
 def _flush_operator_outbox(only_id: int | None = None) -> list[dict]:
