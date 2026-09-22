@@ -414,7 +414,7 @@ def test_jpeg_delivery_retries_only_attachment_not_ready(monkeypatch):
                 raise httpx.HTTPStatusError("failed", request=request, response=httpx.Response(self.status_code, request=request))
 
     responses = iter([
-        Response(200, {"url": "https://upload.test"}),
+        Response(200, {"url": "https://iu.oneme.ru/upload"}),
         Response(200, {"token": "token"}),
         Response(400, {"code": "attachment.not.ready"}),
         Response(200, {}),
@@ -743,8 +743,26 @@ def test_operator_prefix_respects_max_message_size(operator_db):
 def test_jpeg_rejects_fake_and_oversized_dimensions():
     with pytest.raises(ValueError):
         operator_chat.normalize_jpeg(b"\xff\xd8\xffnot-a-jpeg", "image/jpeg")
+    accepted = operator_chat.normalize_jpeg(
+        _jpeg_bytes((operator_chat.MAX_IMAGE_DIMENSION, 1)), "image/jpeg",
+    )
+    with Image.open(BytesIO(accepted)) as decoded:
+        assert decoded.size == (7680, 1)
     with pytest.raises(ValueError, match="размеры"):
         operator_chat.normalize_jpeg(_jpeg_bytes((operator_chat.MAX_IMAGE_DIMENSION + 1, 1)), "image/jpeg")
+
+
+@pytest.mark.parametrize(("url", "allowed"), [
+    ("https://iu.oneme.ru/upload?signature=secret", True),
+    ("https://iu.oneme.ru:443/upload", True),
+    ("http://iu.oneme.ru/upload", False),
+    ("https://iu.oneme.ru:444/upload", False),
+    ("https://iu.oneme.ru.evil.test/upload", False),
+    ("https://user@iu.oneme.ru/upload", False),
+    ("https://iu.oneme.ru/upload#fragment", False),
+])
+def test_max_image_upload_url_exact_allowlist(url, allowed):
+    assert operator_chat.is_allowed_max_image_upload_url(url) is allowed
 
 
 def test_history_image_denies_cleanup_pending_and_expired(operator_db):
@@ -808,7 +826,7 @@ def test_image_outbox_reuses_persisted_upload_token(operator_db, monkeypatch):
                 raise httpx.HTTPStatusError("failed", request=request, response=response)
 
     responses = iter([
-        Response(200, {"url": "https://upload.test"}),
+        Response(200, {"url": "https://iu.oneme.ru/upload"}),
         Response(200, {"token": "stable-token"}),
         Response(400, {"code": "attachment.not.ready"}),
         Response(400, {"code": "attachment.not.ready"}),
@@ -835,7 +853,7 @@ def test_image_outbox_reuses_persisted_upload_token(operator_db, monkeypatch):
         )
         assert second[0]["status"] == "delivered"
         assert sum(url.endswith("/uploads") for url in calls) == 1
-        assert calls.count("https://upload.test") == 1
+        assert calls.count("https://iu.oneme.ru/upload") == 1
     finally:
         image.unlink(missing_ok=True)
         root.rmdir()
@@ -876,7 +894,8 @@ def test_max_image_upload_contract_accepts_nested_photo_token(monkeypatch):
             name, _stream, content_type = kwargs["files"]["data"]
             assert name == "image.jpg"
             assert content_type == "image/jpeg"
-            assert "headers" not in kwargs
+            assert kwargs["headers"] == {"Authorization": web.TOKEN}
+            assert kwargs["follow_redirects"] is False
             return Response({"photos": {"photo-id": {"token": "nested-token"}}})
         assert kwargs["params"] == {"chat_id": 101}
         assert kwargs["json"]["attachments"] == [
@@ -890,6 +909,49 @@ def test_max_image_upload_contract_accepts_nested_photo_token(monkeypatch):
         assert calls[0][1]["params"] == {"type": "image"}
         assert calls[0][1]["headers"] == {"Authorization": web.TOKEN}
         assert calls[1][0] == "https://iu.oneme.ru/uploadImage?unchanged=1"
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("malicious_url", [
+    "http://iu.oneme.ru/upload",
+    "https://evil.test/upload",
+    "https://iu.oneme.ru:444/upload",
+    "https://user@iu.oneme.ru/upload",
+    "https://iu.oneme.ru/upload#fragment",
+])
+@pytest.mark.parametrize("sender", ["web", "bot"])
+def test_image_sender_rejects_untrusted_upload_url(monkeypatch, malicious_url, sender):
+    path = Path(f".operator-untrusted-{uuid.uuid4().hex}.jpg")
+    path.write_bytes(_jpeg_bytes())
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"url": malicious_url}
+
+        def raise_for_status(self):
+            return None
+
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs))
+        return Response()
+
+    monkeypatch.setattr(httpx, "post", post)
+    try:
+        if sender == "web":
+            result = web._send_max_jpeg(103, str(path), "caption")
+        else:
+            result = bot._send_operator_jpeg(
+                103, str(path), "caption", outbox_id=1, upload_token=None,
+            )
+        assert result == (False, "upload_contract")
+        assert len(calls) == 1
+        assert calls[0][1]["headers"] == {"Authorization": web.TOKEN}
+        assert calls[0][1]["params"] == {"type": "image"}
     finally:
         path.unlink(missing_ok=True)
 
@@ -918,7 +980,8 @@ def test_bot_max_image_upload_contract_accepts_nested_photo_token(monkeypatch):
             return Response({"url": "https://iu.oneme.ru/uploadImage?signature=kept"})
         if url.startswith("https://iu.oneme.ru"):
             assert set(kwargs["files"]) == {"data"}
-            assert "headers" not in kwargs
+            assert kwargs["headers"] == {"Authorization": bot.TOKEN}
+            assert kwargs["follow_redirects"] is False
             return Response({"photos": {"photo-id": {"token": "bot-nested-token"}}})
         assert kwargs["json"]["attachments"] == [
             {"type": "image", "payload": {"token": "bot-nested-token"}},
@@ -1125,12 +1188,29 @@ def test_reports_threshold_reject_idempotency_and_unblock(operator_db):
         result = operator_chat.decide_client_report(report["id"], admin, "confirmed")
         assert result["confirmed_count"] == index + 1
     assert operator_chat.is_client_blocked(207)
-    repeated = operator_chat.decide_client_report(report_ids[-1], admin, "confirmed")
-    assert repeated["confirmed_count"] == 3
     assert operator_chat.request_dialog(
         207, profile=None, faq_context=None, ai_messages=[],
     )["status"] == "blocked"
     assert operator_chat.unblock_client(207, admin)
+    assert not operator_chat.is_client_blocked(207)
+    repeated = operator_chat.decide_client_report(report_ids[-1], admin, "confirmed")
+    assert repeated["confirmed_count"] == 3
+    assert repeated["blocked"] is False
+    assert not operator_chat.is_client_blocked(207)
+    with pytest.raises(operator_chat.ReportDecisionConflictError):
+        operator_chat.decide_client_report(report_ids[-1], admin, "rejected")
+
+    historical = operator_chat.request_dialog(
+        207, profile=None, faq_context=None, ai_messages=[],
+    )
+    rejected_after_threshold = operator_chat.create_client_report(
+        historical["id"], owner, "spam", "",
+    )
+    result = operator_chat.decide_client_report(
+        rejected_after_threshold["id"], admin, "rejected",
+    )
+    assert result["confirmed_count"] == 3
+    assert result["blocked"] is False
     assert not operator_chat.is_client_blocked(207)
 
     dialog = operator_chat.request_dialog(208, profile=None, faq_context=None, ai_messages=[])
@@ -1138,6 +1218,181 @@ def test_reports_threshold_reject_idempotency_and_unblock(operator_db):
     result = operator_chat.decide_client_report(rejected["id"], admin, "rejected")
     assert result["confirmed_count"] == 0
     assert not operator_chat.is_client_blocked(208)
+
+
+def test_concurrent_report_decisions_have_one_cas_winner(operator_db):
+    _settings(max_active_dialogs=2, report_threshold=100)
+    owner = _operator("report-race-owner")
+    ok, _ = db.create_user("report-race-admin", "sufficient-password", "Admin", "admin")
+    assert ok
+    admin = db.get_user("report-race-admin")["id"]
+    operator_chat.start_shift(owner)
+    dialog = operator_chat.request_dialog(213, profile=None, faq_context=None, ai_messages=[])
+    report = operator_chat.create_client_report(dialog["id"], owner, "spam", "")
+    barrier = threading.Barrier(2)
+    outcomes = []
+
+    def decide(value):
+        barrier.wait()
+        try:
+            result = operator_chat.decide_client_report(report["id"], admin, value)
+            outcomes.append(("saved", result["status"]))
+        except operator_chat.ReportDecisionConflictError:
+            outcomes.append(("conflict", value))
+
+    threads = [
+        threading.Thread(target=decide, args=("confirmed",)),
+        threading.Thread(target=decide, args=("rejected",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len([item for item in outcomes if item[0] == "saved"]) == 1
+    assert len([item for item in outcomes if item[0] == "conflict"]) == 1
+
+
+def test_request_rechecks_block_inside_assignment_transaction(operator_db, monkeypatch):
+    _settings(max_active_dialogs=2)
+    owner = _operator("request-block-race-owner")
+    operator_chat.start_shift(owner)
+    outer_check = threading.Event()
+    monkeypatch.setattr(
+        operator_chat, "is_client_blocked",
+        lambda _chat_id: outer_check.set() or False,
+    )
+    blocker = db.get_conn()
+    blocker.execute("BEGIN IMMEDIATE")
+    blocker.execute(
+        """INSERT INTO operator_chat_blocks(chat_id,active,blocked_at)
+           VALUES(?,1,?)""",
+        (214, operator_chat.utc_now().isoformat(timespec="seconds")),
+    )
+    outcome = []
+    thread = threading.Thread(target=lambda: outcome.append(operator_chat.request_dialog(
+        214, profile=None, faq_context=None, ai_messages=[],
+    )))
+    thread.start()
+    assert outer_check.wait(timeout=2)
+    blocker.commit()
+    blocker.close()
+    thread.join(timeout=5)
+    assert outcome == [{"status": "blocked"}]
+    assert operator_chat.get_open_dialog_for_chat(214) is None
+
+
+def test_confirm_block_racing_request_leaves_no_open_dialog(operator_db):
+    _settings(max_active_dialogs=2, report_threshold=1)
+    owner = _operator("confirm-request-race-owner")
+    ok, _ = db.create_user(
+        "confirm-request-race-admin", "sufficient-password", "Admin", "admin",
+    )
+    assert ok
+    admin = db.get_user("confirm-request-race-admin")["id"]
+    operator_chat.start_shift(owner)
+    old = operator_chat.request_dialog(217, profile=None, faq_context=None, ai_messages=[])
+    report = operator_chat.create_client_report(old["id"], owner, "spam", "")
+    barrier = threading.Barrier(2)
+    failures = []
+
+    def request_again():
+        try:
+            barrier.wait()
+            operator_chat.request_dialog(217, profile=None, faq_context=None, ai_messages=[])
+        except (sqlite3.Error, ValueError, PermissionError) as exc:
+            failures.append(exc)
+
+    def confirm():
+        try:
+            barrier.wait()
+            operator_chat.decide_client_report(report["id"], admin, "confirmed")
+        except (sqlite3.Error, ValueError, PermissionError) as exc:
+            failures.append(exc)
+
+    threads = [threading.Thread(target=request_again), threading.Thread(target=confirm)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert not failures
+    assert operator_chat.is_client_blocked(217)
+    assert operator_chat.get_open_dialog_for_chat(217) is None
+
+
+def test_report_conflicts_with_in_flight_operator_reply(operator_db):
+    _settings(max_active_dialogs=2)
+    owner = _operator("report-sending-owner")
+    operator_chat.start_shift(owner)
+    dialog = operator_chat.request_dialog(215, profile=None, faq_context=None, ai_messages=[])
+    operator_chat.deliver_outbox(lambda _item: (True, None))
+    message = operator_chat.add_message(
+        dialog["id"], "operator", "in flight", user_id=owner,
+    )
+    conn = db.get_conn()
+    conn.execute(
+        "UPDATE operator_outbox SET status='sending',lease_at=? WHERE message_id=?",
+        (operator_chat.utc_now().isoformat(timespec="seconds"), message["id"]),
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(operator_chat.DeliveryInProgressError):
+        operator_chat.create_client_report(dialog["id"], owner, "spam", "")
+    assert operator_chat.get_open_dialog_for_chat(215)["status"] == "active"
+    assert operator_chat.list_client_reports() == []
+    assert operator_chat.get_outbox_item_for_message(message["id"])["status"] == "sending"
+    client = web.app.test_client()
+    _login_session(client, owner, "report-sending-owner", "operator")
+    response = client.post(
+        f"/operator-chat/api/dialogs/{dialog['id']}/report",
+        data={"reason": "spam"}, headers={"X-CSRF-Token": "csrf"},
+    )
+    assert response.status_code == 409
+    assert "сейчас отправляется" in response.json["error"]
+
+
+@pytest.mark.parametrize("delivery_result", [
+    (True, None),
+    (False, "max_http_500"),
+])
+def test_delivery_finalize_cas_does_not_overwrite_superseding_state(
+    operator_db, delivery_result,
+):
+    _settings(max_active_dialogs=2)
+    owner = _operator("delivery-cas-owner")
+    operator_chat.start_shift(owner)
+    dialog = operator_chat.request_dialog(216, profile=None, faq_context=None, ai_messages=[])
+    operator_chat.deliver_outbox(lambda _item: (True, None))
+    message = operator_chat.add_message(
+        dialog["id"], "operator", "race", user_id=owner,
+    )
+    outbox = operator_chat.get_outbox_item_for_message(message["id"])
+
+    def supersede(_item):
+        conn = db.get_conn()
+        conn.execute(
+            """UPDATE operator_outbox SET status='failed',attempts=?,next_retry_at=NULL,
+               last_error='superseded_in_test' WHERE id=?""",
+            (operator_chat.MAX_OUTBOX_ATTEMPTS, outbox["id"]),
+        )
+        conn.execute(
+            "UPDATE operator_dialogs SET status='closed',closed_at=? WHERE id=?",
+            (operator_chat.utc_now().isoformat(timespec="seconds"), dialog["id"]),
+        )
+        conn.commit()
+        conn.close()
+        return delivery_result
+
+    result = operator_chat.deliver_outbox(supersede, only_id=outbox["id"])
+    assert result[0]["status"] == "failed"
+    assert result[0]["error"] == "superseded_in_test"
+    conn = db.get_conn()
+    saved_message = conn.execute(
+        "SELECT delivery_status,delivered_at FROM operator_messages WHERE id=?",
+        (message["id"],),
+    ).fetchone()
+    conn.close()
+    assert tuple(saved_message) == ("pending", None)
 
 
 def test_report_requires_other_comment_and_valid_client_image(operator_db):
@@ -1187,6 +1442,10 @@ def test_report_admin_routes_and_expired_evidence_are_protected(operator_db, mon
         f"/operator-chat/reports/{report['id']}/confirmed",
         headers={"X-CSRF-Token": "csrf"},
     ).status_code == 200
+    assert client.post(
+        f"/operator-chat/reports/{report['id']}/rejected",
+        headers={"X-CSRF-Token": "csrf"},
+    ).status_code == 409
     evidence.unlink()
     root.rmdir()
 

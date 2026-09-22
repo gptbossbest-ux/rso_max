@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
@@ -25,9 +26,10 @@ import database as db
 
 ACTIVE_STATUSES = ("waiting", "active")
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
-MAX_IMAGE_DIMENSION = 8192
+MAX_IMAGE_DIMENSION = 7680
 MAX_IMAGE_PIXELS = 40_000_000
 MAX_OUTBOX_ATTEMPTS = 5
+MAX_IMAGE_UPLOAD_HOSTS = frozenset({"iu.oneme.ru"})
 OPERATOR_PREFIX = "Оператор: "
 MAX_OPERATOR_BODY = 4000 - len(OPERATOR_PREFIX)
 REPORT_REASONS = {
@@ -41,6 +43,34 @@ MODULE_KEYS = (
     "auth", "appeal", "appeal_status", "readings", "faq", "ai",
     "receipt", "appointment",
 )
+
+
+class ReportDecisionConflictError(ValueError):
+    """A resolved report cannot be changed to the opposite decision."""
+
+
+class DeliveryInProgressError(ValueError):
+    """The dialog has an operator reply currently crossing the MAX boundary."""
+
+
+def is_allowed_max_image_upload_url(value: Any) -> bool:
+    """Validate the documented signed MAX image-upload endpoint without logging it."""
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        parsed = urlparse(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    return bool(
+        parsed.scheme == "https"
+        and parsed.hostname
+        and parsed.hostname.lower() in MAX_IMAGE_UPLOAD_HOSTS
+        and port in {None, 443}
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.fragment
+    )
 
 
 @contextmanager
@@ -315,6 +345,12 @@ def request_dialog(
         ).fetchone()
         if not any_active:
             return {"status": "unavailable"}
+        blocked = conn.execute(
+            "SELECT 1 FROM operator_chat_blocks WHERE chat_id=? AND active=1",
+            (chat_id,),
+        ).fetchone()
+        if blocked:
+            return {"status": "blocked"}
         existing = conn.execute(
             "SELECT * FROM operator_dialogs WHERE chat_id=? AND status IN ('waiting','active')",
             (chat_id,),
@@ -658,6 +694,17 @@ def create_client_report(
         ).fetchone()
         if not dialog:
             raise PermissionError
+        sending_reply = conn.execute(
+            """SELECT 1 FROM operator_outbox o
+               JOIN operator_messages m ON m.id=o.message_id
+               WHERE o.dialog_id=? AND o.status='sending' AND m.sender='operator'
+               LIMIT 1""",
+            (dialog_id,),
+        ).fetchone()
+        if sending_reply:
+            raise DeliveryInProgressError(
+                "Ответ оператора сейчас отправляется. Повторите жалобу через несколько секунд"
+            )
         if image_message_id is not None:
             evidence = conn.execute(
                 """SELECT 1 FROM operator_messages WHERE id=? AND dialog_id=?
@@ -754,19 +801,33 @@ def decide_client_report(
         ).fetchone()
         if not report:
             raise LookupError
-        if report["status"] == "pending":
-            conn.execute(
-                """UPDATE operator_client_reports SET status=?,decided_at=?,decided_by=?
-                   WHERE id=? AND status='pending'""",
-                (decision, _iso(now), admin_id, report_id),
-            )
+        if report["status"] != "pending":
+            if report["status"] != decision:
+                raise ReportDecisionConflictError(
+                    "Решение по жалобе уже принято и не может быть изменено"
+                )
+            count = conn.execute(
+                """SELECT COUNT(*) n FROM operator_client_reports
+                   WHERE client_chat_id=? AND status='confirmed'""",
+                (report["client_chat_id"],),
+            ).fetchone()["n"]
+            result = dict(report)
+            result.update(confirmed_count=int(count), blocked=False)
+            return result
+        transitioned = conn.execute(
+            """UPDATE operator_client_reports SET status=?,decided_at=?,decided_by=?
+               WHERE id=? AND status='pending'""",
+            (decision, _iso(now), admin_id, report_id),
+        )
+        if transitioned.rowcount != 1:
+            raise ReportDecisionConflictError("Решение по жалобе уже изменилось")
         count = conn.execute(
             """SELECT COUNT(*) n FROM operator_client_reports
                WHERE client_chat_id=? AND status='confirmed'""",
             (report["client_chat_id"],),
         ).fetchone()["n"]
         blocked = False
-        if count >= int(settings["report_threshold"]):
+        if decision == "confirmed" and count >= int(settings["report_threshold"]):
             blocked = True
             conn.execute(
                 """INSERT INTO operator_chat_blocks(chat_id,active,blocked_at,blocked_by)
@@ -789,6 +850,13 @@ def decide_client_report(
                     """UPDATE operator_outbox SET status='failed',attempts=?,next_retry_at=NULL,
                        last_error='cancelled_by_block' WHERE dialog_id=? AND status!='delivered'""",
                     (MAX_OUTBOX_ATTEMPTS, dialog["id"]),
+                )
+                conn.execute(
+                    """UPDATE operator_messages SET delivery_status='failed',
+                       last_error='cancelled_by_block'
+                       WHERE dialog_id=? AND sender='operator'
+                         AND delivery_status!='delivered'""",
+                    (dialog["id"],),
                 )
         saved = conn.execute(
             "SELECT * FROM operator_client_reports WHERE id=?", (report_id,),
@@ -1017,6 +1085,7 @@ def deliver_outbox(deliver: Delivery, *, now: datetime | None = None, max_items:
     """
     now = now or utc_now()
     results: list[dict[str, Any]] = []
+    lease_value = _iso(now)
     for _ in range(max_items):
         with _connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1040,7 +1109,7 @@ def deliver_outbox(deliver: Delivery, *, now: datetime | None = None, max_items:
                 break
             claimed = conn.execute(
                 "UPDATE operator_outbox SET status='sending',lease_at=?,attempts=attempts+1 WHERE id=? AND status=?",
-                (_iso(now), row["id"], row["status"]),
+                (lease_value, row["id"], row["status"]),
             )
             if not claimed.rowcount:
                 continue
@@ -1059,13 +1128,16 @@ def deliver_outbox(deliver: Delivery, *, now: datetime | None = None, max_items:
                 if retryable and item["attempts"] < MAX_OUTBOX_ATTEMPTS else None
             )
             attempts = item["attempts"] if retry_at is not None or success else MAX_OUTBOX_ATTEMPTS
-            conn.execute(
+            finalized = conn.execute(
                 """UPDATE operator_outbox SET status=?,attempts=?,last_error=?,next_retry_at=?,
                    delivered_at=CASE WHEN ?='delivered' THEN ? ELSE delivered_at END
-                   WHERE id=? AND status='sending'""",
-                (status, attempts, None if success else safe_error, retry_at, status, _iso(now), item["id"]),
+                   WHERE id=? AND status='sending' AND lease_at=?""",
+                (
+                    status, attempts, None if success else safe_error, retry_at,
+                    status, _iso(now), item["id"], lease_value,
+                ),
             )
-            if item.get("message_id"):
+            if item.get("message_id") and finalized.rowcount == 1:
                 conn.execute(
                     """UPDATE operator_messages SET delivery_status=?,delivery_attempts=delivery_attempts+1,
                        last_error=?,delivered_at=CASE WHEN ?='delivered' THEN ? ELSE delivered_at END
@@ -1078,9 +1150,20 @@ def deliver_outbox(deliver: Delivery, *, now: datetime | None = None, max_items:
                            WHERE id=(SELECT dialog_id FROM operator_messages WHERE id=?)""",
                         (_iso(now), item["message_id"]),
                     )
+            if finalized.rowcount != 1:
+                current = conn.execute(
+                    "SELECT status,last_error,next_retry_at FROM operator_outbox WHERE id=?",
+                    (item["id"],),
+                ).fetchone()
+                status = current["status"] if current else "failed"
+                safe_error = (
+                    current["last_error"] if current and current["last_error"]
+                    else "delivery_superseded"
+                )
+                retry_at = current["next_retry_at"] if current else None
         results.append({
             "id": item["id"], "status": status,
-            "error": None if success else safe_error,
+            "error": None if status == "delivered" else safe_error,
             "retryable": bool(retry_at),
         })
         if only_id is not None:

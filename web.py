@@ -820,13 +820,15 @@ def _send_max_jpeg(
         if not token:
             meta = httpx.post(f"{API}/uploads", headers=headers, params={"type": "image"}, timeout=10)
             meta.raise_for_status()
-            upload_url = meta.json().get("url")
-            if not isinstance(upload_url, str) or not upload_url:
+            metadata = meta.json()
+            upload_url = metadata.get("url") if isinstance(metadata, dict) else None
+            if not operator_chat.is_allowed_max_image_upload_url(upload_url):
                 return False, "upload_contract"
             with open(path, "rb") as stream:
                 uploaded = httpx.post(
-                    upload_url, files={"data": ("image.jpg", stream, "image/jpeg")},
-                    timeout=30,
+                    upload_url, headers=headers,
+                    files={"data": ("image.jpg", stream, "image/jpeg")}, timeout=30,
+                    follow_redirects=False,
                 )
             uploaded.raise_for_status()
             token = operator_chat.extract_image_upload_token(uploaded.json())
@@ -1079,6 +1081,13 @@ def operator_report_client(dialog_id: int):
             except OSError:
                 pass
         abort(404)
+    except operator_chat.DeliveryInProgressError as exc:
+        if evidence_absolute:
+            try:
+                os.remove(evidence_absolute)
+            except OSError:
+                pass
+        return jsonify(ok=False, error=str(exc)), 409
     except ValueError as exc:
         if evidence_absolute:
             try:
@@ -1251,6 +1260,8 @@ def operator_report_decide(report_id: int, decision: str):
         )
     except LookupError:
         abort(404)
+    except operator_chat.ReportDecisionConflictError as exc:
+        return jsonify(ok=False, error=str(exc)), 409
     except ValueError:
         abort(400)
     return jsonify(ok=True, status=result["status"], blocked=result["blocked"])
