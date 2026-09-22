@@ -1188,6 +1188,10 @@ def test_reports_threshold_reject_idempotency_and_unblock(operator_db):
         result = operator_chat.decide_client_report(report["id"], admin, "confirmed")
         assert result["confirmed_count"] == index + 1
     assert operator_chat.is_client_blocked(207)
+    repeated_while_blocked = operator_chat.decide_client_report(
+        report_ids[-1], admin, "confirmed",
+    )
+    assert repeated_while_blocked["blocked"] is True
     assert operator_chat.request_dialog(
         207, profile=None, faq_context=None, ai_messages=[],
     )["status"] == "blocked"

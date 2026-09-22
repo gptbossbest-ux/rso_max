@@ -811,8 +811,12 @@ def decide_client_report(
                    WHERE client_chat_id=? AND status='confirmed'""",
                 (report["client_chat_id"],),
             ).fetchone()["n"]
+            active_block = conn.execute(
+                "SELECT 1 FROM operator_chat_blocks WHERE chat_id=? AND active=1",
+                (report["client_chat_id"],),
+            ).fetchone()
             result = dict(report)
-            result.update(confirmed_count=int(count), blocked=False)
+            result.update(confirmed_count=int(count), blocked=active_block is not None)
             return result
         transitioned = conn.execute(
             """UPDATE operator_client_reports SET status=?,decided_at=?,decided_by=?
