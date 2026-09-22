@@ -527,6 +527,11 @@ def _operator_profile(chat_id: int) -> dict | None:
 
 
 def _start_operator_chat(chat_id: int) -> None:
+    if operator_chat.is_client_blocked(chat_id):
+        state = _get_state(chat_id)
+        _clear_flow(state)
+        send_main_menu(chat_id, "Связь с оператором временно недоступна.")
+        return
     settings = operator_chat.get_settings()
     if not settings["enabled"] or not operator_chat.has_active_operators():
         rows = []
@@ -548,6 +553,10 @@ def _start_operator_chat(chat_id: int) -> None:
     )
     if dialog["status"] == "unavailable":
         send_message(chat_id, "Сейчас нет доступных операторов.")
+        return
+    if dialog["status"] == "blocked":
+        _clear_flow(state)
+        send_main_menu(chat_id, "Связь с оператором временно недоступна.")
         return
     if dialog["status"] == "auth_required":
         _request_ls(chat_id, "operator")
@@ -580,6 +589,10 @@ def _rate_operator(chat_id: int, dialog_id: int, rating: int) -> None:
 
 
 def _on_operator_text(chat_id: int, state: dict, text: str) -> None:
+    if operator_chat.is_client_blocked(chat_id):
+        _clear_flow(state)
+        send_main_menu(chat_id, "Связь с оператором временно недоступна.")
+        return
     dialog = operator_chat.get_open_dialog_for_chat(chat_id)
     if not dialog:
         _clear_flow(state)
@@ -590,20 +603,27 @@ def _on_operator_text(chat_id: int, state: dict, text: str) -> None:
         operator_chat.add_message(dialog["id"], "client", text)
 
 
-def _attachment_url(attachment: dict) -> str | None:
-    if attachment.get("type") not in {"image", "photo"}:
-        return None
+def _attachment_urls(attachment: dict) -> list[str]:
+    if attachment.get("type") != "image":
+        return []
     payload = attachment.get("payload") or {}
+    result: list[str] = []
     for key in ("url", "photo_url"):
         value = payload.get(key)
         if isinstance(value, str):
-            return value
+            result.append(value)
     photos = payload.get("photos")
     if isinstance(photos, dict):
         for value in photos.values():
             if isinstance(value, dict) and isinstance(value.get("url"), str):
-                return value["url"]
-    return None
+                result.append(value["url"])
+    return result
+
+
+def _attachment_url(attachment: dict) -> str | None:
+    """Compatibility helper returning the first official image URL."""
+    urls = _attachment_urls(attachment)
+    return urls[0] if urls else None
 
 
 def _is_allowed_max_image_url(value: str) -> bool:
@@ -619,12 +639,21 @@ def _is_allowed_max_image_url(value: str) -> bool:
 
 
 def _handle_operator_attachments(chat_id: int, dialog: dict, message: dict) -> None:
-    attachments = message.get("attachments") or (message.get("body") or {}).get("attachments") or []
-    image_url = next((_attachment_url(item) for item in attachments if isinstance(item, dict)), None)
-    if not image_url:
-        send_message(chat_id, "Поддерживаются только JPG-изображения до 5 МБ.")
+    if operator_chat.is_client_blocked(chat_id):
+        state = _get_state(chat_id)
+        _clear_flow(state)
+        send_main_menu(chat_id, "Связь с оператором временно недоступна.")
         return
-    if not _is_allowed_max_image_url(image_url):
+    attachments = message.get("attachments") or (message.get("body") or {}).get("attachments") or []
+    candidates = [
+        url for item in attachments if isinstance(item, dict)
+        for url in _attachment_urls(item)
+    ]
+    if not candidates:
+        send_message(chat_id, "Поддерживаются изображения JPEG, PNG и WebP до 5 МБ.")
+        return
+    image_url = next((url for url in candidates if _is_allowed_max_image_url(url)), None)
+    if not image_url:
         send_message(chat_id, "Не удалось безопасно загрузить изображение.")
         return
     try:
@@ -642,7 +671,7 @@ def _handle_operator_attachments(chat_id: int, dialog: dict, message: dict) -> N
                     raise ValueError("oversize")
             data = bytes(buffer)
             content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
-        data = operator_chat.normalize_jpeg(data, content_type)
+        data = operator_chat.normalize_image(data, content_type)
         os.makedirs(OPERATOR_CHAT_IMAGE_DIR, mode=0o700, exist_ok=True)
         name = f"{uuid.uuid4().hex}.jpg"
         path = os.path.join(OPERATOR_CHAT_IMAGE_DIR, name)
@@ -656,7 +685,7 @@ def _handle_operator_attachments(chat_id: int, dialog: dict, message: dict) -> N
             raise
     except (httpx.HTTPError, OSError, sqlite3.Error, ValueError, TypeError):
         log.warning("operator image rejected chat_id=%s", chat_id)
-        send_message(chat_id, "Не удалось принять JPG. Проверьте формат и размер до 5 МБ.")
+        send_message(chat_id, "Не удалось принять изображение. Поддерживаются JPEG, PNG и WebP до 5 МБ.")
 
 
 def _send_operator_payload(chat_id: int, body: dict) -> tuple[bool, str | None]:
@@ -689,11 +718,11 @@ def _send_operator_jpeg(
                 return False, "upload_contract"
             with open(path, "rb") as stream:
                 uploaded = httpx.post(
-                    upload_url, headers=headers,
-                    files={"data": ("image.jpg", stream, "image/jpeg")}, timeout=30,
+                    upload_url, files={"data": ("image.jpg", stream, "image/jpeg")},
+                    timeout=30,
                 )
             uploaded.raise_for_status()
-            token = uploaded.json().get("token")
+            token = operator_chat.extract_image_upload_token(uploaded.json())
             if not isinstance(token, str) or not token:
                 return False, "upload_contract"
             token = operator_chat.set_outbox_upload_token(outbox_id, token)
@@ -1244,6 +1273,12 @@ def handle_message(message: dict) -> None:
         current_state,
         len(text),
     )
+
+    if current_state == S.OPERATOR_CHAT and operator_chat.is_client_blocked(chat_id):
+        state = _get_state(chat_id)
+        _clear_flow(state)
+        send_main_menu(chat_id, "Связь с оператором временно недоступна.")
+        return
 
     open_dialog = operator_chat.get_open_dialog_for_chat(chat_id)
     if open_dialog:

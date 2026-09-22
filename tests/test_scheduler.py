@@ -140,6 +140,27 @@ def test_ai_cleanup_runs_on_scheduler_creation_and_then_hourly():
     )
 
 
+def test_operator_maintenance_runs_every_ten_seconds():
+    instance = Mock()
+    factory = Mock(return_value=instance)
+    maintenance = Mock()
+    deps = _dependencies(factory)
+    deps = scheduler_module.SchedulerDependencies(
+        **{**deps.__dict__, "operator_chat_maintenance": maintenance}
+    )
+
+    scheduler_module.create_scheduler(deps)
+
+    assert instance.add_job.call_args_list[-1] == call(
+        maintenance,
+        trigger="interval",
+        seconds=10,
+        id="operator_chat_maintenance",
+        max_instances=1,
+        misfire_grace_time=30,
+    )
+
+
 def test_real_scheduler_applies_default_coalesce_and_exact_triggers():
     deps = _dependencies(BackgroundScheduler)
     instance = scheduler_module.create_scheduler(deps)

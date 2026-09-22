@@ -24,6 +24,12 @@ def _jpeg_bytes(size=(2, 2)) -> bytes:
     return output.getvalue()
 
 
+def _image_bytes(format_name: str, size=(2, 2)) -> bytes:
+    output = BytesIO()
+    Image.new("RGBA", size, (255, 0, 0, 180)).save(output, format=format_name)
+    return output.getvalue()
+
+
 @pytest.fixture()
 def operator_db(monkeypatch):
     path = os.path.abspath(f".operator-test-{uuid.uuid4().hex}.sqlite")
@@ -48,10 +54,14 @@ def _settings(**overrides):
         "enabled": True,
         "require_auth": False,
         "heartbeat_timeout_min": 5,
+        "heartbeat_timeout_sec": 30,
+        "reconnect_grace_sec": 120,
         "max_active_dialogs": 1,
         "inactivity_timeout_min": 30,
         "warning_before_min": 5,
         "retention_days": 30,
+        "report_threshold": 3,
+        "evidence_retention_days": 30,
     }
     values.update(overrides)
     operator_chat.update_settings(**values)
@@ -361,6 +371,21 @@ def test_migration_preserves_pre_delivery_messages(monkeypatch):
         assert {"delivery_status", "delivery_attempts", "last_error", "cleanup_pending"} <= columns
         outbox_columns = {row[1] for row in conn.execute("PRAGMA table_info(operator_outbox)")}
         assert {"dialog_id", "upload_token"} <= outbox_columns
+        settings_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(operator_chat_settings)")
+        }
+        assert {
+            "heartbeat_timeout_sec", "reconnect_grace_sec", "report_threshold",
+            "evidence_retention_days",
+        } <= settings_columns
+        dialog_columns = {row[1] for row in conn.execute("PRAGMA table_info(operator_dialogs)")}
+        assert "reassignment_pending" in dialog_columns
+        tables = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert {"operator_client_reports", "operator_chat_blocks"} <= tables
         assert conn.execute("SELECT dialog_id FROM operator_messages WHERE id=1").fetchone()[0] == 99
         conn.close()
     finally:
@@ -446,7 +471,7 @@ def test_official_max_attachment_contract_and_redirect_rejection(monkeypatch):
     monkeypatch.setattr(bot.httpx, "stream", lambda *_args, **_kwargs: Stream(302))
     monkeypatch.setattr(bot.operator_chat, "add_message", lambda *_args, **_kwargs: pytest.fail("redirect followed"))
     bot._handle_operator_attachments(1, {"id": 2}, {"attachments": [attachment]})
-    assert send and "Не удалось принять JPG" in send[-1]
+    assert send and "Не удалось принять изображение" in send[-1]
 
 
 def test_inbound_jpeg_db_failure_removes_saved_file(monkeypatch):
@@ -518,25 +543,11 @@ def test_failed_requeue_blocks_later_assignment_notification(operator_db, monkey
         "SELECT * FROM operator_outbox WHERE dialog_id=? ORDER BY id", (dialog["id"],),
     ).fetchall()
     conn.close()
-    requeue, assigned = dict(rows[-2]), dict(rows[-1])
-    assert "направляем вас" in requeue["body"]
-    assert assigned["body"] == "👨‍💻 Оператор подключился к диалогу. Напишите ваш вопрос."
-    assert operator_chat.deliver_outbox(
-        lambda _item: pytest.fail("later event overtook"), now=later, only_id=assigned["id"],
-    ) == []
-    operator_chat.deliver_outbox(
-        lambda _item: (False, "max_http_500"), now=later, only_id=requeue["id"],
-    )
-    assert operator_chat.deliver_outbox(
-        lambda _item: pytest.fail("later event overtook retry"),
-        now=later + timedelta(seconds=3), only_id=assigned["id"],
-    ) == []
-    assert operator_chat.deliver_outbox(
-        lambda _item: (True, None), now=later + timedelta(seconds=3), only_id=requeue["id"],
-    )[0]["status"] == "delivered"
+    assigned = dict(rows[-1])
+    assert "направили вас к другому оператору" in assigned["body"]
     delivered = operator_chat.deliver_outbox(
-        lambda item: (item["id"] == assigned["id"], None),
-        now=later + timedelta(seconds=3), only_id=assigned["id"],
+        lambda item: (item["id"] == assigned["id"], None), now=later,
+        only_id=assigned["id"],
     )
     assert delivered[0]["status"] == "delivered"
 
@@ -828,3 +839,373 @@ def test_image_outbox_reuses_persisted_upload_token(operator_db, monkeypatch):
     finally:
         image.unlink(missing_ok=True)
         root.rmdir()
+
+
+@pytest.mark.parametrize("format_name", ["JPEG", "PNG", "WEBP"])
+def test_supported_images_are_content_decoded_and_stored_as_jpeg(format_name):
+    source = _jpeg_bytes() if format_name == "JPEG" else _image_bytes(format_name)
+    normalized = operator_chat.normalize_image(source, "application/octet-stream")
+    with Image.open(BytesIO(normalized)) as decoded:
+        assert decoded.format == "JPEG"
+        assert decoded.size == (2, 2)
+
+
+def test_max_image_upload_contract_accepts_nested_photo_token(monkeypatch):
+    path = Path(f".operator-contract-{uuid.uuid4().hex}.jpg")
+    path.write_bytes(_jpeg_bytes())
+
+    class Response:
+        def __init__(self, payload, status=200):
+            self._payload = payload
+            self.status_code = status
+
+        def json(self):
+            return self._payload
+
+        def raise_for_status(self):
+            assert self.status_code == 200
+
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs))
+        if url.endswith("/uploads"):
+            return Response({"url": "https://iu.oneme.ru/uploadImage?unchanged=1"})
+        if url.startswith("https://iu.oneme.ru"):
+            assert set(kwargs["files"]) == {"data"}
+            name, _stream, content_type = kwargs["files"]["data"]
+            assert name == "image.jpg"
+            assert content_type == "image/jpeg"
+            assert "headers" not in kwargs
+            return Response({"photos": {"photo-id": {"token": "nested-token"}}})
+        assert kwargs["params"] == {"chat_id": 101}
+        assert kwargs["json"]["attachments"] == [
+            {"type": "image", "payload": {"token": "nested-token"}},
+        ]
+        return Response({})
+
+    monkeypatch.setattr(httpx, "post", post)
+    try:
+        assert web._send_max_jpeg(101, str(path), "caption") == (True, None)
+        assert calls[0][1]["params"] == {"type": "image"}
+        assert calls[0][1]["headers"] == {"Authorization": web.TOKEN}
+        assert calls[1][0] == "https://iu.oneme.ru/uploadImage?unchanged=1"
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_bot_max_image_upload_contract_accepts_nested_photo_token(monkeypatch):
+    path = Path(f".operator-bot-contract-{uuid.uuid4().hex}.jpg")
+    path.write_bytes(_jpeg_bytes())
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+        def raise_for_status(self):
+            return None
+
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs))
+        if url.endswith("/uploads"):
+            return Response({"url": "https://iu.oneme.ru/uploadImage?signature=kept"})
+        if url.startswith("https://iu.oneme.ru"):
+            assert set(kwargs["files"]) == {"data"}
+            assert "headers" not in kwargs
+            return Response({"photos": {"photo-id": {"token": "bot-nested-token"}}})
+        assert kwargs["json"]["attachments"] == [
+            {"type": "image", "payload": {"token": "bot-nested-token"}},
+        ]
+        return Response({})
+
+    monkeypatch.setattr(bot.httpx, "post", post)
+    monkeypatch.setattr(
+        operator_chat, "set_outbox_upload_token", lambda outbox_id, token: token,
+    )
+    try:
+        assert bot._send_operator_jpeg(
+            102, str(path), "caption", outbox_id=99, upload_token=None,
+        ) == (True, None)
+        assert calls[0][1]["params"] == {"type": "image"}
+        assert calls[0][1]["headers"] == {"Authorization": bot.TOKEN}
+        assert calls[1][0] == "https://iu.oneme.ru/uploadImage?signature=kept"
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_inbound_png_uses_allowed_candidate_and_is_saved_as_jpeg(operator_db, monkeypatch):
+    _settings(require_auth=False)
+    owner = _operator("inbound-png")
+    operator_chat.start_shift(owner)
+    dialog = operator_chat.request_dialog(201, profile=None, faq_context=None, ai_messages=[])
+    source = _image_bytes("PNG")
+    root = Path(f".operator-inbound-{uuid.uuid4().hex}")
+    root.mkdir()
+    allowed = "https://iu.oneme.ru/image"
+
+    class Stream:
+        def __init__(self):
+            self.status_code = 200
+            self.headers = {
+                "content-type": "image/png", "content-length": str(len(source)),
+            }
+            self.request = httpx.Request("GET", allowed)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def iter_bytes(self, _size):
+            yield source
+
+    monkeypatch.setattr(bot, "OPERATOR_CHAT_IMAGE_DIR", str(root))
+    monkeypatch.setattr(bot.httpx, "stream", lambda *_args, **kwargs: Stream())
+    monkeypatch.setattr(bot, "send_message", lambda *_args: pytest.fail("valid image rejected"))
+    try:
+        bot._handle_operator_attachments(201, dialog, {"attachments": [{
+            "type": "image", "payload": {"url": "https://evil.test/x", "photos": {
+                "full": {"url": allowed},
+            }},
+        }]})
+        saved = next(root.glob("*.jpg"))
+        with Image.open(saved) as decoded:
+            assert decoded.format == "JPEG"
+        rows = operator_chat.list_messages(dialog["id"], owner)
+        assert any(row["sender"] == "client" and row["image_path"] == saved.name for row in rows)
+    finally:
+        for item in root.glob("*.jpg"):
+            item.unlink()
+        root.rmdir()
+
+
+def test_delete_undelivered_image_enforces_owner_state_and_unblocks_close(operator_db):
+    _settings(max_active_dialogs=2)
+    owner, other = _operator("delete-owner"), _operator("delete-other")
+    operator_chat.start_shift(owner)
+    dialog = operator_chat.request_dialog(202, profile=None, faq_context=None, ai_messages=[])
+    operator_chat.deliver_outbox(lambda _item: (True, None))
+    message = operator_chat.add_message(
+        dialog["id"], "operator", "photo", user_id=owner, image_path="pending.jpg",
+    )
+    with pytest.raises(PermissionError):
+        operator_chat.delete_undelivered_image(message["id"], other)
+    assert operator_chat.delete_undelivered_image(message["id"], owner) == "pending.jpg"
+    assert operator_chat.get_outbox_item_for_message(message["id"]) is None
+    assert operator_chat.close_dialog(dialog["id"], owner) == 202
+
+
+def test_delete_image_rejects_delivered_and_in_flight_messages(operator_db):
+    _settings(max_active_dialogs=2)
+    owner = _operator("delete-state-owner")
+    operator_chat.start_shift(owner)
+    dialog = operator_chat.request_dialog(211, profile=None, faq_context=None, ai_messages=[])
+    operator_chat.deliver_outbox(lambda _item: (True, None))
+    delivered = operator_chat.add_message(
+        dialog["id"], "operator", "delivered", user_id=owner, image_path="done.jpg",
+    )
+    operator_chat.deliver_outbox(lambda _item: (True, None))
+    with pytest.raises(ValueError, match="Доставленное"):
+        operator_chat.delete_undelivered_image(delivered["id"], owner)
+
+    sending = operator_chat.add_message(
+        dialog["id"], "operator", "sending", user_id=owner, image_path="sending.jpg",
+    )
+    conn = db.get_conn()
+    conn.execute(
+        "UPDATE operator_outbox SET status='sending' WHERE message_id=?", (sending["id"],),
+    )
+    conn.commit()
+    conn.close()
+    with pytest.raises(ValueError, match="сейчас отправляется"):
+        operator_chat.delete_undelivered_image(sending["id"], owner)
+
+
+def test_delete_image_web_route_csrf_and_idor(operator_db, monkeypatch):
+    _settings(max_active_dialogs=2)
+    owner, other = _operator("delete-web-owner"), _operator("delete-web-other")
+    operator_chat.start_shift(owner)
+    dialog = operator_chat.request_dialog(203, profile=None, faq_context=None, ai_messages=[])
+    operator_chat.deliver_outbox(lambda _item: (True, None))
+    root = Path(f".operator-delete-{uuid.uuid4().hex}")
+    root.mkdir()
+    image = root / "pending.jpg"
+    image.write_bytes(_jpeg_bytes())
+    message = operator_chat.add_message(
+        dialog["id"], "operator", "photo", user_id=owner, image_path=image.name,
+    )
+    monkeypatch.setattr(web, "OPERATOR_CHAT_IMAGE_DIR", str(root))
+    client = web.app.test_client()
+    _login_session(client, owner, "delete-web-owner", "operator")
+    assert client.post(f"/operator-chat/api/messages/{message['id']}/delete").status_code == 400
+    _login_session(client, other, "delete-web-other", "operator")
+    assert client.post(
+        f"/operator-chat/api/messages/{message['id']}/delete",
+        headers={"X-CSRF-Token": "csrf"},
+    ).status_code == 404
+    _login_session(client, owner, "delete-web-owner", "operator")
+    assert client.post(
+        f"/operator-chat/api/messages/{message['id']}/delete",
+        headers={"X-CSRF-Token": "csrf"},
+    ).status_code == 200
+    assert not image.exists()
+    root.rmdir()
+
+
+def test_reconnect_within_grace_preserves_owner_then_reassigns_after_grace(operator_db, monkeypatch):
+    _settings(
+        max_active_dialogs=1, heartbeat_timeout_sec=30, reconnect_grace_sec=120,
+    )
+    first, second = _operator("grace-first"), _operator("grace-second")
+    base = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(first, now=base)
+    dialog = operator_chat.request_dialog(204, profile=None, faq_context=None, ai_messages=[], now=base)
+    operator_chat.deliver_outbox(lambda _item: (True, None), now=base)
+    operator_chat.start_shift(second, now=base + timedelta(seconds=31))
+    assert not operator_chat.process_timeouts(now=base + timedelta(seconds=149))["requeued"]
+    assert operator_chat.get_open_dialog_for_chat(204)["operator_id"] == first
+    operator_chat.heartbeat(first, now=base + timedelta(seconds=149))
+    assert not operator_chat.process_timeouts(now=base + timedelta(seconds=151))["requeued"]
+    assert operator_chat.get_open_dialog_for_chat(204)["operator_id"] == first
+    operator_chat.heartbeat(second, now=base + timedelta(seconds=301))
+    monkeypatch.setattr(operator_chat.random, "choice", lambda values: max(values))
+    events = operator_chat.process_timeouts(now=base + timedelta(seconds=301))
+    assert events["requeued"] and events["assigned"][0]["operator_id"] == second
+    assert operator_chat.get_open_dialog_for_chat(204)["id"] == dialog["id"]
+
+
+def test_transfer_all_ends_shift_and_reassigns_atomically(operator_db, monkeypatch):
+    _settings(max_active_dialogs=3)
+    first, second = _operator("transfer-first"), _operator("transfer-second")
+    now = operator_chat.utc_now()
+    operator_chat.start_shift(first, now=now)
+    monkeypatch.setattr(operator_chat.random, "choice", lambda values: min(values))
+    dialogs = [
+        operator_chat.request_dialog(chat_id, profile=None, faq_context=None, ai_messages=[], now=now)
+        for chat_id in (205, 206)
+    ]
+    assert all(dialog["operator_id"] == first for dialog in dialogs)
+    operator_chat.start_shift(second, now=now)
+    transferred = operator_chat.transfer_all_dialogs(first, now=now + timedelta(seconds=1))
+    assert transferred == [dialog["id"] for dialog in dialogs]
+    conn = db.get_conn()
+    assert conn.execute("SELECT active FROM operator_shifts WHERE user_id=?", (first,)).fetchone()[0] == 0
+    conn.close()
+    assigned = operator_chat.assign_waiting(now=now + timedelta(seconds=1))
+    assert {row["operator_id"] for row in assigned} == {second}
+
+
+def test_reports_threshold_reject_idempotency_and_unblock(operator_db):
+    _settings(max_active_dialogs=2, report_threshold=3)
+    owner, other = _operator("report-owner"), _operator("report-other")
+    ok, _ = db.create_user("report-admin", "sufficient-password", "Admin", "admin")
+    assert ok
+    admin = db.get_user("report-admin")["id"]
+    operator_chat.start_shift(owner)
+    report_ids = []
+    for index in range(3):
+        dialog = operator_chat.request_dialog(
+            207, profile=None, faq_context=None, ai_messages=[],
+        )
+        operator_chat.add_message(dialog["id"], "client", f"spam {index}")
+        with pytest.raises(PermissionError):
+            operator_chat.create_client_report(dialog["id"], other, "spam", "")
+        report = operator_chat.create_client_report(dialog["id"], owner, "spam", "")
+        report_ids.append(report["id"])
+        assert report["status"] == "pending"
+        assert not operator_chat.is_client_blocked(207)
+        result = operator_chat.decide_client_report(report["id"], admin, "confirmed")
+        assert result["confirmed_count"] == index + 1
+    assert operator_chat.is_client_blocked(207)
+    repeated = operator_chat.decide_client_report(report_ids[-1], admin, "confirmed")
+    assert repeated["confirmed_count"] == 3
+    assert operator_chat.request_dialog(
+        207, profile=None, faq_context=None, ai_messages=[],
+    )["status"] == "blocked"
+    assert operator_chat.unblock_client(207, admin)
+    assert not operator_chat.is_client_blocked(207)
+
+    dialog = operator_chat.request_dialog(208, profile=None, faq_context=None, ai_messages=[])
+    rejected = operator_chat.create_client_report(dialog["id"], owner, "other", "контекст")
+    result = operator_chat.decide_client_report(rejected["id"], admin, "rejected")
+    assert result["confirmed_count"] == 0
+    assert not operator_chat.is_client_blocked(208)
+
+
+def test_report_requires_other_comment_and_valid_client_image(operator_db):
+    _settings(max_active_dialogs=2)
+    owner = _operator("report-validation")
+    operator_chat.start_shift(owner)
+    dialog = operator_chat.request_dialog(209, profile=None, faq_context=None, ai_messages=[])
+    with pytest.raises(ValueError, match="обязателен"):
+        operator_chat.create_client_report(dialog["id"], owner, "other", "")
+    operator_image = operator_chat.add_message(
+        dialog["id"], "operator", "x", user_id=owner, image_path="operator.jpg",
+    )
+    with pytest.raises(ValueError, match="не относится"):
+        operator_chat.create_client_report(
+            dialog["id"], owner, "unwanted_image", "", image_message_id=operator_image["id"],
+        )
+
+
+def test_report_admin_routes_and_expired_evidence_are_protected(operator_db, monkeypatch):
+    _settings(max_active_dialogs=2, evidence_retention_days=30)
+    owner, other = _operator("report-route-owner"), _operator("report-route-other")
+    ok, _ = db.create_user("report-route-admin", "sufficient-password", "Admin", "admin")
+    assert ok
+    admin = db.get_user("report-route-admin")["id"]
+    old = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    operator_chat.start_shift(owner, now=old)
+    dialog = operator_chat.request_dialog(210, profile=None, faq_context=None, ai_messages=[], now=old)
+    root = Path(f".operator-evidence-{uuid.uuid4().hex}")
+    root.mkdir()
+    evidence = root / "report-proof.jpg"
+    evidence.write_bytes(_jpeg_bytes())
+    report = operator_chat.create_client_report(
+        dialog["id"], owner, "spam", "", evidence_path=evidence.name, now=old,
+    )
+    monkeypatch.setattr(web, "OPERATOR_CHAT_IMAGE_DIR", str(root))
+    client = web.app.test_client()
+    _login_session(client, other, "report-route-other", "operator")
+    assert client.get("/operator-chat/reports").status_code == 302
+    _login_session(client, admin, "report-route-admin", "admin")
+    assert client.get("/operator-chat/reports").status_code == 200
+    assert client.get(f"/operator-chat/reports/{report['id']}").status_code == 200
+    assert client.get(f"/operator-chat/reports/{report['id']}/evidence").status_code == 404
+    assert client.post(
+        f"/operator-chat/reports/{report['id']}/confirmed",
+    ).status_code == 400
+    assert client.post(
+        f"/operator-chat/reports/{report['id']}/confirmed",
+        headers={"X-CSRF-Token": "csrf"},
+    ).status_code == 200
+    evidence.unlink()
+    root.rmdir()
+
+
+def test_blocked_client_stale_operator_flow_is_cleared(operator_db, monkeypatch):
+    _settings(max_active_dialogs=2, report_threshold=1)
+    owner = _operator("blocked-flow-owner")
+    ok, _ = db.create_user("blocked-flow-admin", "sufficient-password", "Admin", "admin")
+    assert ok
+    admin = db.get_user("blocked-flow-admin")["id"]
+    operator_chat.start_shift(owner)
+    dialog = operator_chat.request_dialog(212, profile=None, faq_context=None, ai_messages=[])
+    report = operator_chat.create_client_report(dialog["id"], owner, "spam", "")
+    operator_chat.decide_client_report(report["id"], admin, "confirmed")
+    state = bot._get_state(212)
+    state["state"] = bot.S.OPERATOR_CHAT
+    messages = []
+    monkeypatch.setattr(bot, "send_message", lambda chat_id, text, **_kwargs: messages.append((chat_id, text)))
+    monkeypatch.setattr(bot, "send_main_menu", lambda chat_id, text=None: messages.append((chat_id, text)))
+    bot._on_operator_text(212, state, "stale text")
+    assert state.get("state") == bot.S.MENU
+    assert messages[-1] == (212, "Связь с оператором временно недоступна.")

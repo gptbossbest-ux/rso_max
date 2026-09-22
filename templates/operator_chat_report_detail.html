@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Жалоба №{{ report.id }}{% endblock %}
+{% block content %}
+<h1>Жалоба №{{ report.id }}</h1>
+<div class="card"><div class="card-body"><p><b>Статус:</b> {{ report.status }}</p><p><b>Оператор:</b> {{ report.operator_name or '—' }}</p><p><b>MAX ID:</b> {{ report.client_chat_id }}</p><p><b>Причина:</b> {{ reasons.get(report.reason, report.reason) }}</p><p><b>Комментарий:</b> {{ report.comment or '—' }}</p>{% if report.evidence_path %}<p><img src="{{ url_for('operator_report_evidence', report_id=report.id) }}" style="max-width:420px"></p>{% endif %}</div></div>
+<div class="card"><div class="card-header">Снимок переписки</div><div class="card-body">{% for m in snapshot %}<p><b>{{ m.sender }}</b>: {{ m.body or ('[изображение]' if m.message_type == 'image' else '') }}</p>{% endfor %}</div></div>
+{% if report.status == 'pending' %}<button class="btn btn-danger" onclick="decide('confirmed')">Подтвердить</button> <button class="btn btn-secondary" onclick="decide('rejected')">Отклонить</button>{% endif %}
+<script>const csrf={{ csrf_token|tojson }};async function decide(value){if(!confirm('Сохранить решение?'))return;const r=await fetch(`/operator-chat/reports/{{ report.id }}/${value}`,{method:'POST',headers:{'X-CSRF-Token':csrf}});if(r.ok)location.reload();else alert('Не удалось сохранить решение.')}</script>
+{% endblock %}

@@ -30,6 +30,13 @@ MAX_IMAGE_PIXELS = 40_000_000
 MAX_OUTBOX_ATTEMPTS = 5
 OPERATOR_PREFIX = "Оператор: "
 MAX_OPERATOR_BODY = 4000 - len(OPERATOR_PREFIX)
+REPORT_REASONS = {
+    "unwanted_image": "Нежелательное изображение",
+    "insults": "Оскорбления",
+    "spam": "Спам",
+    "irrelevant_image": "Изображение не относится к вопросу",
+    "other": "Другое",
+}
 MODULE_KEYS = (
     "auth", "appeal", "appeal_status", "readings", "faq", "ai",
     "receipt", "appointment",
@@ -94,19 +101,25 @@ def get_settings() -> dict[str, Any]:
 
 
 def update_settings(**values: Any) -> None:
+    current = get_settings()
     numeric = {
         "heartbeat_timeout_min": (1, 60),
+        "heartbeat_timeout_sec": (10, 120),
+        "reconnect_grace_sec": (30, 900),
         "max_active_dialogs": (1, 50),
         "inactivity_timeout_min": (5, 1440),
         "warning_before_min": (1, 1439),
         "retention_days": (1, 3650),
+        "report_threshold": (1, 100),
+        "evidence_retention_days": (1, 3650),
     }
     clean: dict[str, Any] = {
         "enabled": int(bool(values["enabled"])),
         "require_auth": int(bool(values["require_auth"])),
     }
     for key, (low, high) in numeric.items():
-        value = int(values[key])
+        raw = values.get(key)
+        value = int(current[key] if raw is None else raw)
         if not low <= value <= high:
             raise ValueError(f"{key}: допустимое значение {low}–{high}")
         clean[key] = value
@@ -116,9 +129,13 @@ def update_settings(**values: Any) -> None:
         conn.execute(
             """UPDATE operator_chat_settings SET enabled=:enabled,
                require_auth=:require_auth, heartbeat_timeout_min=:heartbeat_timeout_min,
+               heartbeat_timeout_sec=:heartbeat_timeout_sec,
+               reconnect_grace_sec=:reconnect_grace_sec,
                max_active_dialogs=:max_active_dialogs,
                inactivity_timeout_min=:inactivity_timeout_min,
-               warning_before_min=:warning_before_min, retention_days=:retention_days
+               warning_before_min=:warning_before_min, retention_days=:retention_days,
+               report_threshold=:report_threshold,
+               evidence_retention_days=:evidence_retention_days
                WHERE id=1""",
             clean,
         )
@@ -152,7 +169,23 @@ def update_module_settings(values: dict[str, bool]) -> None:
 
 
 def _fresh_cutoff(settings: dict[str, Any], now: datetime) -> str:
-    return _iso(now - timedelta(minutes=int(settings["heartbeat_timeout_min"])))
+    return _iso(now - timedelta(seconds=int(settings["heartbeat_timeout_sec"])))
+
+
+def _requeue_cutoff(settings: dict[str, Any], now: datetime) -> str:
+    seconds = int(settings["heartbeat_timeout_sec"]) + int(settings["reconnect_grace_sec"])
+    return _iso(now - timedelta(seconds=seconds))
+
+
+def is_client_blocked(chat_id: int) -> bool:
+    try:
+        with _connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM operator_chat_blocks WHERE chat_id=? AND active=1", (chat_id,),
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return False
+    return row is not None
 
 
 def has_active_operators(now: datetime | None = None) -> bool:
@@ -208,6 +241,38 @@ def end_shift(user_id: int, now: datetime | None = None) -> None:
         )
 
 
+def transfer_all_dialogs(user_id: int, now: datetime | None = None) -> list[int]:
+    """Atomically end a shift and return all assigned dialogs to FIFO."""
+    now = now or utc_now()
+    with _connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        role = conn.execute("SELECT role FROM users WHERE id=?", (user_id,)).fetchone()
+        if not role or role["role"] != "operator":
+            raise PermissionError
+        rows = conn.execute(
+            "SELECT id FROM operator_dialogs WHERE operator_id=? AND status='active' ORDER BY id",
+            (user_id,),
+        ).fetchall()
+        next_seq = int(conn.execute(
+            "SELECT COALESCE(MAX(queue_seq),0)+1 n FROM operator_dialogs"
+        ).fetchone()["n"])
+        ids: list[int] = []
+        for offset, row in enumerate(rows):
+            dialog_id = int(row["id"])
+            conn.execute(
+                """UPDATE operator_dialogs SET status='waiting',operator_id=NULL,queue_seq=?,
+                   assigned_at=NULL,warned_at=NULL,last_activity_at=?,reassignment_pending=1
+                   WHERE id=? AND operator_id=? AND status='active'""",
+                (next_seq + offset, _iso(now), dialog_id, user_id),
+            )
+            ids.append(dialog_id)
+        conn.execute(
+            "UPDATE operator_shifts SET active=0,ended_at=? WHERE user_id=?",
+            (_iso(now), user_id),
+        )
+    return ids
+
+
 def _choose_operator(conn: Any, settings: dict[str, Any], now: datetime) -> int | None:
     rows = conn.execute(
         """SELECT u.id, COUNT(d.id) load FROM users u
@@ -234,6 +299,8 @@ def request_dialog(
 ) -> dict[str, Any]:
     now = now or utc_now()
     settings = get_settings()
+    if is_client_blocked(chat_id):
+        return {"status": "blocked"}
     if not settings["enabled"] or not has_active_operators(now):
         return {"status": "unavailable"}
     authenticated = bool(profile and profile.get("ls"))
@@ -332,9 +399,11 @@ def assign_waiting(now: datetime | None = None) -> list[dict[str, Any]]:
             operator_id = _choose_operator(conn, settings, now)
             if not waiting or not operator_id:
                 break
+            was_reassignment = bool(waiting["reassignment_pending"])
             cur = conn.execute(
                 """UPDATE operator_dialogs SET status='active',operator_id=?,assigned_at=?,
-                   last_activity_at=?,warned_at=NULL WHERE id=? AND status='waiting'""",
+                   last_activity_at=?,warned_at=NULL,reassignment_pending=0
+                   WHERE id=? AND status='waiting'""",
                 (operator_id, _iso(now), _iso(now), waiting["id"]),
             )
             if not cur.rowcount:
@@ -342,7 +411,12 @@ def assign_waiting(now: datetime | None = None) -> list[dict[str, Any]]:
             conn.execute(
                 "INSERT INTO operator_messages(dialog_id,sender,message_type,body,created_at) "
                 "VALUES(?,'system','text',?,?)",
-                (waiting["id"], "Оператор подключился к диалогу.", _iso(now)),
+                (
+                    waiting["id"],
+                    "Оператор сменился и подключился к диалогу."
+                    if was_reassignment else "Оператор подключился к диалогу.",
+                    _iso(now),
+                ),
             )
             assignment_no = conn.execute(
                 "SELECT COUNT(*) n FROM operator_messages WHERE dialog_id=? AND sender='system'",
@@ -351,7 +425,13 @@ def assign_waiting(now: datetime | None = None) -> list[dict[str, Any]]:
             _enqueue_outbox_locked(
                 conn, event_key=f"dialog:{waiting['id']}:assigned:{assignment_no}",
                 dialog_id=waiting["id"], chat_id=waiting["chat_id"], kind="text",
-                body="👨‍💻 Оператор подключился к диалогу. Напишите ваш вопрос.", now=now,
+                body=(
+                    "Извините, оператор не на связи, мы направили вас к другому оператору. "
+                    "Напишите ваш вопрос."
+                    if was_reassignment else
+                    "👨‍💻 Оператор подключился к диалогу. Напишите ваш вопрос."
+                ),
+                now=now,
             )
             assigned.append({"dialog_id": waiting["id"], "chat_id": waiting["chat_id"], "operator_id": operator_id})
     return assigned
@@ -429,6 +509,18 @@ def get_dialog_for_operator(dialog_id: int, user_id: int) -> dict[str, Any] | No
         row = conn.execute(
             "SELECT * FROM operator_dialogs WHERE id=? AND operator_id=? AND status='active'",
             (dialog_id, user_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_reportable_image(dialog_id: int, user_id: int, message_id: int) -> dict[str, Any] | None:
+    with _connection() as conn:
+        row = conn.execute(
+            """SELECT m.* FROM operator_messages m
+               JOIN operator_dialogs d ON d.id=m.dialog_id
+               WHERE m.id=? AND m.dialog_id=? AND m.sender='client'
+                 AND m.message_type='image' AND d.operator_id=? AND d.status='active'""",
+            (message_id, dialog_id, user_id),
         ).fetchone()
     return dict(row) if row else None
 
@@ -537,6 +629,195 @@ def list_history_messages(dialog_id: int) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def create_client_report(
+    dialog_id: int,
+    operator_id: int,
+    reason: str,
+    comment: str | None,
+    *,
+    image_message_id: int | None = None,
+    evidence_path: str | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Close an assigned dialog and create a pending, immutable report snapshot."""
+    reason = reason.strip()
+    comment = (comment or "").strip()
+    if reason not in REPORT_REASONS:
+        raise ValueError("Неизвестная причина жалобы")
+    if reason == "other" and not comment:
+        raise ValueError("Для причины «Другое» обязателен комментарий")
+    if len(comment) > 2000:
+        raise ValueError("Комментарий слишком длинный")
+    now = now or utc_now()
+    with _connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        dialog = conn.execute(
+            """SELECT * FROM operator_dialogs
+               WHERE id=? AND operator_id=? AND status='active'""",
+            (dialog_id, operator_id),
+        ).fetchone()
+        if not dialog:
+            raise PermissionError
+        if image_message_id is not None:
+            evidence = conn.execute(
+                """SELECT 1 FROM operator_messages WHERE id=? AND dialog_id=?
+                   AND sender='client' AND message_type='image'""",
+                (image_message_id, dialog_id),
+            ).fetchone()
+            if not evidence:
+                raise ValueError("Изображение не относится к этому диалогу")
+        messages = conn.execute(
+            """SELECT id,sender,message_type,body,created_at FROM operator_messages
+               WHERE dialog_id=? ORDER BY id DESC LIMIT 20""",
+            (dialog_id,),
+        ).fetchall()
+        snapshot = [dict(row) for row in reversed(messages)]
+        cur = conn.execute(
+            """INSERT INTO operator_client_reports
+               (dialog_id,operator_id,client_chat_id,reason,comment,image_message_id,
+                evidence_path,snapshot_json,status,created_at)
+               VALUES(?,?,?,?,?,?,?,?, 'pending',?)""",
+            (
+                dialog_id, operator_id, dialog["chat_id"], reason, comment or None,
+                image_message_id, evidence_path,
+                json.dumps(snapshot, ensure_ascii=False), _iso(now),
+            ),
+        )
+        report_id = int(cur.lastrowid)
+        conn.execute(
+            "UPDATE operator_dialogs SET status='closed',closed_at=?,closed_by=? WHERE id=?",
+            (_iso(now), operator_id, dialog_id),
+        )
+        conn.execute(
+            """UPDATE operator_outbox SET status='failed',attempts=?,next_retry_at=NULL,
+               last_error='cancelled_by_report' WHERE dialog_id=? AND status!='delivered'""",
+            (MAX_OUTBOX_ATTEMPTS, dialog_id),
+        )
+        conn.execute(
+            """UPDATE operator_messages SET delivery_status='failed',last_error='cancelled_by_report'
+               WHERE dialog_id=? AND sender='operator' AND delivery_status!='delivered'""",
+            (dialog_id,),
+        )
+        _enqueue_outbox_locked(
+            conn, event_key=f"report:{report_id}:closed", dialog_id=dialog_id,
+            chat_id=dialog["chat_id"], kind="text",
+            body="Диалог с оператором завершён.", now=now,
+        )
+        row = conn.execute(
+            "SELECT * FROM operator_client_reports WHERE id=?", (report_id,),
+        ).fetchone()
+    return dict(row)
+
+
+def list_client_reports(status: str | None = None) -> list[dict[str, Any]]:
+    params: tuple[Any, ...] = ()
+    where = ""
+    if status in {"pending", "confirmed", "rejected"}:
+        where = "WHERE r.status=?"
+        params = (status,)
+    with _connection() as conn:
+        rows = conn.execute(
+            f"""SELECT r.*,u.name operator_name,reviewer.name reviewer_name
+                FROM operator_client_reports r
+                LEFT JOIN users u ON u.id=r.operator_id
+                LEFT JOIN users reviewer ON reviewer.id=r.decided_by
+                {where} ORDER BY r.created_at DESC,r.id DESC""",  # nosec B608 - fixed allowlisted clause
+            params,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_client_report(report_id: int) -> dict[str, Any] | None:
+    with _connection() as conn:
+        row = conn.execute(
+            """SELECT r.*,u.name operator_name,reviewer.name reviewer_name
+               FROM operator_client_reports r
+               LEFT JOIN users u ON u.id=r.operator_id
+               LEFT JOIN users reviewer ON reviewer.id=r.decided_by
+               WHERE r.id=?""",
+            (report_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def decide_client_report(
+    report_id: int, admin_id: int, decision: str, now: datetime | None = None,
+) -> dict[str, Any]:
+    if decision not in {"confirmed", "rejected"}:
+        raise ValueError
+    now = now or utc_now()
+    settings = get_settings()
+    with _connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        report = conn.execute(
+            "SELECT * FROM operator_client_reports WHERE id=?", (report_id,),
+        ).fetchone()
+        if not report:
+            raise LookupError
+        if report["status"] == "pending":
+            conn.execute(
+                """UPDATE operator_client_reports SET status=?,decided_at=?,decided_by=?
+                   WHERE id=? AND status='pending'""",
+                (decision, _iso(now), admin_id, report_id),
+            )
+        count = conn.execute(
+            """SELECT COUNT(*) n FROM operator_client_reports
+               WHERE client_chat_id=? AND status='confirmed'""",
+            (report["client_chat_id"],),
+        ).fetchone()["n"]
+        blocked = False
+        if count >= int(settings["report_threshold"]):
+            blocked = True
+            conn.execute(
+                """INSERT INTO operator_chat_blocks(chat_id,active,blocked_at,blocked_by)
+                   VALUES(?,1,?,?) ON CONFLICT(chat_id) DO UPDATE SET
+                   active=1,blocked_at=excluded.blocked_at,blocked_by=excluded.blocked_by,
+                   unblocked_at=NULL,unblocked_by=NULL""",
+                (report["client_chat_id"], _iso(now), admin_id),
+            )
+            dialogs = conn.execute(
+                """SELECT id FROM operator_dialogs
+                   WHERE chat_id=? AND status IN ('waiting','active')""",
+                (report["client_chat_id"],),
+            ).fetchall()
+            for dialog in dialogs:
+                conn.execute(
+                    "UPDATE operator_dialogs SET status='cancelled',closed_at=? WHERE id=?",
+                    (_iso(now), dialog["id"]),
+                )
+                conn.execute(
+                    """UPDATE operator_outbox SET status='failed',attempts=?,next_retry_at=NULL,
+                       last_error='cancelled_by_block' WHERE dialog_id=? AND status!='delivered'""",
+                    (MAX_OUTBOX_ATTEMPTS, dialog["id"]),
+                )
+        saved = conn.execute(
+            "SELECT * FROM operator_client_reports WHERE id=?", (report_id,),
+        ).fetchone()
+    result = dict(saved)
+    result.update(confirmed_count=int(count), blocked=blocked)
+    return result
+
+
+def list_blocked_clients() -> list[dict[str, Any]]:
+    with _connection() as conn:
+        rows = conn.execute(
+            """SELECT b.*,(SELECT COUNT(*) FROM operator_client_reports r
+                 WHERE r.client_chat_id=b.chat_id AND r.status='confirmed') confirmed_count
+               FROM operator_chat_blocks b WHERE b.active=1 ORDER BY b.blocked_at DESC"""
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def unblock_client(chat_id: int, admin_id: int, now: datetime | None = None) -> bool:
+    with _connection() as conn:
+        cur = conn.execute(
+            """UPDATE operator_chat_blocks SET active=0,unblocked_at=?,unblocked_by=?
+               WHERE chat_id=? AND active=1""",
+            (_iso(now), admin_id, chat_id),
+        )
+    return bool(cur.rowcount)
+
+
 def process_timeouts(now: datetime | None = None) -> dict[str, list[dict[str, Any]]]:
     """Return notification work after atomically updating stale/warn/closed rows."""
     now = now or utc_now()
@@ -549,7 +830,7 @@ def process_timeouts(now: datetime | None = None) -> dict[str, list[dict[str, An
         stale = conn.execute(
             """SELECT d.id,d.chat_id,d.assigned_at FROM operator_dialogs d LEFT JOIN operator_shifts s ON s.user_id=d.operator_id
                WHERE d.status='active' AND (s.user_id IS NULL OR s.active=0 OR s.heartbeat_at<?)""",
-            (_fresh_cutoff(settings, now),),
+            (_requeue_cutoff(settings, now),),
         ).fetchall()
         for row in stale:
             conn.execute(
@@ -561,17 +842,11 @@ def process_timeouts(now: datetime | None = None) -> dict[str, list[dict[str, An
             queue_seq = conn.execute("SELECT COALESCE(MAX(queue_seq),0)+1 n FROM operator_dialogs").fetchone()["n"]
             conn.execute(
                 """UPDATE operator_dialogs SET status='waiting',operator_id=NULL,queue_seq=?,
-                   assigned_at=NULL,warned_at=NULL,last_activity_at=? WHERE id=?""",
+                   assigned_at=NULL,warned_at=NULL,last_activity_at=?,reassignment_pending=1
+                   WHERE id=?""",
                 (queue_seq, _iso(now), row["id"]),
             )
             result["requeued"].append(dict(row))
-            _enqueue_outbox_locked(
-                conn, event_key=f"dialog:{row['id']}:requeued:{row['assigned_at']}", chat_id=row["chat_id"],
-                dialog_id=row["id"],
-                kind="text",
-                body="Извините, оператор не на связи, мы направляем вас к другому оператору.",
-                now=now,
-            )
         warn_at = _iso(now - timedelta(minutes=int(settings["inactivity_timeout_min"] - settings["warning_before_min"])))
         close_at = _iso(now - timedelta(minutes=int(settings["inactivity_timeout_min"])))
         warns = conn.execute(
@@ -661,6 +936,30 @@ def retry_message(message_id: int, operator_id: int, now: datetime | None = None
     return True
 
 
+def delete_undelivered_image(message_id: int, operator_id: int) -> str | None:
+    """Cancel and delete the operator's own unsent image, returning its file name."""
+    with _connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """SELECT m.image_path,m.delivery_status,o.id outbox_id,o.status outbox_status
+               FROM operator_messages m
+               JOIN operator_dialogs d ON d.id=m.dialog_id
+               JOIN operator_outbox o ON o.message_id=m.id
+               WHERE m.id=? AND m.sender='operator' AND m.message_type='image'
+                 AND m.sender_user_id=? AND d.operator_id=? AND d.status='active'""",
+            (message_id, operator_id, operator_id),
+        ).fetchone()
+        if not row:
+            raise PermissionError
+        if row["delivery_status"] == "delivered":
+            raise ValueError("Доставленное изображение удалить нельзя")
+        if row["outbox_status"] == "sending":
+            raise ValueError("Изображение сейчас отправляется. Повторите позже")
+        conn.execute("DELETE FROM operator_outbox WHERE id=?", (row["outbox_id"],))
+        conn.execute("DELETE FROM operator_messages WHERE id=?", (message_id,))
+    return row["image_path"]
+
+
 Delivery = Callable[[dict[str, Any]], tuple[bool, str | None]]
 
 
@@ -677,6 +976,23 @@ def set_outbox_upload_token(outbox_id: int, token: str) -> str:
     if not row:
         raise LookupError(outbox_id)
     return str(row["upload_token"])
+
+
+def extract_image_upload_token(payload: Any) -> str | None:
+    """Read both documented MAX image upload response variants."""
+    if not isinstance(payload, dict):
+        return None
+    direct = payload.get("token")
+    if isinstance(direct, str) and direct:
+        return direct
+    photos = payload.get("photos")
+    if isinstance(photos, dict):
+        for photo in photos.values():
+            if isinstance(photo, dict):
+                token = photo.get("token")
+                if isinstance(token, str) and token:
+                    return token
+    return None
 
 
 def _retryable_delivery_error(error: str) -> bool:
@@ -776,6 +1092,9 @@ def cleanup_history(image_root: str | os.PathLike[str], now: datetime | None = N
     now = now or utc_now()
     settings = get_settings()
     cutoff = _iso(now - timedelta(days=int(settings["retention_days"])))
+    evidence_cutoff = _iso(
+        now - timedelta(days=int(settings["evidence_retention_days"]))
+    )
     root = Path(image_root).resolve()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     with _connection() as conn:
@@ -805,6 +1124,34 @@ def cleanup_history(image_root: str | os.PathLike[str], now: datetime | None = N
                     (row["id"],),
                 )
     with _connection() as conn:
+        evidence_rows = conn.execute(
+            """SELECT id,evidence_path FROM operator_client_reports
+               WHERE created_at<? AND (snapshot_json!='[]' OR evidence_path IS NOT NULL)
+               ORDER BY id LIMIT 500""",
+            (evidence_cutoff,),
+        ).fetchall()
+    for row in evidence_rows:
+        removed = False
+        candidate = (root / row["evidence_path"]).resolve() if row["evidence_path"] else None
+        if candidate is None:
+            removed = True
+        elif candidate.parent == root:
+            try:
+                candidate.unlink(missing_ok=True)
+                removed = True
+            except OSError:
+                pass
+        with _connection() as conn:
+            conn.execute(
+                "UPDATE operator_client_reports SET snapshot_json='[]',image_message_id=NULL WHERE id=?",
+                (row["id"],),
+            )
+            if removed:
+                conn.execute(
+                    "UPDATE operator_client_reports SET evidence_path=NULL WHERE id=?",
+                    (row["id"],),
+                )
+    with _connection() as conn:
         conn.execute("DELETE FROM operator_outbox WHERE created_at<?", (cutoff,))
         ids = [row["id"] for row in conn.execute(
             "SELECT id FROM operator_dialogs WHERE status NOT IN ('waiting','active') AND closed_at<?",
@@ -826,6 +1173,11 @@ def cleanup_history(image_root: str | os.PathLike[str], now: datetime | None = N
                 "SELECT image_path FROM operator_messages WHERE image_path IS NOT NULL"
             ).fetchall()
         }
+        referenced.update(
+            row["evidence_path"] for row in conn.execute(
+                "SELECT evidence_path FROM operator_client_reports WHERE evidence_path IS NOT NULL"
+            ).fetchall()
+        )
     orphan_cutoff = now.timestamp() - 3600
     removed_orphans = 0
     for candidate in root.glob("*.jpg"):
@@ -841,18 +1193,16 @@ def cleanup_history(image_root: str | os.PathLike[str], now: datetime | None = N
     return scrubbed
 
 
-def normalize_jpeg(data: bytes, content_type: str | None) -> bytes:
-    """Fully decode and re-encode a bounded JPEG, stripping metadata/trailing data."""
+def normalize_image(data: bytes, content_type: str | None = None) -> bytes:
+    """Decode JPEG/PNG/WebP by content and store a metadata-free JPEG."""
     if not data or len(data) > MAX_IMAGE_BYTES:
         raise ValueError("Изображение должно быть не более 5 МБ")
-    if content_type not in {"image/jpeg", "image/jpg"}:
-        raise ValueError("Поддерживаются только JPG-изображения")
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             with Image.open(io.BytesIO(data)) as probe:
-                if probe.format != "JPEG":
-                    raise ValueError("Поддерживаются только JPG-изображения")
+                if probe.format not in {"JPEG", "PNG", "WEBP"}:
+                    raise ValueError("Поддерживаются только JPEG, PNG и WebP")
                 width, height = probe.size
                 if (
                     width <= 0 or height <= 0
@@ -866,15 +1216,23 @@ def normalize_jpeg(data: bytes, content_type: str | None) -> bytes:
                 normalized = ImageOps.exif_transpose(decoded).convert("RGB")
                 output = io.BytesIO()
                 normalized.save(output, format="JPEG", quality=90, optimize=True)
-    except (Image.DecompressionBombError, Image.DecompressionBombWarning, UnidentifiedImageError, OSError) as exc:
-        raise ValueError("Повреждённое JPG-изображение") from exc
+    except (
+        Image.DecompressionBombError, Image.DecompressionBombWarning,
+        UnidentifiedImageError, OSError, SyntaxError,
+    ) as exc:
+        raise ValueError("Повреждённое изображение") from exc
     result = output.getvalue()
     if len(result) > MAX_IMAGE_BYTES:
         raise ValueError("Изображение после обработки превышает 5 МБ")
     return result
 
 
+def normalize_jpeg(data: bytes, content_type: str | None) -> bytes:
+    """Compatibility wrapper; validation deliberately does not trust MIME."""
+    return normalize_image(data, content_type)
+
+
 def validate_jpeg(data: bytes, content_type: str | None) -> None:
-    normalize_jpeg(data, content_type)
+    normalize_image(data, content_type)
 
 

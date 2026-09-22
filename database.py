@@ -370,12 +370,20 @@ def init_db() -> None:
             enabled INTEGER NOT NULL DEFAULT 1,
             require_auth INTEGER NOT NULL DEFAULT 1,
             heartbeat_timeout_min INTEGER NOT NULL DEFAULT 5,
+            heartbeat_timeout_sec INTEGER NOT NULL DEFAULT 30,
+            reconnect_grace_sec INTEGER NOT NULL DEFAULT 120,
             max_active_dialogs INTEGER NOT NULL DEFAULT 5,
             inactivity_timeout_min INTEGER NOT NULL DEFAULT 30,
             warning_before_min INTEGER NOT NULL DEFAULT 5,
-            retention_days INTEGER NOT NULL DEFAULT 30
+            retention_days INTEGER NOT NULL DEFAULT 30,
+            report_threshold INTEGER NOT NULL DEFAULT 3,
+            evidence_retention_days INTEGER NOT NULL DEFAULT 30
         )
     """)
+    _ensure_column(c, "operator_chat_settings", "heartbeat_timeout_sec", "INTEGER NOT NULL DEFAULT 30")
+    _ensure_column(c, "operator_chat_settings", "reconnect_grace_sec", "INTEGER NOT NULL DEFAULT 120")
+    _ensure_column(c, "operator_chat_settings", "report_threshold", "INTEGER NOT NULL DEFAULT 3")
+    _ensure_column(c, "operator_chat_settings", "evidence_retention_days", "INTEGER NOT NULL DEFAULT 30")
     c.execute("INSERT OR IGNORE INTO operator_chat_settings (id) VALUES (1)")
     c.execute("""
         CREATE TABLE IF NOT EXISTS operator_shifts (
@@ -409,6 +417,7 @@ def init_db() -> None:
             rated_at TEXT
         )
     """)
+    _ensure_column(c, "operator_dialogs", "reassignment_pending", "INTEGER NOT NULL DEFAULT 0")
     c.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS uq_operator_dialog_open_chat
         ON operator_dialogs(chat_id) WHERE status IN ('waiting','active')
@@ -472,6 +481,38 @@ def init_db() -> None:
            ) WHERE dialog_id IS NULL AND message_id IS NOT NULL"""
     )
     c.execute("CREATE INDEX IF NOT EXISTS ix_operator_outbox_due ON operator_outbox(status,next_retry_at,id)")
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS operator_client_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dialog_id INTEGER NOT NULL REFERENCES operator_dialogs(id) ON DELETE RESTRICT,
+            operator_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            client_chat_id INTEGER NOT NULL,
+            reason TEXT NOT NULL CHECK(reason IN (
+                'unwanted_image','insults','spam','irrelevant_image','other'
+            )),
+            comment TEXT,
+            image_message_id INTEGER REFERENCES operator_messages(id) ON DELETE SET NULL,
+            evidence_path TEXT,
+            snapshot_json TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending','confirmed','rejected')),
+            created_at TEXT NOT NULL,
+            decided_at TEXT,
+            decided_by INTEGER REFERENCES users(id) ON DELETE SET NULL
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS ix_operator_reports_status ON operator_client_reports(status,created_at,id)")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS operator_chat_blocks (
+            chat_id INTEGER PRIMARY KEY,
+            active INTEGER NOT NULL DEFAULT 1,
+            blocked_at TEXT NOT NULL,
+            blocked_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            unblocked_at TEXT,
+            unblocked_by INTEGER REFERENCES users(id) ON DELETE SET NULL
+        )
+    """)
 
     # Центральные feature flags главного меню. Данные модулей не удаляются.
     c.execute("""

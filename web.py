@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import secrets
+import shutil
 import sqlite3
 import time
 import uuid
@@ -824,11 +825,11 @@ def _send_max_jpeg(
                 return False, "upload_contract"
             with open(path, "rb") as stream:
                 uploaded = httpx.post(
-                    upload_url, headers=headers,
-                    files={"data": ("image.jpg", stream, "image/jpeg")}, timeout=30,
+                    upload_url, files={"data": ("image.jpg", stream, "image/jpeg")},
+                    timeout=30,
                 )
             uploaded.raise_for_status()
-            token = uploaded.json().get("token")
+            token = operator_chat.extract_image_upload_token(uploaded.json())
             if not isinstance(token, str) or not token:
                 return False, "upload_contract"
             if outbox_id is not None:
@@ -914,6 +915,15 @@ def operator_shift_end():
     return jsonify(ok=True)
 
 
+@app.post("/operator-chat/shift/transfer-all")
+@operator_required
+@csrf_protected
+def operator_transfer_all():
+    dialog_ids = operator_chat.transfer_all_dialogs(_operator_id())
+    _assign_and_notify()
+    return jsonify(ok=True, transferred=len(dialog_ids), dialog_ids=dialog_ids)
+
+
 @app.post("/operator-chat/heartbeat")
 @operator_required
 @csrf_protected
@@ -956,7 +966,7 @@ def operator_send_message(dialog_id: int):
     try:
         if upload and upload.filename:
             data = upload.read(operator_chat.MAX_IMAGE_BYTES + 1)
-            data = operator_chat.normalize_jpeg(data, upload.mimetype)
+            data = operator_chat.normalize_image(data, upload.mimetype)
             os.makedirs(OPERATOR_CHAT_IMAGE_DIR, mode=0o700, exist_ok=True)
             relative_path = f"{uuid.uuid4().hex}.jpg"
             absolute_path = os.path.join(OPERATOR_CHAT_IMAGE_DIR, relative_path)
@@ -1000,6 +1010,85 @@ def operator_retry_message(message_id: int):
     result = _flush_outbox(outbox["id"] if outbox else None)
     status = result[0]["status"] if result else "pending"
     return jsonify(ok=True, delivered=status == "delivered", delivery_status=status)
+
+
+def _operator_runtime_image_path(relative_path: str | None) -> str | None:
+    if not relative_path:
+        return None
+    root = os.path.realpath(OPERATOR_CHAT_IMAGE_DIR)
+    path = os.path.realpath(os.path.join(root, relative_path))
+    if os.path.dirname(path) != root:
+        return None
+    return path
+
+
+@app.post("/operator-chat/api/messages/<int:message_id>/delete")
+@operator_required
+@csrf_protected
+def operator_delete_message(message_id: int):
+    try:
+        relative_path = operator_chat.delete_undelivered_image(message_id, _operator_id())
+    except PermissionError:
+        abort(404)
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 409
+    path = _operator_runtime_image_path(relative_path)
+    if path:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            log.warning("Не удалось удалить недоставленное изображение message_id=%s", message_id)
+    return jsonify(ok=True)
+
+
+@app.post("/operator-chat/api/dialogs/<int:dialog_id>/report")
+@operator_required
+@csrf_protected
+def operator_report_client(dialog_id: int):
+    reason = request.form.get("reason", "")
+    comment = request.form.get("comment", "")
+    image_message_raw = request.form.get("image_message_id", "").strip()
+    image_message_id = int(image_message_raw) if image_message_raw.isdigit() else None
+    evidence_path = None
+    evidence_absolute = None
+    if image_message_id is not None:
+        message = operator_chat.get_reportable_image(dialog_id, _operator_id(), image_message_id)
+        if not message:
+            abort(404)
+        source = _operator_runtime_image_path(message["image_path"])
+        if not source or os.path.islink(source) or not os.path.isfile(source):
+            return jsonify(ok=False, error="Изображение недоступно"), 409
+        os.makedirs(OPERATOR_CHAT_IMAGE_DIR, mode=0o700, exist_ok=True)
+        evidence_path = f"report-{uuid.uuid4().hex}.jpg"
+        evidence_absolute = _operator_runtime_image_path(evidence_path)
+        try:
+            shutil.copyfile(source, evidence_absolute)
+        except OSError:
+            return jsonify(ok=False, error="Не удалось сохранить доказательство"), 500
+    try:
+        report = operator_chat.create_client_report(
+            dialog_id, _operator_id(), reason, comment,
+            image_message_id=image_message_id, evidence_path=evidence_path,
+        )
+    except PermissionError:
+        if evidence_absolute:
+            try:
+                os.remove(evidence_absolute)
+            except OSError:
+                pass
+        abort(404)
+    except ValueError as exc:
+        if evidence_absolute:
+            try:
+                os.remove(evidence_absolute)
+            except OSError:
+                pass
+        return jsonify(ok=False, error=str(exc)), 400
+    _flush_outbox()
+    _assign_and_notify()
+    return jsonify(ok=True, report_id=report["id"])
 
 
 @app.post("/operator-chat/api/dialogs/<int:dialog_id>/close")
@@ -1046,11 +1135,14 @@ def operator_chat_settings_page():
             operator_chat.update_settings(
                 enabled=request.form.get("enabled") == "on",
                 require_auth=request.form.get("require_auth") == "on",
-                heartbeat_timeout_min=request.form.get("heartbeat_timeout_min"),
+                heartbeat_timeout_sec=request.form.get("heartbeat_timeout_sec"),
+                reconnect_grace_sec=request.form.get("reconnect_grace_sec"),
                 max_active_dialogs=request.form.get("max_active_dialogs"),
                 inactivity_timeout_min=request.form.get("inactivity_timeout_min"),
                 warning_before_min=request.form.get("warning_before_min"),
                 retention_days=request.form.get("retention_days"),
+                report_threshold=request.form.get("report_threshold"),
+                evidence_retention_days=request.form.get("evidence_retention_days"),
             )
             operator_chat.update_module_settings({key: request.form.get(f"module_{key}") == "on" for key in operator_chat.MODULE_KEYS})
         except (ValueError, TypeError) as exc:
@@ -1120,6 +1212,74 @@ def operator_chat_history_image(message_id: int):
     root = os.path.realpath(OPERATOR_CHAT_IMAGE_DIR)
     path = os.path.realpath(os.path.join(root, row["image_path"]))
     if os.path.dirname(path) != root or not os.path.isfile(path):
+        abort(404)
+    return send_file(path, mimetype="image/jpeg", conditional=True)
+
+
+@app.get("/operator-chat/reports")
+@admin_required
+def operator_reports_page():
+    status = request.args.get("status")
+    return render_template(
+        "operator_chat_reports.html", user=session["user"], csrf_token=_csrf_token(),
+        reports=operator_chat.list_client_reports(status),
+        blocked=operator_chat.list_blocked_clients(), reasons=operator_chat.REPORT_REASONS,
+    )
+
+
+@app.get("/operator-chat/reports/<int:report_id>")
+@admin_required
+def operator_report_detail(report_id: int):
+    report = operator_chat.get_client_report(report_id)
+    if not report:
+        abort(404)
+    return render_template(
+        "operator_chat_report_detail.html", user=session["user"],
+        csrf_token=_csrf_token(), report=report,
+        snapshot=json.loads(report["snapshot_json"] or "[]"),
+        reasons=operator_chat.REPORT_REASONS,
+    )
+
+
+@app.post("/operator-chat/reports/<int:report_id>/<decision>")
+@admin_required
+@csrf_protected
+def operator_report_decide(report_id: int, decision: str):
+    try:
+        result = operator_chat.decide_client_report(
+            report_id, _operator_id(), decision,
+        )
+    except LookupError:
+        abort(404)
+    except ValueError:
+        abort(400)
+    return jsonify(ok=True, status=result["status"], blocked=result["blocked"])
+
+
+@app.post("/operator-chat/blocked/<int:chat_id>/unblock")
+@admin_required
+@csrf_protected
+def operator_unblock_client(chat_id: int):
+    if not operator_chat.unblock_client(chat_id, _operator_id()):
+        abort(404)
+    return jsonify(ok=True)
+
+
+@app.get("/operator-chat/reports/<int:report_id>/evidence")
+@admin_required
+def operator_report_evidence(report_id: int):
+    report = operator_chat.get_client_report(report_id)
+    if not report or not report["evidence_path"]:
+        abort(404)
+    settings = operator_chat.get_settings()
+    cutoff = operator_chat.utc_now() - timedelta(
+        days=int(settings["evidence_retention_days"])
+    )
+    created = datetime.fromisoformat(report["created_at"])
+    if created < cutoff:
+        abort(404)
+    path = _operator_runtime_image_path(report["evidence_path"])
+    if not path or os.path.islink(path) or not os.path.isfile(path):
         abort(404)
     return send_file(path, mimetype="image/jpeg", conditional=True)
 

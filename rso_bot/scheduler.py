@@ -74,10 +74,10 @@ def register_jobs(scheduler: Any, deps: SchedulerDependencies) -> None:
         scheduler.add_job(
             deps.operator_chat_maintenance,
             trigger="interval",
-            minutes=1,
+            seconds=10,
             id="operator_chat_maintenance",
             max_instances=1,
-            misfire_grace_time=60,
+            misfire_grace_time=30,
         )
 
 
