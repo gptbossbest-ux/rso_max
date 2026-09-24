@@ -75,9 +75,15 @@
               <td colspan="2" style="padding:6px 12px">
                 <form method="POST"
                       action="{{ url_for('script_node_update', script_id=script.id, node_id=n.id) }}"
-                      class="d-flex gap-2" style="align-items:center">
+                      style="display:grid;grid-template-columns:2fr 1.4fr 1fr auto auto;gap:6px;align-items:center">
                   <input type="text" name="title" class="form-control form-control-sm"
                          value="{{ n.title }}" required style="flex:1">
+                  <input type="url" name="link_url" class="form-control form-control-sm"
+                         value="{{ n.link_url or '' }}" maxlength="2048"
+                         placeholder="https://сайт.ru (необязательно)">
+                  <input type="text" name="link_text" class="form-control form-control-sm"
+                         value="{{ n.link_text or '' }}" maxlength="128"
+                         placeholder="Текст ссылки">
                   <label style="display:flex;align-items:center;gap:4px;cursor:pointer;margin:0;white-space:nowrap"
                          title="Конечный узел: бот покажет «В главное меню»">
                     <input type="checkbox" name="is_terminal" {% if n.is_terminal %}checked{% endif %}>
@@ -102,9 +108,13 @@
               <td colspan="3" style="padding:6px 12px">
                 <form method="POST"
                       action="{{ url_for('script_node_add', script_id=script.id) }}"
-                      class="d-flex gap-2" style="align-items:center">
+                      style="display:grid;grid-template-columns:2fr 1.4fr 1fr auto auto;gap:6px;align-items:center">
                   <input type="text" name="title" class="form-control form-control-sm"
                          placeholder="Текст нового узла" required style="flex:1">
+                  <input type="url" name="link_url" class="form-control form-control-sm"
+                         maxlength="2048" placeholder="https://сайт.ru (необязательно)">
+                  <input type="text" name="link_text" class="form-control form-control-sm"
+                         maxlength="128" placeholder="Текст ссылки">
                   <label style="display:flex;align-items:center;gap:4px;cursor:pointer;margin:0;white-space:nowrap">
                     <input type="checkbox" name="is_terminal">
                     <span class="small">финал</span>

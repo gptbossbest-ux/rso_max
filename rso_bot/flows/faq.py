@@ -26,6 +26,7 @@ class FaqDependencies:
     get_state: Callable[[int], State]
     touch: Callable[[State], State]
     make_callback: Callable[[str, str], Button]
+    make_link: Callable[[str, str], Button]
     send_message: Callable[[int, str], Any]
     send_buttons: Callable[[int, str, list[list[Button]]], Any]
     send_main_menu: Callable[..., None]
@@ -117,6 +118,9 @@ def show_script_node(chat_id: int, deps: FaqDependencies) -> None:
 
     text = node["title"]
     edges = edges_by_from.get(current_id, [])
+    link_rows = []
+    if node.get("link_url"):
+        link_rows = [[deps.make_link(node.get("link_text") or "Открыть сайт", node["link_url"])]]
 
     if node.get("is_terminal") or not edges:
         path = list(script.get("path", []))
@@ -132,12 +136,13 @@ def show_script_node(chat_id: int, deps: FaqDependencies) -> None:
         deps.send_buttons(
             chat_id,
             f"📌 {text}{invitation}",
-            ([[deps.make_callback("🤖 Спросить у ИИ-помощника", "ai_from_faq")]] if deps.ai_available() else [])
+            link_rows
+            + ([[deps.make_callback("🤖 Спросить у ИИ-помощника", "ai_from_faq")]] if deps.ai_available() else [])
             + ([[deps.make_callback("🎧 Связаться с оператором", "operator_start")]] if deps.operator_available() else [])
             + [[deps.make_callback("🏠 Главное меню", "main_menu")]],
         )
     else:
-        rows = [
+        rows = link_rows + [
             [deps.make_callback(edge["label"], f"script_node:{edge['to_node_id']}")]
             for edge in edges
         ]

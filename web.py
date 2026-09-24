@@ -66,7 +66,7 @@ from config import (
     YANDEXGPT_API_KEY,
     YANDEXGPT_FOLDER_ID,
 )
-from rso_bot import operator_chat
+from rso_bot import max_transport, operator_chat
 
 # ── Логгер ────────────────────────────────────────────────────────────────────
 
@@ -1868,15 +1868,35 @@ def script_delete(script_id: int):
     return redirect(url_for("scripts_list"))
 
 
+def _validate_script_link(url: str, text: str) -> tuple[str | None, str | None]:
+    """Validate optional structured FAQ link without interpreting node text as markup."""
+    if not url:
+        if text:
+            raise ValueError("Укажите адрес ссылки или очистите текст кнопки")
+        return None, None
+    safe_url = max_transport.validate_link_url(url)
+    label = text or "Открыть сайт"
+    # Reuse MAX's button limits and return normalized values for persistence.
+    button = max_transport.make_link_button(label, safe_url)
+    return button["url"], button["text"]
+
+
 @app.route("/scripts/<int:script_id>/nodes/add", methods=["POST"])
 @admin_required
 def script_node_add(script_id: int):
     title = request.form.get("title", "").strip()
     is_terminal = request.form.get("is_terminal") == "on"
+    link_url = request.form.get("link_url", "").strip()
+    link_text = request.form.get("link_text", "").strip()
     if not title:
         flash("Текст узла не может быть пустым", "error")
     else:
-        db.add_script_node(script_id, title, is_terminal)
+        try:
+            link_url, link_text = _validate_script_link(link_url, link_text)
+        except ValueError as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("script_editor", script_id=script_id))
+        db.add_script_node(script_id, title, is_terminal, link_url, link_text)
         flash("Узел добавлен", "success")
     return redirect(url_for("script_editor", script_id=script_id))
 
@@ -1886,10 +1906,17 @@ def script_node_add(script_id: int):
 def script_node_update(script_id: int, node_id: int):
     title = request.form.get("title", "").strip()
     is_terminal = request.form.get("is_terminal") == "on"
+    link_url = request.form.get("link_url", "").strip()
+    link_text = request.form.get("link_text", "").strip()
     if not title:
         flash("Текст узла не может быть пустым", "error")
     else:
-        db.update_script_node(node_id, title, is_terminal)
+        try:
+            link_url, link_text = _validate_script_link(link_url, link_text)
+        except ValueError as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("script_editor", script_id=script_id))
+        db.update_script_node(node_id, title, is_terminal, link_url, link_text)
         flash("Узел сохранён", "success")
     return redirect(url_for("script_editor", script_id=script_id))
 

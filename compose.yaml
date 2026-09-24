@@ -59,9 +59,12 @@ services:
 
   web:
     <<: *app
-    command: gunicorn --bind 0.0.0.0:5000 --workers 1 --threads 4 --timeout 60 web:app
+    command: ["gunicorn", "-c", "gunicorn.conf.py", "web:app"]
     environment:
       <<: *runtime-environment
+      WEB_WORKERS: ${WEB_WORKERS:-2}
+      WEB_THREADS: ${WEB_THREADS:-4}
+      WEB_TIMEOUT: ${WEB_TIMEOUT:-60}
       FASTAPI_BASE_URL: http://api:8000
       DB_PATH: /app/data/database.sqlite
       LOG_FILE: /app/logs/web.log

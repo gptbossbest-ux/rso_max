@@ -22,6 +22,7 @@ def _dependencies(
             "text": label,
             "payload": payload,
         },
+        make_link=lambda label, url: {"type": "link", "text": label, "url": url},
         send_message=Mock(),
         send_buttons=Mock(),
         send_main_menu=Mock(),
@@ -155,6 +156,25 @@ def test_terminal_node_does_not_invite_disabled_ai():
     text, rows = deps.send_buttons.call_args.args[1:]
     assert "ИИ-помощнику" not in text
     assert all(button["payload"] != "ai_from_faq" for row in rows for button in row)
+
+
+def test_faq_node_renders_structured_site_link_without_markdown():
+    deps, state = _dependencies()
+    state["script"] = {
+        "nodes": {5: {
+            "id": 5, "title": "Подробнее [здесь](не-разметка)",
+            "is_terminal": True, "link_url": "https://example.test/help",
+            "link_text": "Открыть инструкцию",
+        }},
+        "edges_by_from": {}, "current": 5,
+    }
+    faq.show_script_node(42, deps)
+    text, rows = deps.send_buttons.call_args.args[1:]
+    assert "[здесь](не-разметка)" in text
+    assert rows[0] == [{
+        "type": "link", "text": "Открыть инструкцию",
+        "url": "https://example.test/help",
+    }]
 
 
 def test_navigate_can_move_to_child_and_back_to_parent():

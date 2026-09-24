@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -680,6 +681,9 @@ def test_outbox_orders_old_close_before_new_dialog_assignment(operator_db):
 def test_operator_composer_matches_server_message_limit():
     template = Path("templates/operator_chat.html").read_text(encoding="utf-8")
     assert 'name="body" type="text" maxlength="3990"' in template
+    assert "function clearCurrent" in template
+    assert "clearCurrent('Диалог завершён.')" in template
+    assert "clearCurrent('Диалоги переданы.')" in template
 
 
 def test_non_retryable_4xx_dead_letters_until_manual_retry(operator_db):
@@ -1472,3 +1476,185 @@ def test_blocked_client_stale_operator_flow_is_cleared(operator_db, monkeypatch)
     bot._on_operator_text(212, state, "stale text")
     assert state.get("state") == bot.S.MENU
     assert messages[-1] == (212, "Связь с оператором временно недоступна.")
+
+
+def _outbox_rows(dialog_id: int):
+    conn = db.get_conn()
+    rows = conn.execute(
+        "SELECT * FROM operator_outbox WHERE dialog_id=? ORDER BY id", (dialog_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def test_cancel_waiting_creates_one_durable_terminal_keyboard(operator_db):
+    _settings(max_active_dialogs=1)
+    owner = _operator("cancel-terminal-owner")
+    operator_chat.start_shift(owner)
+    operator_chat.request_dialog(301, profile=None, faq_context=None, ai_messages=[])
+    waiting = operator_chat.request_dialog(302, profile=None, faq_context=None, ai_messages=[])
+    assert waiting["status"] == "waiting"
+
+    assert operator_chat.cancel_waiting(302)
+    assert not operator_chat.cancel_waiting(302)
+    terminal = [
+        item for item in _outbox_rows(waiting["id"])
+        if item["event_key"].endswith(":cancelled_by_client")
+    ]
+    assert len(terminal) == 1
+    assert terminal[0]["kind"] == "buttons"
+    assert json.loads(terminal[0]["buttons_json"])[0][0]["payload"] == "main_menu"
+
+
+@pytest.mark.parametrize("terminal_kind", ["close", "report", "timeout", "queue_timeout"])
+def test_every_terminal_path_has_durable_exit_keyboard(
+    operator_db, terminal_kind,
+):
+    _settings(max_active_dialogs=2, inactivity_timeout_min=30, warning_before_min=5)
+    owner = _operator(f"terminal-{terminal_kind}")
+    base = datetime(2026, 1, 2, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(owner, now=base)
+    dialog = operator_chat.request_dialog(
+        310, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+    operator_chat.deliver_outbox(lambda _item: (True, None), now=base)
+    if terminal_kind == "close":
+        operator_chat.close_dialog(dialog["id"], owner, now=base)
+    elif terminal_kind == "report":
+        operator_chat.create_client_report(
+            dialog["id"], owner, "spam", "", now=base,
+        )
+    elif terminal_kind == "timeout":
+        operator_chat.heartbeat(owner, now=base + timedelta(minutes=31))
+        operator_chat.process_timeouts(now=base + timedelta(minutes=31))
+    else:
+        second = operator_chat.request_dialog(
+            311, profile=None, faq_context=None, ai_messages=[], now=base,
+        )
+        assert second["status"] == "active"
+        waiting = operator_chat.request_dialog(
+            312, profile=None, faq_context=None, ai_messages=[], now=base,
+        )
+        dialog = waiting
+        operator_chat.process_timeouts(now=base + timedelta(minutes=31))
+    terminal = [item for item in _outbox_rows(dialog["id"]) if item["buttons_json"]]
+    assert terminal
+    buttons = json.loads(terminal[-1]["buttons_json"])
+    assert any(button.get("payload") == "main_menu" for row in buttons for button in row)
+
+
+def test_timeout_scheduler_is_idempotent_for_terminal_notification(operator_db):
+    _settings(max_active_dialogs=1, inactivity_timeout_min=30, warning_before_min=5)
+    owner = _operator("timeout-idempotency")
+    base = datetime(2026, 1, 3, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(owner, now=base)
+    dialog = operator_chat.request_dialog(
+        313, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+    operator_chat.deliver_outbox(lambda _item: (True, None), now=base)
+    operator_chat.heartbeat(owner, now=base + timedelta(minutes=31))
+    operator_chat.process_timeouts(now=base + timedelta(minutes=31))
+    operator_chat.process_timeouts(now=base + timedelta(minutes=32))
+    assert sum(
+        item["event_key"] == f"dialog:{dialog['id']}:timed_out"
+        for item in _outbox_rows(dialog["id"])
+    ) == 1
+
+
+def test_attachment_only_update_reconciles_stale_operator_flow(
+    operator_db, monkeypatch,
+):
+    state = bot._get_state(314)
+    state["state"] = bot.S.OPERATOR_CHAT
+    sent = []
+    monkeypatch.setattr(
+        bot, "send_main_menu",
+        lambda chat_id, text=None: sent.append((chat_id, text)),
+    )
+    bot.handle_message({
+        "recipient": {"chat_id": 314},
+        "body": {"attachments": [{"type": "image", "payload": {}}]},
+    })
+    assert state["state"] == bot.S.MENU
+    assert sent == [(314, "Диалог с оператором завершён.")]
+
+
+def test_stale_text_after_close_does_not_reopen_or_append(operator_db, monkeypatch):
+    _settings(max_active_dialogs=1)
+    owner = _operator("stale-text-owner")
+    operator_chat.start_shift(owner)
+    dialog = operator_chat.request_dialog(
+        315, profile=None, faq_context=None, ai_messages=[],
+    )
+    operator_chat.deliver_outbox(lambda _item: (True, None))
+    operator_chat.close_dialog(dialog["id"], owner)
+    state = bot._get_state(315)
+    state["state"] = bot.S.OPERATOR_CHAT
+    sent = []
+    monkeypatch.setattr(
+        bot, "send_main_menu", lambda chat_id, text=None: sent.append((chat_id, text)),
+    )
+    bot.handle_message({"recipient": {"chat_id": 315}, "body": {"text": "поздний ответ"}})
+    assert state["state"] == bot.S.MENU
+    assert sent == [(315, "Диалог с оператором завершён.")]
+    conn = db.get_conn()
+    count = conn.execute(
+        "SELECT COUNT(*) FROM operator_messages WHERE dialog_id=? AND sender='client'",
+        (dialog["id"],),
+    ).fetchone()[0]
+    conn.close()
+    assert count == 0
+
+
+def test_transfer_reassignment_notifies_once_and_stale_cancel_preserves_active_dialog(
+    operator_db, monkeypatch,
+):
+    _settings(max_active_dialogs=2)
+    first, second = _operator("transfer-notify-first"), _operator("transfer-notify-second")
+    now = operator_chat.utc_now()
+    operator_chat.start_shift(first, now=now)
+    monkeypatch.setattr(operator_chat.random, "choice", lambda values: min(values))
+    dialog = operator_chat.request_dialog(
+        316, profile=None, faq_context=None, ai_messages=[], now=now,
+    )
+    operator_chat.deliver_outbox(lambda _item: (True, None), now=now)
+    operator_chat.start_shift(second, now=now)
+    operator_chat.transfer_all_dialogs(first, now=now + timedelta(seconds=1))
+    assert operator_chat.assign_waiting(now=now + timedelta(seconds=1))
+    assert not operator_chat.assign_waiting(now=now + timedelta(seconds=1))
+    rows = _outbox_rows(dialog["id"])
+    reassigned = [row for row in rows if "направили вас к другому" in row["body"]]
+    assert len(reassigned) == 1
+
+    state = bot._get_state(316)
+    state["state"] = bot.S.OPERATOR_CHAT
+    messages = []
+    monkeypatch.setattr(bot, "send_message", lambda chat_id, text: messages.append((chat_id, text)))
+    bot._cancel_operator_wait(316, state)
+    assert operator_chat.get_open_dialog_for_chat(316)["status"] == "active"
+    assert state["state"] == bot.S.OPERATOR_CHAT
+    assert messages == [(316, "Оператор уже подключён к диалогу.")]
+
+
+def test_faq_link_columns_migrate_and_round_trip(operator_db):
+    script_id = db.create_script("FAQ со ссылкой")
+    node_id = db.add_script_node(
+        script_id, "Инструкция", True,
+        "https://example.test/help", "Открыть сайт",
+    )
+    tree = db.get_script_tree(script_id)
+    node = next(item for item in tree["nodes"] if item["id"] == node_id)
+    assert node["link_url"] == "https://example.test/help"
+    assert node["link_text"] == "Открыть сайт"
+    db.init_db()  # additive migration remains idempotent on an existing database
+    assert db.get_script_nodes(script_id)[0]["link_url"] == "https://example.test/help"
+
+
+def test_script_link_validation_rejects_unsafe_url_and_defaults_label():
+    with pytest.raises(ValueError):
+        web._validate_script_link("javascript:alert(1)", "Плохая ссылка")
+    assert web._validate_script_link("https://example.test/help", "") == (
+        "https://example.test/help", "Открыть сайт",
+    )
+    with pytest.raises(ValueError, match="Укажите адрес"):
+        web._validate_script_link("", "Лишний текст")

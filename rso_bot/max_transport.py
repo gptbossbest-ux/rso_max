@@ -10,10 +10,46 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
 SendRaw = Callable[[int, dict[str, Any]], bool]
+MAX_LINK_URL_LENGTH = 2048
+MAX_LINK_TEXT_LENGTH = 128
+
+
+def validate_link_url(value: str) -> str:
+    """Return a safe absolute HTTP(S) URL accepted by a MAX link button."""
+    value = (value or "").strip()
+    if (
+        not value
+        or len(value) > MAX_LINK_URL_LENGTH
+        or any(ord(character) <= 32 for character in value)
+    ):
+        raise ValueError("Ссылка должна содержать не более 2048 символов")
+    try:
+        parsed = urlparse(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Некорректная ссылка") from exc
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 80, 443}
+    ):
+        raise ValueError("Разрешены только обычные ссылки http/https без логина и пароля")
+    return value
+
+
+def make_link_button(text: str, url: str) -> dict[str, str]:
+    """Build the documented MAX inline-keyboard link button."""
+    label = (text or "").strip()
+    if not label or len(label) > MAX_LINK_TEXT_LENGTH:
+        raise ValueError("Текст кнопки должен содержать от 1 до 128 символов")
+    return {"type": "link", "text": label, "url": validate_link_url(url)}
 
 
 def send_raw(

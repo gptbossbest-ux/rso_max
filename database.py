@@ -312,9 +312,13 @@ def init_db() -> None:
             script_id   INTEGER NOT NULL REFERENCES scripts(id),
             title       TEXT NOT NULL,
             image_path  TEXT,
+            link_url    TEXT,
+            link_text   TEXT,
             is_terminal INTEGER DEFAULT 0
         )
     """)
+    _ensure_column(c, "script_nodes", "link_url", "TEXT")
+    _ensure_column(c, "script_nodes", "link_text", "TEXT")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS script_edges (
@@ -1017,7 +1021,8 @@ def get_script_tree(script_id: int) -> dict | None:
         return None
 
     nodes = conn.execute(
-        "SELECT id, title, is_terminal, image_path FROM script_nodes WHERE script_id=?",
+        "SELECT id, title, is_terminal, image_path, link_url, link_text "
+        "FROM script_nodes WHERE script_id=?",
         (script_id,),
     ).fetchall()
 
@@ -2874,12 +2879,16 @@ def get_script_edges(script_id: int) -> list[sqlite3.Row]:
     return rows
 
 
-def add_script_node(script_id: int, title: str, is_terminal: bool = False) -> int:
+def add_script_node(
+    script_id: int, title: str, is_terminal: bool = False,
+    link_url: str | None = None, link_text: str | None = None,
+) -> int:
     conn = get_conn()
     try:
         row_id = conn.execute(
-            "INSERT INTO script_nodes (script_id, title, is_terminal) VALUES (?, ?, ?)",
-            (script_id, title, int(is_terminal)),
+            "INSERT INTO script_nodes (script_id,title,is_terminal,link_url,link_text) "
+            "VALUES (?,?,?,?,?)",
+            (script_id, title, int(is_terminal), link_url, link_text),
         ).lastrowid
         conn.commit()
         return row_id
@@ -2887,11 +2896,14 @@ def add_script_node(script_id: int, title: str, is_terminal: bool = False) -> in
         conn.close()
 
 
-def update_script_node(node_id: int, title: str, is_terminal: bool) -> None:
+def update_script_node(
+    node_id: int, title: str, is_terminal: bool,
+    link_url: str | None = None, link_text: str | None = None,
+) -> None:
     conn = get_conn()
     conn.execute(
-        "UPDATE script_nodes SET title=?, is_terminal=? WHERE id=?",
-        (title, int(is_terminal), node_id),
+        "UPDATE script_nodes SET title=?,is_terminal=?,link_url=?,link_text=? WHERE id=?",
+        (title, int(is_terminal), link_url, link_text, node_id),
     )
     conn.commit()
     conn.close()

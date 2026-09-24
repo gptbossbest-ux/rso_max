@@ -226,6 +226,11 @@ def _cb(label: str, payload: str) -> dict:
     return {"type": "callback", "text": label, "payload": payload}
 
 
+def _link(label: str, url: str) -> dict:
+    """Create a validated MAX link button for structured content."""
+    return max_transport.make_link_button(label, url)
+
+
 # ── Главное меню ──────────────────────────────────────────────────────────────
 
 def send_main_menu(chat_id: int, text: str = "Выберите действие:") -> None:
@@ -415,6 +420,7 @@ def _faq_dependencies() -> faq.FaqDependencies:
         get_state=_get_state,
         touch=_touch,
         make_callback=_cb,
+        make_link=_link,
         send_message=send_message,
         send_buttons=send_buttons,
         send_main_menu=send_main_menu,
@@ -534,6 +540,8 @@ def _start_operator_chat(chat_id: int) -> None:
         return
     settings = operator_chat.get_settings()
     if not settings["enabled"] or not operator_chat.has_active_operators():
+        state = _get_state(chat_id)
+        _clear_flow(state)
         rows = []
         if operator_chat.module_enabled("appeal"):
             rows.append([_cb("📝 Оформить обращение", "appeal_start")])
@@ -573,9 +581,14 @@ def _start_operator_chat(chat_id: int) -> None:
 def _cancel_operator_wait(chat_id: int, state: dict) -> None:
     if operator_chat.cancel_waiting(chat_id):
         _clear_flow(state)
-        send_main_menu(chat_id, "Ожидание оператора отменено.")
+        _flush_operator_outbox()
     else:
-        send_message(chat_id, "Ожидание уже завершено.")
+        dialog = operator_chat.get_open_dialog_for_chat(chat_id)
+        if dialog and dialog["status"] == "active":
+            send_message(chat_id, "Оператор уже подключён к диалогу.")
+        else:
+            _clear_flow(state)
+            send_main_menu(chat_id, "Ожидание уже завершено.")
 
 
 def _rate_operator(chat_id: int, dialog_id: int, rating: int) -> None:
@@ -1289,6 +1302,17 @@ def handle_message(message: dict) -> None:
             _handle_operator_attachments(chat_id, open_dialog, message)
         elif text:
             _on_operator_text(chat_id, _get_state(chat_id), text)
+        return
+
+    # Operator dialogs can be closed asynchronously by the web portal or the
+    # maintenance scheduler.  Reconcile the process-local flow from durable
+    # dialog state even for attachment-only updates; otherwise the client stays
+    # visually trapped in the obsolete operator flow until sending text.
+    if current_state == S.OPERATOR_CHAT:
+        state = _get_state(chat_id)
+        _clear_flow(state)
+        _touch(state)
+        send_main_menu(chat_id, "Диалог с оператором завершён.")
         return
 
     if not text:

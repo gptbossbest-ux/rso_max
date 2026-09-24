@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
+import pytest
+
 import bot
 from rso_bot import max_transport
 
@@ -93,6 +95,33 @@ def test_send_buttons_builds_inline_keyboard_without_changing_buttons():
         },
     )
     assert buttons[0][0]["payload"] == "yes"
+
+
+@pytest.mark.parametrize("url", [
+    "javascript:alert(1)", "data:text/plain,x", "file:///etc/passwd",
+    "https://user:password@example.test/path", "//example.test/path",
+    "https://example.test:444/path", "https://example.test/" + "x" * 2048,
+    "https://example.test/path\nnext",
+])
+def test_link_button_rejects_unsafe_urls(url):
+    with pytest.raises(ValueError):
+        max_transport.make_link_button("Сайт", url)
+
+
+def test_link_button_matches_max_inline_keyboard_contract():
+    button = max_transport.make_link_button(
+        "Открыть личный кабинет", "https://example.test/account?q=1",
+    )
+    assert button == {
+        "type": "link", "text": "Открыть личный кабинет",
+        "url": "https://example.test/account?q=1",
+    }
+    sender = Mock(return_value=True)
+    max_transport.send_buttons(7, "Текст [не становится](разметкой)", [[button]], sender=sender)
+    payload = sender.call_args.args[1]
+    assert payload["text"] == "Текст [не становится](разметкой)"
+    assert "format" not in payload
+    assert payload["attachments"][0]["payload"]["buttons"] == [[button]]
 
 
 def test_ack_callback_posts_expected_answer():

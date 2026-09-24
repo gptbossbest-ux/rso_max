@@ -121,7 +121,11 @@ def _rating_buttons(dialog_id: int) -> list[list[dict[str, Any]]]:
     return [[
         {"type": "callback", "text": str(value), "payload": f"operator_rate:{dialog_id}-{value}"}
         for value in range(1, 6)
-    ]]
+    ], [{"type": "callback", "text": "🏠 Главное меню", "payload": "main_menu"}]]
+
+
+def _main_menu_buttons() -> list[list[dict[str, Any]]]:
+    return [[{"type": "callback", "text": "🏠 Главное меню", "payload": "main_menu"}]]
 
 
 def get_settings() -> dict[str, Any]:
@@ -410,11 +414,22 @@ def queue_position(dialog_id: int) -> int | None:
 
 def cancel_waiting(chat_id: int, now: datetime | None = None) -> bool:
     with _connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT id FROM operator_dialogs WHERE chat_id=? AND status='waiting'", (chat_id,),
+        ).fetchone()
+        if not row:
+            return False
         cur = conn.execute(
-            "UPDATE operator_dialogs SET status='cancelled',closed_at=? "
-            "WHERE chat_id=? AND status='waiting'",
-            (_iso(now), chat_id),
+            "UPDATE operator_dialogs SET status='cancelled',closed_at=? WHERE id=? AND status='waiting'",
+            (_iso(now), row["id"]),
         )
+        if cur.rowcount:
+            _enqueue_outbox_locked(
+                conn, event_key=f"dialog:{row['id']}:cancelled_by_client",
+                dialog_id=row["id"], chat_id=chat_id, kind="buttons",
+                body="Ожидание оператора отменено.", buttons=_main_menu_buttons(), now=now,
+            )
     return bool(cur.rowcount)
 
 
@@ -747,8 +762,8 @@ def create_client_report(
         )
         _enqueue_outbox_locked(
             conn, event_key=f"report:{report_id}:closed", dialog_id=dialog_id,
-            chat_id=dialog["chat_id"], kind="text",
-            body="Диалог с оператором завершён.", now=now,
+            chat_id=dialog["chat_id"], kind="buttons",
+            body="Диалог с оператором завершён.", buttons=_main_menu_buttons(), now=now,
         )
         row = conn.execute(
             "SELECT * FROM operator_client_reports WHERE id=?", (report_id,),
@@ -969,7 +984,8 @@ def process_timeouts(now: datetime | None = None) -> dict[str, list[dict[str, An
             _enqueue_outbox_locked(
                 conn, event_key=f"dialog:{row['id']}:waiting_timeout", chat_id=row["chat_id"],
                 dialog_id=row["id"],
-                kind="text", body="Время ожидания оператора истекло. Пожалуйста, попробуйте позже.",
+                kind="buttons", body="Время ожидания оператора истекло. Пожалуйста, попробуйте позже.",
+                buttons=_main_menu_buttons(),
                 now=now,
             )
     result["assigned"] = assign_waiting(now=now)
