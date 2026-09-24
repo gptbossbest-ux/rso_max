@@ -1313,12 +1313,13 @@ _RESET_COMMANDS = ("/start", "/help", "/menu")
 
 
 def _reconcile_operator_terminal(chat_id: int) -> bool:
-    """Consume stale updates until the durable terminal notice is delivered."""
+    """Reconcile stale flow, consuming only updates used for notice recovery."""
     state = _get_state(chat_id)
     if state.get("state") != S.OPERATOR_CHAT or operator_chat.get_open_dialog_for_chat(chat_id):
         return False
     terminal = operator_chat.ensure_terminal_notification(chat_id)
-    if terminal and terminal["status"] != "delivered":
+    was_already_delivered = bool(terminal and terminal["status"] == "delivered")
+    if terminal and not was_already_delivered:
         result = _flush_operator_outbox(terminal["id"])
         delivered = bool(result and result[0]["status"] == "delivered")
     elif terminal:
@@ -1330,7 +1331,10 @@ def _reconcile_operator_terminal(chat_id: int) -> bool:
     if delivered:
         _clear_flow(state)
         _touch(state)
-    return True
+    # A callback can be the first rating click on the just-delivered terminal
+    # keyboard.  Once delivery was already durable, clear stale local state but
+    # let that current callback continue to the rating handler.
+    return not was_already_delivered
 
 
 def handle_message(message: dict) -> None:

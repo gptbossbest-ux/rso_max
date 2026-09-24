@@ -9,6 +9,7 @@ patch points without introducing a circular import.
 from __future__ import annotations
 
 import logging
+import re
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -17,6 +18,11 @@ from typing import Any
 State = dict[str, Any]
 Button = dict[str, Any]
 PAGE_ROWS = 29
+_TOKEN_PATTERN = re.compile(r"[0-9a-f]{8}\Z", re.ASCII)
+
+
+def _valid_render_token(value: Any) -> bool:
+    return isinstance(value, str) and _TOKEN_PATTERN.fullmatch(value) is not None
 
 
 @dataclass(frozen=True)
@@ -112,6 +118,7 @@ def show_scripts_page(chat_id: int, token: str, page: int, deps: FaqDependencies
     if (
         state.get("state") != deps.script_list_state
         or "faq_scripts" not in state
+        or not _valid_render_token(token)
         or not secrets.compare_digest(str(state.get("faq_scripts_token", "")), token)
     ):
         state["state"] = deps.menu_state
@@ -249,6 +256,7 @@ def show_node_page(
         state.get("state") != deps.script_node_state
         or script.get("id") != script_id
         or script.get("current") != node_id
+        or not _valid_render_token(token)
         or not secrets.compare_digest(str(script.get("render_token", "")), token)
     ):
         state["state"] = deps.menu_state
@@ -309,6 +317,7 @@ def navigate_bound_action(
         state.get("state") != deps.script_node_state
         or script.get("id") != script_id
         or script.get("current") != current_id
+        or not _valid_render_token(token)
         or not secrets.compare_digest(str(script.get("render_token", "")), token)
         or not valid_edge
     ):

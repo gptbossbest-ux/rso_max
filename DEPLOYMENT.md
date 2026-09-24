@@ -117,9 +117,12 @@ TRUSTED_PROXY_CIDRS=
 EXPECT_REVERSE_PROXY=true
 ```
 
-Перед включением proxy посмотрите фактический `REMOTE_ADDR` в access-log Nginx
-и адрес gateway сети: `docker network inspect <project>_backend`. Добавьте
-конкретный адрес proxy как `/32` (или IPv6 `/128`) отдельно для
+Перед включением proxy временно выведите или измерьте именно app-side значение
+Flask `request.remote_addr` (то есть адрес peer, который видит Gunicorn), а также
+сверьте адреса контейнерной сети командой
+`docker network inspect <project>_backend`. Значение Nginx `$remote_addr` — это
+адрес клиента на стороне Nginx, а не peer Flask, и для allowlist не подходит.
+Добавьте измеренный адрес proxy/gateway как `/32` (или IPv6 `/128`) отдельно для
 каждого контура. Не предполагайте, что host Nginx виден как loopback:
 
 ```dotenv

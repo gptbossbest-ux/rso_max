@@ -1401,10 +1401,20 @@ def test_admin_block_preflights_every_live_delivery_and_retries_stale_lease(
         now=base + timedelta(seconds=2),
     )
     conn = db.get_conn()
+    assignment_id = conn.execute(
+        "SELECT id FROM operator_outbox WHERE dialog_id=? AND event_key LIKE ?",
+        (active["id"], f"dialog:{active['id']}:assigned:%"),
+    ).fetchone()["id"]
+    operator_chat._enqueue_outbox_locked(
+        conn, event_key=f"dialog:{active['id']}:warning_correction:test",
+        dialog_id=active["id"], chat_id=510, kind="text", body="obsolete",
+        now=base + timedelta(seconds=3),
+    )
+    conn.commit()
     if event_kind == "operator":
         conn.execute(
-            "UPDATE operator_outbox SET status='delivered' WHERE dialog_id=?",
-            (active["id"],),
+            "UPDATE operator_outbox SET status='delivered' WHERE id=?",
+            (assignment_id,),
         )
         conn.commit()
         conn.close()
@@ -1415,11 +1425,11 @@ def test_admin_block_preflights_every_live_delivery_and_retries_stale_lease(
         conn = db.get_conn()
         selector, value = "message_id=?", message["id"]
     else:
-        selector, value = "dialog_id=?", active["id"]
+        selector, value = "id=?", assignment_id
         if event_kind == "warning":
             conn.execute(
-                "UPDATE operator_outbox SET event_key=? WHERE dialog_id=?",
-                (f"dialog:{active['id']}:warning:{active['last_activity_at']}", active["id"]),
+                "UPDATE operator_outbox SET event_key=? WHERE id=?",
+                (f"dialog:{active['id']}:warning:{active['last_activity_at']}", assignment_id),
             )
     decision_at = base + timedelta(seconds=4)
     conn.execute(
@@ -1449,6 +1459,51 @@ def test_admin_block_preflights_every_live_delivery_and_retries_stale_lease(
     )
     assert result["blocked"] is True
     assert operator_chat.get_open_dialog_for_chat(510) is None
+    correction = next(
+        row for row in _outbox_rows(active["id"])
+        if "warning_correction" in row["event_key"]
+    )
+    assert correction["last_error"] == "cancelled_by_block"
+
+
+@pytest.mark.parametrize("transition", ["close", "report", "transfer", "requeue", "timeout"])
+def test_pending_warning_correction_is_superseded_by_dialog_transition(
+    operator_db, transition,
+):
+    _settings(max_active_dialogs=1, inactivity_timeout_min=30, warning_before_min=5)
+    owner = _operator(f"correction-{transition}")
+    base = datetime(2026, 7, 1, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(owner, now=base)
+    dialog = operator_chat.request_dialog(
+        540, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+    operator_chat.deliver_outbox(lambda _item: (True, None), now=base)
+    with operator_chat._connection() as conn:
+        operator_chat._enqueue_outbox_locked(
+            conn, event_key=f"dialog:{dialog['id']}:warning_correction:test",
+            dialog_id=dialog["id"], chat_id=540, kind="text", body="obsolete",
+            now=base + timedelta(seconds=1),
+        )
+    if transition == "close":
+        operator_chat.close_dialog(dialog["id"], owner, now=base + timedelta(seconds=2))
+    elif transition == "report":
+        operator_chat.create_client_report(
+            dialog["id"], owner, "spam", "", now=base + timedelta(seconds=2),
+        )
+    elif transition == "transfer":
+        operator_chat.transfer_all_dialogs(owner, now=base + timedelta(seconds=2))
+    elif transition == "requeue":
+        operator_chat.process_timeouts(now=base + timedelta(minutes=6))
+    else:
+        operator_chat.heartbeat(owner, now=base + timedelta(minutes=31))
+        operator_chat.process_timeouts(now=base + timedelta(minutes=31))
+    correction = next(
+        row for row in _outbox_rows(dialog["id"])
+        if "warning_correction" in row["event_key"]
+    )
+    assert correction["status"] == "failed"
+    assert correction["next_retry_at"] is None
+    assert correction["last_error"].startswith(("superseded_", "cancelled_"))
 
 
 @pytest.mark.parametrize("delivery_result", [
@@ -2024,7 +2079,7 @@ def test_assignment_send_cas_finishes_before_later_transition(operator_db):
     owner = _operator("assignment-cas")
     base = datetime(2026, 4, 2, 10, tzinfo=timezone.utc)
     operator_chat.start_shift(owner, now=base)
-    dialog = operator_chat.request_dialog(
+    operator_chat.request_dialog(
         451, profile=None, faq_context=None, ai_messages=[], now=base,
     )
 
@@ -2117,6 +2172,36 @@ def test_stale_callback_rearms_terminal_notice_before_dispatch(
     })
     assert sent == [f"dialog:{dialog['id']}:closed"]
     assert state["state"] == bot.S.MENU
+
+
+def test_first_rating_click_dispatches_after_delivered_terminal(operator_db, monkeypatch):
+    _settings(max_active_dialogs=1)
+    owner = _operator("terminal-first-rating")
+    operator_chat.start_shift(owner)
+    dialog = operator_chat.request_dialog(
+        532, profile=None, faq_context=None, ai_messages=[],
+    )
+    operator_chat.deliver_outbox(lambda _item: (True, None))
+    operator_chat.close_dialog(dialog["id"], owner)
+    operator_chat.deliver_outbox(lambda _item: (True, None))
+    state = bot._get_state(532)
+    state["state"] = bot.S.OPERATOR_CHAT
+    menus = []
+    monkeypatch.setattr(bot, "_ack_callback", lambda _callback_id: None)
+    monkeypatch.setattr(
+        bot, "send_main_menu",
+        lambda chat_id, text=None: menus.append((chat_id, text)) or True,
+    )
+    bot.handle_callback({
+        "message": {"recipient": {"chat_id": 532}},
+        "callback": {
+            "callback_id": "rating-first-click",
+            "payload": f"operator_rate:{dialog['id']}-5",
+        },
+    })
+    saved = operator_chat.get_history_dialog(dialog["id"])
+    assert saved["rating"] == 5
+    assert menus == [(532, "Спасибо за оценку!")]
 
 
 @pytest.mark.parametrize(("status", "attempts", "next_retry", "expected_state"), [
@@ -2325,3 +2410,52 @@ def test_login_rate_limit_isolated_by_account_behind_same_proxy(operator_db):
     assert db.get_login_block_seconds(first) > 0
     assert db.get_login_block_seconds(second) == 0
     assert first != second
+
+
+def test_web_login_two_level_limiter_bounds_unknown_names_and_preserves_peer(operator_db):
+    ok, _ = db.create_user("proxy-first", "sufficient-password", "First", "operator")
+    assert ok
+    ok, _ = db.create_user("proxy-second", "sufficient-password", "Second", "operator")
+    assert ok
+    ip = "172.30.0.9"
+    client = web.app.test_client()
+    for _ in range(5):
+        client.post(
+            "/login", data={"username": "proxy-first", "password": "wrong"},
+            environ_base={"REMOTE_ADDR": ip},
+        )
+    response = client.post(
+        "/login",
+        data={"username": "proxy-second", "password": "sufficient-password"},
+        environ_base={"REMOTE_ADDR": ip},
+    )
+    assert response.status_code == 302
+
+    unknown_ip = "172.30.0.10"
+    stranger = web.app.test_client()
+    for index in range(20):
+        stranger.post(
+            "/login", data={"username": f"unknown-{index}", "password": "wrong"},
+            environ_base={"REMOTE_ADDR": unknown_ip},
+        )
+    conn = db.get_conn()
+    keys = conn.execute(
+        "SELECT ip FROM login_rate_limits WHERE ip LIKE ?",
+        (f"{unknown_ip}|%",),
+    ).fetchall()
+    conn.close()
+    assert len(keys) == 2  # one IP sentinel and one shared unknown-account bucket
+    assert db.get_login_block_seconds(web._login_ip_limit_key(unknown_ip)) == 0
+
+
+def test_ip_spray_bucket_has_higher_bounded_threshold(operator_db):
+    key = web._login_ip_limit_key("192.0.2.200")
+    for _ in range(web._MAX_IP_LOGIN_ATTEMPTS - 1):
+        blocked, _ = db.record_login_failure(
+            key, max_attempts=web._MAX_IP_LOGIN_ATTEMPTS,
+        )
+        assert not blocked
+    blocked, _ = db.record_login_failure(
+        key, max_attempts=web._MAX_IP_LOGIN_ATTEMPTS,
+    )
+    assert blocked

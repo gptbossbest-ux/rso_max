@@ -3,6 +3,7 @@ from __future__ import annotations
 from unittest.mock import Mock
 
 import bot
+import pytest
 from rso_bot import max_transport
 from rso_bot.flows import faq
 
@@ -224,13 +225,13 @@ def test_node_edges_paginate_without_invalid_max_keyboard():
     edges = [{"label": f"Вариант {index}", "to_node_id": index + 2} for index in range(35)]
     state["script"] = {
         "id": 7, "nodes": {1: {"id": 1, "title": "Выбор", "is_terminal": False}},
-        "edges_by_from": {1: edges}, "current": 1, "render_token": "page-token",
+        "edges_by_from": {1: edges}, "current": 1, "render_token": "deadbeef",
     }
     state["state"] = "script_node"
     faq.show_script_node(42, deps)
     assert deps.send_buttons.call_count == 1
     assert len(deps.send_buttons.call_args.args[2]) == 30
-    faq.show_node_page(42, 7, 1, "page-token", 1, deps)
+    faq.show_node_page(42, 7, 1, "deadbeef", 1, deps)
     assert deps.send_buttons.call_count == 2
     assert len(deps.send_buttons.call_args.args[2]) == 8
 
@@ -241,7 +242,7 @@ def test_bound_faq_action_rejects_stale_and_non_edge_targets():
         "state": "script_node",
         "script": {
             "id": 7,
-            "render_token": "current-token",
+            "render_token": "deadbeef",
             "nodes": {
                 1: {"id": 1, "title": "Root", "is_terminal": False},
                 2: {"id": 2, "title": "Child", "is_terminal": False},
@@ -255,15 +256,15 @@ def test_bound_faq_action_rejects_stale_and_non_edge_targets():
             "path": ["FAQ", "Root"],
         },
     })
-    faq.navigate_bound_action(42, 7, 1, 3, "current-token", deps)
+    faq.navigate_bound_action(42, 7, 1, 3, "deadbeef", deps)
     assert state["script"]["current"] == 1
-    faq.navigate_bound_action(42, 7, 1, 2, "stale-token", deps)
+    faq.navigate_bound_action(42, 7, 1, 2, "cafebabe", deps)
     assert state["script"]["current"] == 1
-    faq.navigate_bound_action(42, 7, 1, 2, "current-token", deps)
+    faq.navigate_bound_action(42, 7, 1, 2, "deadbeef", deps)
     assert state["script"]["current"] == 2
     new_token = state["script"]["render_token"]
-    assert new_token != "current-token"
-    faq.navigate_bound_action(42, 7, 1, 2, "current-token", deps)
+    assert new_token != "deadbeef"
+    faq.navigate_bound_action(42, 7, 1, 2, "deadbeef", deps)
     assert state["script"]["current"] == 2
     assert state["script"]["render_token"] == new_token
 
@@ -293,9 +294,38 @@ def test_stale_or_invalid_faq_page_fails_safe():
     deps.send_main_menu.assert_called_once_with(42)
     state["state"] = "script_list"
     state["faq_scripts"] = [{"id": index, "title": f"A {index}"} for index in range(61)]
-    state["faq_scripts_token"] = "current"
-    faq.show_scripts_page(42, "current", 99, deps)
+    state["faq_scripts_token"] = "deadbeef"
+    faq.show_scripts_page(42, "deadbeef", 99, deps)
     assert deps.send_message.call_args.args == (42, "Неверная страница FAQ.")
+
+
+@pytest.mark.parametrize("bad_token", ["юникод00", "a" * 4096, "ABCDEF12", "abc"])
+def test_all_faq_callback_tokens_fail_closed_without_type_error(bad_token):
+    deps, state = _dependencies(scripts=([{"id": 1, "title": "A"}], None))
+    state.update({
+        "state": "script_list", "faq_scripts": [{"id": 1, "title": "A"}],
+        "faq_scripts_token": "deadbeef",
+    })
+    faq.show_scripts_page(42, bad_token, 0, deps)
+    assert state["state"] == "menu"
+
+    for action in ("page", "go"):
+        state.update({
+            "state": "script_node",
+            "script": {
+                "id": 7, "render_token": "deadbeef", "current": 1,
+                "nodes": {
+                    1: {"id": 1, "title": "Root", "is_terminal": False},
+                    2: {"id": 2, "title": "Child", "is_terminal": True},
+                },
+                "edges_by_from": {1: [{"label": "Next", "to_node_id": 2}]},
+            },
+        })
+        if action == "page":
+            faq.show_node_page(42, 7, 1, bad_token, 0, deps)
+        else:
+            faq.navigate_bound_action(42, 7, 1, 2, bad_token, deps)
+        assert state.get("script", {}).get("current") != 2
 
 
 def test_invalid_legacy_faq_button_is_skipped_without_crash():

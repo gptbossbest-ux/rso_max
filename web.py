@@ -151,8 +151,10 @@ CHANNELS = {
 # ── Брутфорс-защита логина ────────────────────────────────────────────────────
 
 _MAX_LOGIN_ATTEMPTS = 5
+_MAX_IP_LOGIN_ATTEMPTS = 50
 _LOGIN_BLOCK_MINUTES = 15
 _LOGIN_WINDOW_MINUTES = 15
+_MAX_LOGIN_NAME_LENGTH = 128
 _ACCOUNTS_PAGE_SIZE = 50
 _CSRF_SESSION_KEY = "_csrf_token"
 _DEFAULT_TRUSTED_PROXY_CIDRS = ""
@@ -208,6 +210,10 @@ def _login_limit_key(ip: str, username: str) -> str:
     identity = username.strip().casefold().encode("utf-8", errors="replace")[:512]
     digest = hashlib.sha256(identity).hexdigest()[:32]
     return f"{ip}|{digest}"
+
+
+def _login_ip_limit_key(ip: str) -> str:
+    return f"{ip}|*"
 
 
 def _warn_proxy_configuration() -> None:
@@ -368,12 +374,15 @@ def login():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        limiter_key = _login_limit_key(ip, username)
-        block_msg = _check_login_block(limiter_key)
+        ip_limiter_key = _login_ip_limit_key(ip)
+        if len(username) > _MAX_LOGIN_NAME_LENGTH:
+            username = ""
+        user = db.get_user(username) if username else None
+        limiter_key = _login_limit_key(ip, username if user else "")
+        block_msg = _check_login_block(ip_limiter_key) or _check_login_block(limiter_key)
         if block_msg:
             flash(block_msg, "error")
             return render_template("login.html")
-        user = db.get_user(username)
 
         if user and check_password_hash(user["password"], password):
             _ok_login(limiter_key)
@@ -391,7 +400,18 @@ def login():
                 return redirect(url_for("change_own_password"))
             return redirect(url_for("index"))
 
+        ip_blocked, _ = db.record_login_failure(
+            ip_limiter_key,
+            max_attempts=_MAX_IP_LOGIN_ATTEMPTS,
+            window_minutes=_LOGIN_WINDOW_MINUTES,
+            block_minutes=_LOGIN_BLOCK_MINUTES,
+        )
         msg = _fail_login(limiter_key)
+        if ip_blocked:
+            msg = (
+                "Превышено число попыток с этого адреса. "
+                f"Вход заблокирован на {_LOGIN_BLOCK_MINUTES} мин."
+            )
         flash(msg, "error")
         log.warning("Неудачный вход: %s  ip=%s", username, ip)
 

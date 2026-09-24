@@ -1991,6 +1991,15 @@ def record_login_failure(
                )""",
             ((now - timedelta(days=7)).isoformat(timespec="seconds"),),
         )
+        row_count = int(conn.execute(
+            "SELECT COUNT(*) n FROM login_rate_limits",
+        ).fetchone()["n"])
+        if row_count >= 10_000:
+            conn.execute(
+                """DELETE FROM login_rate_limits WHERE ip IN (
+                       SELECT ip FROM login_rate_limits ORDER BY updated_at LIMIT 100
+                   )"""
+            )
         row = conn.execute(
             "SELECT * FROM login_rate_limits WHERE ip=?", (ip,),
         ).fetchone()

@@ -323,10 +323,13 @@ def _supersede_dialog_events_locked(conn: Any, dialog_id: int, reason: str) -> N
     conn.execute(
         """UPDATE operator_outbox SET status='failed',attempts=?,next_retry_at=NULL,
            lease_at=NULL,last_error=? WHERE dialog_id=? AND status!='delivered'
-           AND message_id IS NULL AND (event_key LIKE ? OR event_key LIKE ?)""",
+           AND message_id IS NULL AND (
+               event_key LIKE ? OR event_key LIKE ? OR event_key LIKE ?
+           )""",
         (
             MAX_OUTBOX_ATTEMPTS, reason, dialog_id,
             f"dialog:{dialog_id}:assigned:%", f"dialog:{dialog_id}:warning:%",
+            f"dialog:{dialog_id}:warning_correction:%",
         ),
     )
 
