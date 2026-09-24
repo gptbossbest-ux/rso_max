@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Жалобы на клиентов{% endblock %}
+{% block content %}
+<h1>🚫 Жалобы на клиентов</h1>
+<p><a href="?status=pending">Ожидают решения</a> · <a href="?status=confirmed">Подтверждены</a> · <a href="?status=rejected">Отклонены</a> · <a href="{{ url_for('operator_reports_page') }}">Все</a></p>
+<div class="card"><div class="card-body"><table class="table"><tr><th>ID</th><th>Создана</th><th>Оператор</th><th>MAX ID</th><th>Причина</th><th>Статус</th></tr>{% for r in reports %}<tr><td><a href="{{ url_for('operator_report_detail', report_id=r.id) }}">{{ r.id }}</a></td><td>{{ r.created_at }}</td><td>{{ r.operator_name or '—' }}</td><td>{{ r.client_chat_id }}</td><td>{{ reasons.get(r.reason, r.reason) }}</td><td>{{ r.status }}</td></tr>{% endfor %}</table></div></div>
+<h2>Заблокированные пользователи</h2>
+<div class="card"><div class="card-body"><table class="table"><tr><th>MAX ID</th><th>Подтверждено</th><th>Дата блокировки</th><th></th></tr>{% for b in blocked %}<tr><td>{{ b.chat_id }}</td><td>{{ b.confirmed_count }}</td><td>{{ b.blocked_at }}</td><td><button class="btn btn-warning" onclick="unblock({{ b.chat_id }})">Разблокировать</button></td></tr>{% endfor %}</table></div></div>
+<script>const csrf={{ csrf_token|tojson }};async function unblock(id){if(!confirm('Разблокировать пользователя?'))return;const r=await fetch(`/operator-chat/blocked/${id}/unblock`,{method:'POST',headers:{'X-CSRF-Token':csrf}});if(r.ok)location.reload();else alert('Не удалось разблокировать пользователя.')}</script>
+{% endblock %}

@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}История операторских диалогов{% endblock %}
+{% block content %}
+<h1>История операторских диалогов</h1>
+<div class="card"><div class="card-body p-0"><table class="table"><thead><tr><th>№</th><th>Клиент</th><th>Оператор</th><th>Статус</th><th>Закрыт</th><th>Оценка</th></tr></thead><tbody>
+{% for d in dialogs %}<tr><td><a href="{{ url_for('operator_chat_history_detail', dialog_id=d.id) }}">{{ d.id }}</a></td><td>{{ d.client_fio or 'Неавторизованный/удалён' }}</td><td>{{ d.operator_name or '—' }}</td><td>{{ d.status }}</td><td>{{ d.closed_at or '—' }}</td><td>{{ d.rating or '—' }}</td></tr>{% endfor %}
+</tbody></table></div></div>
+{% endblock %}

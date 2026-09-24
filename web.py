@@ -20,38 +20,55 @@ from __future__ import annotations
 # (который тянет httpx) и до локальных `import httpx` внутри broadcast()/
 # appointment_cancel().
 import truststore
+
 truststore.inject_into_ssl()
 
+import hashlib
+import ipaddress
 import json
 import logging
 import os
-from collections import defaultdict
+import secrets
+import shutil
+import sqlite3
+import time
+import uuid
 from datetime import datetime, timedelta
 from functools import wraps
 from logging.handlers import RotatingFileHandler
 
 from flask import (
     Flask,
+    abort,
     flash,
+    jsonify,
     redirect,
     render_template,
     request,
+    send_file,
     session,
     url_for,
 )
-from werkzeug.security import check_password_hash
+from werkzeug.security import check_password_hash, generate_password_hash
 
 import client_api
 import database as db
 from config import (
+    API,
+    APP_ENV,
     DB_PATH,
     ENABLE_1C_INTEGRATION,
     LOG_BACKUP_COUNT,
     LOG_FILE,
     LOG_LEVEL,
     LOG_MAX_BYTES,
+    OPERATOR_CHAT_IMAGE_DIR,
     SECRET_KEY,
+    TOKEN,
+    YANDEXGPT_API_KEY,
+    YANDEXGPT_FOLDER_ID,
 )
+from rso_bot import max_transport, operator_chat
 
 # ── Логгер ────────────────────────────────────────────────────────────────────
 
@@ -90,6 +107,7 @@ log = _setup_logger()
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
 
 
 @app.get("/healthz")
@@ -131,32 +149,108 @@ CHANNELS = {
 
 # ── Брутфорс-защита логина ────────────────────────────────────────────────────
 
-_login_attempts: dict = defaultdict(lambda: {"attempts": 0, "blocked_until": None})
 _MAX_LOGIN_ATTEMPTS = 5
+_MAX_IP_LOGIN_ATTEMPTS = 50
 _LOGIN_BLOCK_MINUTES = 15
+_LOGIN_WINDOW_MINUTES = 15
+_MAX_LEGACY_LOGIN_NAME_LENGTH = 4096
+_GENERIC_LOGIN_FAILURE = "Неверный логин или пароль. Попробуйте позже."
+_DUMMY_PASSWORD_HASH = generate_password_hash("dummy-password-not-used")
+_ACCOUNTS_PAGE_SIZE = 50
+_CSRF_SESSION_KEY = "_csrf_token"
+_DEFAULT_TRUSTED_PROXY_CIDRS = ""
+
+
+def _normalize_login_ip(value: str | None) -> str:
+    """Canonicalize the trusted WSGI peer address into a bounded DB key."""
+    try:
+        parsed = ipaddress.ip_address((value or "").strip())
+    except ValueError:
+        return "unknown"
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped:
+        parsed = parsed.ipv4_mapped
+    return parsed.compressed
+
+
+def _trusted_proxy_networks(value: str | None = None) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    """Parse the explicit immediate-proxy allowlist; invalid entries fail closed."""
+    raw = os.getenv("TRUSTED_PROXY_CIDRS", _DEFAULT_TRUSTED_PROXY_CIDRS) if value is None else value
+    networks = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            log.warning("TRUSTED_PROXY_CIDRS contains an invalid network; forwarded IPs disabled")
+            return ()
+    return tuple(networks)
+
+
+def _client_login_ip(remote_addr: str | None, forwarded_for: str | None) -> str:
+    """Accept exactly one forwarded hop only from an explicitly trusted peer."""
+    remote = _normalize_login_ip(remote_addr)
+    try:
+        peer = ipaddress.ip_address(remote)
+    except ValueError:
+        return remote
+    trusted = any(peer.version == network.version and peer in network for network in _trusted_proxy_networks())
+    if not trusted or not forwarded_for:
+        return remote
+    # Nginx is configured to overwrite, not append, X-Forwarded-For.  Multiple
+    # values are therefore malformed/spoofed and deliberately ignored.
+    if "," in forwarded_for or forwarded_for != forwarded_for.strip():
+        return remote
+    forwarded = _normalize_login_ip(forwarded_for)
+    return remote if forwarded == "unknown" else forwarded
+
+
+def _login_limit_key(ip: str, username: str) -> str:
+    """Isolate users behind one gateway without persisting their login name."""
+    identity = username.strip().encode("utf-8", errors="replace")
+    digest = hashlib.sha256(identity).hexdigest()[:32]
+    return f"{ip}|{digest}"
+
+
+def _login_ip_limit_key(ip: str) -> str:
+    return f"{ip}|*"
+
+
+def _warn_proxy_configuration() -> None:
+    if (
+        APP_ENV == "production"
+        and os.getenv("EXPECT_REVERSE_PROXY", "").lower() in {"1", "true", "yes"}
+        and not os.getenv("TRUSTED_PROXY_CIDRS", "").strip()
+    ):
+        log.warning(
+            "Reverse proxy expected but TRUSTED_PROXY_CIDRS is empty; "
+            "X-Forwarded-For will be ignored"
+        )
+
+
+_warn_proxy_configuration()
 
 
 def _check_login_block(ip: str) -> str | None:
-    info = _login_attempts[ip]
-    if info["blocked_until"] and datetime.now() < info["blocked_until"]:
-        remaining = int((info["blocked_until"] - datetime.now()).total_seconds() / 60) + 1
-        return f"Слишком много попыток. Попробуйте через {remaining} мин."
+    remaining_seconds = db.get_login_block_seconds(ip)
+    if remaining_seconds:
+        return _GENERIC_LOGIN_FAILURE
     return None
 
 
 def _fail_login(ip: str) -> str:
-    info = _login_attempts[ip]
-    info["attempts"] += 1
-    left = _MAX_LOGIN_ATTEMPTS - info["attempts"]
-    if info["attempts"] >= _MAX_LOGIN_ATTEMPTS:
-        info["blocked_until"] = datetime.now() + timedelta(minutes=_LOGIN_BLOCK_MINUTES)
-        info["attempts"] = 0
-        return f"Превышено число попыток. Вход заблокирован на {_LOGIN_BLOCK_MINUTES} мин."
-    return f"Неверный логин или пароль. Осталось попыток: {left}"
+    db.record_login_failure(
+        ip,
+        max_attempts=_MAX_LOGIN_ATTEMPTS,
+        window_minutes=_LOGIN_WINDOW_MINUTES,
+        block_minutes=_LOGIN_BLOCK_MINUTES,
+    )
+    return _GENERIC_LOGIN_FAILURE
 
 
 def _ok_login(ip: str) -> None:
-    _login_attempts.pop(ip, None)
+    db.reset_login_rate_limit(ip)
 
 
 # ── Декораторы доступа ────────────────────────────────────────────────────────
@@ -188,6 +282,38 @@ def admin_required(f):
     return decorated
 
 
+def operator_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        user = _validated_session_user()
+        if user is None:
+            return redirect(url_for("login"))
+        if user["must_change_password"]:
+            return redirect(url_for("change_own_password"))
+        if user["role"] != "operator":
+            abort(403)
+        return f(*args, **kwargs)
+    return decorated
+
+
+def csrf_protected(f):
+    """Require a session-bound token for browser form mutations."""
+
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        expected = session.get(_CSRF_SESSION_KEY)
+        submitted = request.form.get("csrf_token", "") or request.headers.get("X-CSRF-Token", "")
+        if (
+            not isinstance(expected, str)
+            or not expected
+            or not secrets.compare_digest(expected, submitted)
+        ):
+            abort(400)
+        return f(*args, **kwargs)
+
+    return decorated
+
+
 def _validated_session_user():
     """Сверяет cookie-сессию с текущим пользователем и версией в БД."""
     saved = session.get("user")
@@ -216,6 +342,14 @@ def _operator_id() -> int | None:
     return session.get("user", {}).get("id")
 
 
+def _csrf_token() -> str:
+    token = session.get(_CSRF_SESSION_KEY)
+    if not isinstance(token, str) or not token:
+        token = secrets.token_urlsafe(32)
+        session[_CSRF_SESSION_KEY] = token
+    return token
+
+
 def _enrich_appeals(rows) -> list[dict]:
     """Дополняет список обращений читаемыми метками."""
     result = []
@@ -233,20 +367,26 @@ def _enrich_appeals(rows) -> list[dict]:
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    ip = request.remote_addr
-
-    block_msg = _check_login_block(ip)
-    if block_msg:
-        flash(block_msg, "error")
-        return render_template("login.html")
+    ip = _client_login_ip(request.remote_addr, request.headers.get("X-Forwarded-For"))
 
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        user = db.get_user(username)
-
-        if user and check_password_hash(user["password"], password):
-            _ok_login(ip)
+        ip_limiter_key = _login_ip_limit_key(ip)
+        lookup_name = username if len(username) <= _MAX_LEGACY_LOGIN_NAME_LENGTH else ""
+        user = db.get_user(lookup_name) if lookup_name else None
+        limiter_key = _login_limit_key(ip, username if user else "")
+        password_ok = check_password_hash(
+            user["password"] if user else _DUMMY_PASSWORD_HASH,
+            password,
+        )
+        block_msg = _check_login_block(ip_limiter_key) or _check_login_block(limiter_key)
+        if block_msg:
+            flash(block_msg, "error")
+            return render_template("login.html")
+        if user and password_ok:
+            _ok_login(limiter_key)
+            session.clear()
             session["user"] = {
                 "id":       user["id"],      # нужен для operator_id в API
                 "username": user["username"],
@@ -255,21 +395,28 @@ def login():
                 "session_version": user["session_version"],
                 "must_change_password": bool(user["must_change_password"]),
             }
-            log.info("Вход: %s  ip=%s", username, ip)
+            log.info("Вход user_id=%s ip=%s", user["id"], ip)
             if user["must_change_password"]:
                 return redirect(url_for("change_own_password"))
             return redirect(url_for("index"))
 
-        msg = _fail_login(ip)
+        db.record_login_failure(
+            ip_limiter_key,
+            max_attempts=_MAX_IP_LOGIN_ATTEMPTS,
+            window_minutes=_LOGIN_WINDOW_MINUTES,
+            block_minutes=_LOGIN_BLOCK_MINUTES,
+        )
+        msg = _fail_login(limiter_key)
         flash(msg, "error")
-        log.warning("Неудачный вход: %s  ip=%s", username, ip)
+        log.warning("Неудачный вход ip=%s", ip)
 
     return render_template("login.html")
 
 
 @app.route("/logout")
 def logout():
-    user = session.pop("user", {})
+    user = session.get("user", {})
+    session.clear()
     log.info("Выход: %s", user.get("username", "?"))
     return redirect(url_for("login"))
 
@@ -302,6 +449,43 @@ def index():
         counts=counts,
         statuses=STATUSES,
         status_colors=STATUS_COLORS,
+        user=session["user"],
+    )
+
+
+# ── ИИ-помощник ─────────────────────────────────────────────────────────────────────────
+
+@app.route("/ai-settings", methods=["GET", "POST"])
+@admin_required
+def ai_settings_page():
+    if request.method == "POST":
+        expected = session.get(_CSRF_SESSION_KEY)
+        submitted = request.form.get("csrf_token", "")
+        if not isinstance(expected, str) or not expected or not secrets.compare_digest(expected, submitted):
+            abort(400)
+        try:
+            db.update_ai_settings(
+                enabled=request.form.get("enabled") == "on",
+                model=request.form.get("model", ""),
+                system_prompt=request.form.get("system_prompt", ""),
+                daily_limit=int(request.form.get("daily_limit", "")),
+                temperature=float(request.form.get("temperature", "")),
+                max_output_tokens=int(request.form.get("max_output_tokens", "")),
+            )
+        except (ValueError, TypeError) as exc:
+            flash(str(exc) or "Проверьте значения настроек", "error")
+        except sqlite3.Error:
+            log.exception("Не удалось сохранить настройки ИИ-помощника")
+            flash("Не удалось сохранить настройки", "error")
+        else:
+            flash("Настройки ИИ-помощника сохранены", "success")
+            return redirect(url_for("ai_settings_page"))
+    return render_template(
+        "ai_settings.html",
+        settings=db.get_ai_settings(),
+        api_key_configured=bool(YANDEXGPT_API_KEY),
+        folder_configured=bool(YANDEXGPT_FOLDER_ID),
+        csrf_token=_csrf_token(),
         user=session["user"],
     )
 
@@ -556,17 +740,72 @@ def upload_file():
     return redirect(url_for("upload_page"))
 
 
+# ── Управление лицевыми счетами ──────────────────────────────────────────────
+
+@app.route("/accounts")
+@admin_required
+def accounts_page():
+    query = db.normalize_lschet_search(request.args.get("q"))
+    try:
+        requested_page = int(request.args.get("page", "1"))
+    except ValueError:
+        requested_page = 1
+    total = db.count_lschet(query)
+    total_pages = max(1, (total + _ACCOUNTS_PAGE_SIZE - 1) // _ACCOUNTS_PAGE_SIZE)
+    page = min(max(requested_page, 1), total_pages)
+    accounts = db.list_lschet(
+        query,
+        limit=_ACCOUNTS_PAGE_SIZE,
+        offset=(page - 1) * _ACCOUNTS_PAGE_SIZE,
+    )
+    return render_template(
+        "accounts.html",
+        accounts=accounts,
+        csrf_token=_csrf_token(),
+        page=page,
+        query=query,
+        total=total,
+        total_pages=total_pages,
+        user=session["user"],
+    )
+
+
+@app.route("/accounts/create", methods=["POST"])
+@admin_required
+@csrf_protected
+def account_create():
+    number = request.form.get("number", "")
+    fio = request.form.get("fio", "")
+    address = request.form.get("address", "")
+    try:
+        created = db.create_lschet(number, fio, address)
+    except ValueError as exc:
+        flash(str(exc), "error")
+    except sqlite3.DatabaseError:
+        log.error("Ошибка БД при добавлении лицевого счёта")
+        flash("Не удалось добавить лицевой счёт. Попробуйте позже.", "error")
+    else:
+        if created:
+            flash("Лицевой счёт добавлен", "success")
+        else:
+            flash("Лицевой счёт с таким номером уже существует", "error")
+    return redirect(url_for("accounts_page"))
+
+
 # ── Управление пользователями ─────────────────────────────────────────────────
 
 @app.route("/users")
 @admin_required
 def users_page():
     users = db.get_all_users()
-    return render_template("users.html", users=users, user=session["user"])
+    return render_template(
+        "users.html", users=users, user=session["user"], csrf_token=_csrf_token(),
+    )
 
 
 @app.route("/users/create", methods=["POST"])
 @admin_required
+@csrf_protected
 def user_create():
     username = request.form.get("username", "").strip()
     password = request.form.get("password", "").strip()
@@ -580,8 +819,18 @@ def user_create():
     return redirect(url_for("users_page"))
 
 
+@app.route("/users/username/<int:user_id>", methods=["POST"])
+@admin_required
+@csrf_protected
+def user_username(user_id: int):
+    ok, msg = db.change_username(user_id, request.form.get("username", ""))
+    flash(msg, "success" if ok else "error")
+    return redirect(url_for("users_page"))
+
+
 @app.route("/users/delete/<int:user_id>", methods=["POST"])
 @admin_required
+@csrf_protected
 def user_delete(user_id: int):
     if user_id == 1:
         flash("Нельзя удалить главного администратора", "error")
@@ -593,6 +842,7 @@ def user_delete(user_id: int):
 
 @app.route("/users/password/<int:user_id>", methods=["POST"])
 @admin_required
+@csrf_protected
 def user_password(user_id: int):
     pw = request.form.get("password", "").strip()
     if len(pw) < 6:
@@ -605,6 +855,7 @@ def user_password(user_id: int):
 
 @app.route("/users/role/<int:user_id>", methods=["POST"])
 @admin_required
+@csrf_protected
 def user_role(user_id: int):
     if user_id == 1:
         flash("Нельзя изменить роль главного администратора", "error")
@@ -612,6 +863,552 @@ def user_role(user_id: int):
         db.change_role(user_id, request.form.get("role", "operator"))
         flash("Роль изменена", "success")
     return redirect(url_for("users_page"))
+
+
+# ── Операторские диалоги ────────────────────────────────────────────────────
+
+def _max_headers() -> dict[str, str]:
+    return {"Authorization": TOKEN, "Content-Type": "application/json"}
+
+
+def _send_max_text(chat_id: int, text: str) -> tuple[bool, str | None]:
+    import httpx
+    try:
+        response = httpx.post(
+            f"{API}/messages", headers=_max_headers(), params={"chat_id": chat_id},
+            json={"text": text}, timeout=5,
+        )
+        if response.status_code == 200:
+            return True, None
+        return False, f"max_http_{response.status_code}"
+    except httpx.TimeoutException:
+        return False, "max_timeout"
+    except httpx.HTTPError:
+        log.warning("MAX недоступен при отправке сообщения операторского диалога chat_id=%s", chat_id)
+        return False, "max_transport"
+
+
+def _send_max_buttons(chat_id: int, text: str, buttons: list[list[dict]]) -> tuple[bool, str | None]:
+    import httpx
+    try:
+        max_transport.validate_inline_keyboard(buttons)
+    except ValueError:
+        return False, "invalid_buttons"
+    try:
+        response = httpx.post(
+            f"{API}/messages", headers=_max_headers(), params={"chat_id": chat_id},
+            json={"text": text, "attachments": [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]},
+            timeout=5,
+        )
+        if response.status_code == 200:
+            return True, None
+        return False, f"max_http_{response.status_code}"
+    except httpx.TimeoutException:
+        return False, "max_timeout"
+    except httpx.HTTPError:
+        log.warning("MAX недоступен при отправке кнопок chat_id=%s", chat_id)
+        return False, "max_transport"
+
+
+def _assign_and_notify() -> None:
+    operator_chat.assign_waiting()
+    _flush_outbox()
+
+
+def _send_max_jpeg(
+    chat_id: int, path: str, caption: str = "", *, outbox_id: int | None = None,
+    upload_token: str | None = None,
+) -> tuple[bool, str | None]:
+    import httpx
+    headers = {"Authorization": TOKEN}
+    try:
+        token = upload_token
+        if not token:
+            meta = httpx.post(f"{API}/uploads", headers=headers, params={"type": "image"}, timeout=10)
+            meta.raise_for_status()
+            metadata = meta.json()
+            upload_url = metadata.get("url") if isinstance(metadata, dict) else None
+            if not operator_chat.is_allowed_max_image_upload_url(upload_url):
+                return False, "upload_contract"
+            with open(path, "rb") as stream:
+                uploaded = httpx.post(
+                    upload_url, headers=headers,
+                    files={"data": ("image.jpg", stream, "image/jpeg")}, timeout=30,
+                    follow_redirects=False,
+                )
+            uploaded.raise_for_status()
+            token = operator_chat.extract_image_upload_token(uploaded.json())
+            if not isinstance(token, str) or not token:
+                return False, "upload_contract"
+            if outbox_id is not None:
+                token = operator_chat.set_outbox_upload_token(outbox_id, token)
+        for attempt in range(3):
+            response = httpx.post(
+                f"{API}/messages", headers=_max_headers(), params={"chat_id": chat_id},
+                json={"text": caption or "Оператор отправил изображение.",
+                      "attachments": [{"type": "image", "payload": {"token": token}}]},
+                timeout=10,
+            )
+            if response.status_code == 200:
+                return True, None
+            code = ""
+            try:
+                payload = response.json()
+                code = str(payload.get("code") or payload.get("error") or "") if isinstance(payload, dict) else ""
+            except ValueError:
+                pass
+            if "attachment.not.ready" not in code.lower():
+                return False, f"max_http_{response.status_code}"
+            if attempt < 2:
+                time.sleep(0.2 * (2 ** attempt))
+        return False, "attachment_not_ready"
+    except httpx.TimeoutException:
+        return False, "max_timeout"
+    except httpx.HTTPStatusError as exc:
+        return False, f"max_http_{exc.response.status_code}"
+    except (httpx.HTTPError, OSError, ValueError, TypeError):
+        log.warning("MAX недоступен при отправке изображения chat_id=%s", chat_id)
+        return False, "max_transport"
+
+
+def _deliver_outbox_item(item: dict) -> tuple[bool, str | None]:
+    if item["kind"] == "text":
+        return _send_max_text(item["chat_id"], item["body"])
+    if item["kind"] == "buttons":
+        try:
+            buttons = json.loads(item["buttons_json"] or "[]")
+        except (TypeError, ValueError):
+            return False, "invalid_buttons"
+        return _send_max_buttons(item["chat_id"], item["body"], buttons)
+    root = os.path.realpath(OPERATOR_CHAT_IMAGE_DIR)
+    path = os.path.realpath(os.path.join(root, item["image_path"] or ""))
+    if os.path.dirname(path) != root:
+        return False, "invalid_image_path"
+    return _send_max_jpeg(
+        item["chat_id"], path, item["body"], outbox_id=item["id"],
+        upload_token=item.get("upload_token"),
+    )
+
+
+def _flush_outbox(only_id: int | None = None) -> list[dict]:
+    return operator_chat.deliver_outbox(_deliver_outbox_item, only_id=only_id)
+
+
+@app.route("/operator-chat")
+@operator_required
+def operator_chat_page():
+    return render_template(
+        "operator_chat.html", user=session["user"], csrf_token=_csrf_token(),
+        dialogs=operator_chat.list_operator_dialogs(_operator_id()),
+    )
+
+
+@app.post("/operator-chat/shift/start")
+@operator_required
+@csrf_protected
+def operator_shift_start():
+    operator_chat.start_shift(_operator_id())
+    _assign_and_notify()
+    return jsonify(ok=True)
+
+
+@app.post("/operator-chat/shift/end")
+@operator_required
+@csrf_protected
+def operator_shift_end():
+    try:
+        operator_chat.end_shift(_operator_id())
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 409
+    return jsonify(ok=True)
+
+
+@app.post("/operator-chat/shift/transfer-all")
+@operator_required
+@csrf_protected
+def operator_transfer_all():
+    try:
+        dialog_ids = operator_chat.transfer_all_dialogs(_operator_id())
+    except operator_chat.DeliveryInProgressError as exc:
+        return jsonify(ok=False, error=str(exc)), 409
+    _assign_and_notify()
+    return jsonify(ok=True, transferred=len(dialog_ids), dialog_ids=dialog_ids)
+
+
+@app.post("/operator-chat/heartbeat")
+@operator_required
+@csrf_protected
+def operator_heartbeat():
+    active = operator_chat.heartbeat(_operator_id())
+    if active:
+        _assign_and_notify()
+    return jsonify(ok=active)
+
+
+@app.get("/operator-chat/api/dialogs")
+@operator_required
+def operator_dialogs_api():
+    return jsonify(operator_chat.list_operator_dialogs(_operator_id()))
+
+
+@app.get("/operator-chat/api/dialogs/<int:dialog_id>/messages")
+@operator_required
+def operator_messages_api(dialog_id: int):
+    try:
+        messages = operator_chat.list_messages(
+            dialog_id, _operator_id(), int(request.args.get("after", "0")),
+        )
+    except (PermissionError, ValueError):
+        abort(404)
+    return jsonify(messages)
+
+
+@app.post("/operator-chat/api/dialogs/<int:dialog_id>/messages")
+@operator_required
+@csrf_protected
+def operator_send_message(dialog_id: int):
+    dialog = operator_chat.get_dialog_for_operator(dialog_id, _operator_id())
+    if not dialog:
+        abort(404)
+    body = request.form.get("body", "").strip()
+    upload = request.files.get("image")
+    relative_path = None
+    absolute_path = None
+    try:
+        if upload and upload.filename:
+            data = upload.read(operator_chat.MAX_IMAGE_BYTES + 1)
+            data = operator_chat.normalize_image(data, upload.mimetype)
+            os.makedirs(OPERATOR_CHAT_IMAGE_DIR, mode=0o700, exist_ok=True)
+            relative_path = f"{uuid.uuid4().hex}.jpg"
+            absolute_path = os.path.join(OPERATOR_CHAT_IMAGE_DIR, relative_path)
+            with open(absolute_path, "xb") as stream:
+                stream.write(data)
+    except (ValueError, OSError) as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+    try:
+        message = operator_chat.add_message(
+            dialog_id, "operator", body, user_id=_operator_id(), image_path=relative_path,
+        )
+    except (ValueError, PermissionError) as exc:
+        if absolute_path:
+            try:
+                os.remove(absolute_path)
+            except OSError:
+                pass
+        return jsonify(ok=False, error=str(exc)), 400
+    except Exception:
+        if absolute_path:
+            try:
+                os.remove(absolute_path)
+            except OSError:
+                pass
+        raise
+    outbox = operator_chat.get_outbox_item_for_message(message["id"])
+    result = _flush_outbox(outbox["id"] if outbox else None)
+    status = result[0]["status"] if result else "pending"
+    message["delivery_status"] = status
+    message["last_error"] = result[0]["error"] if result else None
+    return jsonify(ok=True, delivered=status == "delivered", delivery_status=status, message=message)
+
+
+@app.post("/operator-chat/api/messages/<int:message_id>/retry")
+@operator_required
+@csrf_protected
+def operator_retry_message(message_id: int):
+    if not operator_chat.retry_message(message_id, _operator_id()):
+        abort(404)
+    outbox = operator_chat.get_outbox_item_for_message(message_id)
+    result = _flush_outbox(outbox["id"] if outbox else None)
+    status = result[0]["status"] if result else "pending"
+    return jsonify(ok=True, delivered=status == "delivered", delivery_status=status)
+
+
+def _operator_runtime_image_path(relative_path: str | None) -> str | None:
+    if not relative_path:
+        return None
+    root = os.path.realpath(OPERATOR_CHAT_IMAGE_DIR)
+    path = os.path.realpath(os.path.join(root, relative_path))
+    if os.path.dirname(path) != root:
+        return None
+    return path
+
+
+@app.post("/operator-chat/api/messages/<int:message_id>/delete")
+@operator_required
+@csrf_protected
+def operator_delete_message(message_id: int):
+    try:
+        relative_path = operator_chat.delete_undelivered_image(message_id, _operator_id())
+    except PermissionError:
+        abort(404)
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 409
+    path = _operator_runtime_image_path(relative_path)
+    if path:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            log.warning("Не удалось удалить недоставленное изображение message_id=%s", message_id)
+    return jsonify(ok=True)
+
+
+@app.post("/operator-chat/api/dialogs/<int:dialog_id>/report")
+@operator_required
+@csrf_protected
+def operator_report_client(dialog_id: int):
+    reason = request.form.get("reason", "")
+    comment = request.form.get("comment", "")
+    image_message_raw = request.form.get("image_message_id", "").strip()
+    image_message_id = int(image_message_raw) if image_message_raw.isdigit() else None
+    evidence_path = None
+    evidence_absolute = None
+    if image_message_id is not None:
+        message = operator_chat.get_reportable_image(dialog_id, _operator_id(), image_message_id)
+        if not message:
+            abort(404)
+        source = _operator_runtime_image_path(message["image_path"])
+        if not source or os.path.islink(source) or not os.path.isfile(source):
+            return jsonify(ok=False, error="Изображение недоступно"), 409
+        os.makedirs(OPERATOR_CHAT_IMAGE_DIR, mode=0o700, exist_ok=True)
+        evidence_path = f"report-{uuid.uuid4().hex}.jpg"
+        evidence_absolute = _operator_runtime_image_path(evidence_path)
+        try:
+            shutil.copyfile(source, evidence_absolute)
+        except OSError:
+            return jsonify(ok=False, error="Не удалось сохранить доказательство"), 500
+    try:
+        report = operator_chat.create_client_report(
+            dialog_id, _operator_id(), reason, comment,
+            image_message_id=image_message_id, evidence_path=evidence_path,
+        )
+    except PermissionError:
+        if evidence_absolute:
+            try:
+                os.remove(evidence_absolute)
+            except OSError:
+                pass
+        abort(404)
+    except operator_chat.DeliveryInProgressError as exc:
+        if evidence_absolute:
+            try:
+                os.remove(evidence_absolute)
+            except OSError:
+                pass
+        return jsonify(ok=False, error=str(exc)), 409
+    except ValueError as exc:
+        if evidence_absolute:
+            try:
+                os.remove(evidence_absolute)
+            except OSError:
+                pass
+        return jsonify(ok=False, error=str(exc)), 400
+    _flush_outbox()
+    _assign_and_notify()
+    return jsonify(ok=True, report_id=report["id"])
+
+
+@app.post("/operator-chat/api/dialogs/<int:dialog_id>/close")
+@operator_required
+@csrf_protected
+def operator_close_dialog(dialog_id: int):
+    try:
+        operator_chat.close_dialog(dialog_id, _operator_id())
+    except PermissionError:
+        abort(404)
+    except operator_chat.UndeliveredMessagesError as exc:
+        return jsonify(
+            ok=False, error=str(exc),
+            undelivered_count=exc.total, undelivered_images=exc.images,
+        ), 409
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 409
+    _flush_outbox()
+    _assign_and_notify()
+    return jsonify(ok=True)
+
+
+@app.get("/operator-chat/images/<int:message_id>")
+@operator_required
+def operator_chat_image(message_id: int):
+    conn = db.get_conn()
+    row = conn.execute(
+        """SELECT m.image_path,d.operator_id,d.status FROM operator_messages m
+           JOIN operator_dialogs d ON d.id=m.dialog_id WHERE m.id=?""", (message_id,),
+    ).fetchone()
+    conn.close()
+    if not row or row["operator_id"] != _operator_id() or row["status"] != "active" or not row["image_path"]:
+        abort(404)
+    root = os.path.realpath(OPERATOR_CHAT_IMAGE_DIR)
+    path = os.path.realpath(os.path.join(root, row["image_path"]))
+    if os.path.dirname(path) != root or not os.path.isfile(path):
+        abort(404)
+    return send_file(path, mimetype="image/jpeg", conditional=True)
+
+
+@app.route("/operator-chat/settings", methods=["GET", "POST"])
+@admin_required
+def operator_chat_settings_page():
+    if request.method == "POST":
+        expected = session.get(_CSRF_SESSION_KEY, "")
+        if not secrets.compare_digest(expected, request.form.get("csrf_token", "")):
+            abort(400)
+        try:
+            operator_chat.update_settings(
+                enabled=request.form.get("enabled") == "on",
+                require_auth=request.form.get("require_auth") == "on",
+                heartbeat_timeout_sec=request.form.get("heartbeat_timeout_sec"),
+                reconnect_grace_sec=request.form.get("reconnect_grace_sec"),
+                max_active_dialogs=request.form.get("max_active_dialogs"),
+                inactivity_timeout_min=request.form.get("inactivity_timeout_min"),
+                warning_before_min=request.form.get("warning_before_min"),
+                retention_days=request.form.get("retention_days"),
+                report_threshold=request.form.get("report_threshold"),
+                evidence_retention_days=request.form.get("evidence_retention_days"),
+            )
+            operator_chat.update_module_settings({key: request.form.get(f"module_{key}") == "on" for key in operator_chat.MODULE_KEYS})
+        except (ValueError, TypeError) as exc:
+            flash(str(exc), "error")
+        else:
+            flash("Настройки сохранены", "success")
+            return redirect(url_for("operator_chat_settings_page"))
+    return render_template(
+        "operator_chat_settings.html", user=session["user"], csrf_token=_csrf_token(),
+        settings=operator_chat.get_settings(), modules=operator_chat.get_module_settings(),
+        ratings=operator_chat.rating_report(),
+    )
+
+
+@app.get("/operator-chat/history")
+@admin_required
+def operator_chat_history_page():
+    return render_template(
+        "operator_chat_history.html", user=session["user"],
+        dialogs=operator_chat.list_history(),
+    )
+
+
+@app.get("/operator-chat/api/history")
+@admin_required
+def operator_chat_history_api():
+    return jsonify(operator_chat.list_history())
+
+
+@app.get("/operator-chat/api/history/<int:dialog_id>")
+@admin_required
+def operator_chat_history_detail_api(dialog_id: int):
+    dialog = operator_chat.get_history_dialog(dialog_id)
+    if not dialog:
+        abort(404)
+    return jsonify(dialog=dialog, messages=operator_chat.list_history_messages(dialog_id))
+
+
+@app.get("/operator-chat/history/<int:dialog_id>")
+@admin_required
+def operator_chat_history_detail(dialog_id: int):
+    dialog = operator_chat.get_history_dialog(dialog_id)
+    if not dialog:
+        abort(404)
+    return render_template(
+        "operator_chat_history_detail.html", user=session["user"], dialog=dialog,
+        messages=operator_chat.list_history_messages(dialog_id),
+    )
+
+
+@app.get("/operator-chat/history/images/<int:message_id>")
+@admin_required
+def operator_chat_history_image(message_id: int):
+    settings = operator_chat.get_settings()
+    cutoff = (
+        operator_chat.utc_now() - timedelta(days=int(settings["retention_days"]))
+    ).isoformat(timespec="seconds")
+    conn = db.get_conn()
+    row = conn.execute(
+        """SELECT m.image_path FROM operator_messages m JOIN operator_dialogs d ON d.id=m.dialog_id
+           WHERE m.id=? AND m.cleanup_pending=0 AND d.closed_at>=?
+             AND d.status IN ('closed','timed_out','cancelled')""", (message_id, cutoff),
+    ).fetchone()
+    conn.close()
+    if not row or not row["image_path"]:
+        abort(404)
+    root = os.path.realpath(OPERATOR_CHAT_IMAGE_DIR)
+    path = os.path.realpath(os.path.join(root, row["image_path"]))
+    if os.path.dirname(path) != root or not os.path.isfile(path):
+        abort(404)
+    return send_file(path, mimetype="image/jpeg", conditional=True)
+
+
+@app.get("/operator-chat/reports")
+@admin_required
+def operator_reports_page():
+    status = request.args.get("status")
+    return render_template(
+        "operator_chat_reports.html", user=session["user"], csrf_token=_csrf_token(),
+        reports=operator_chat.list_client_reports(status),
+        blocked=operator_chat.list_blocked_clients(), reasons=operator_chat.REPORT_REASONS,
+    )
+
+
+@app.get("/operator-chat/reports/<int:report_id>")
+@admin_required
+def operator_report_detail(report_id: int):
+    report = operator_chat.get_client_report(report_id)
+    if not report:
+        abort(404)
+    return render_template(
+        "operator_chat_report_detail.html", user=session["user"],
+        csrf_token=_csrf_token(), report=report,
+        snapshot=json.loads(report["snapshot_json"] or "[]"),
+        reasons=operator_chat.REPORT_REASONS,
+    )
+
+
+@app.post("/operator-chat/reports/<int:report_id>/<decision>")
+@admin_required
+@csrf_protected
+def operator_report_decide(report_id: int, decision: str):
+    try:
+        result = operator_chat.decide_client_report(
+            report_id, _operator_id(), decision,
+        )
+    except LookupError:
+        abort(404)
+    except operator_chat.ReportDecisionConflictError as exc:
+        return jsonify(ok=False, error=str(exc)), 409
+    except operator_chat.DeliveryInProgressError as exc:
+        return jsonify(ok=False, error=str(exc)), 409
+    except ValueError:
+        abort(400)
+    return jsonify(ok=True, status=result["status"], blocked=result["blocked"])
+
+
+@app.post("/operator-chat/blocked/<int:chat_id>/unblock")
+@admin_required
+@csrf_protected
+def operator_unblock_client(chat_id: int):
+    if not operator_chat.unblock_client(chat_id, _operator_id()):
+        abort(404)
+    return jsonify(ok=True)
+
+
+@app.get("/operator-chat/reports/<int:report_id>/evidence")
+@admin_required
+def operator_report_evidence(report_id: int):
+    report = operator_chat.get_client_report(report_id)
+    if not report or not report["evidence_path"]:
+        abort(404)
+    settings = operator_chat.get_settings()
+    cutoff = operator_chat.utc_now() - timedelta(
+        days=int(settings["evidence_retention_days"])
+    )
+    created = datetime.fromisoformat(report["created_at"])
+    if created < cutoff:
+        abort(404)
+    path = _operator_runtime_image_path(report["evidence_path"])
+    if not path or os.path.islink(path) or not os.path.isfile(path):
+        abort(404)
+    return send_file(path, mimetype="image/jpeg", conditional=True)
 
 
 APPOINTMENT_STATUSES = {
@@ -1109,17 +1906,25 @@ def scenario_delete(scenario_id: int):
 @login_required
 def scripts_list():
     scripts = db.get_all_scripts()
-    return render_template("scripts_list.html", scripts=scripts, user=session["user"])
+    return render_template(
+        "scripts_list.html", scripts=scripts, user=session["user"],
+        csrf_token=_csrf_token(),
+    )
 
 
 @app.route("/scripts/create", methods=["POST"])
 @admin_required
+@csrf_protected
 def script_create():
-    title = request.form.get("title", "").strip()
+    title = request.form.get("title", "")
     if not title:
         flash("Введите название скрипта", "error")
         return redirect(url_for("scripts_list"))
-    sid = db.create_script(title)
+    try:
+        sid = db.create_script(title)
+    except ValueError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("scripts_list"))
     flash(f"Скрипт «{title}» создан", "success")
     return redirect(url_for("script_editor", script_id=sid))
 
@@ -1157,13 +1962,15 @@ def script_editor(script_id: int):
         from_counts=from_counts,
         to_counts=to_counts,
         user=session["user"],
+        csrf_token=_csrf_token(),
     )
 
 
 @app.route("/scripts/<int:script_id>/update", methods=["POST"])
 @admin_required
+@csrf_protected
 def script_update(script_id: int):
-    title = request.form.get("title", "").strip()
+    title = request.form.get("title", "")
     try:
         sort_order = int(request.form.get("sort_order", "0"))
     except ValueError:
@@ -1173,13 +1980,17 @@ def script_update(script_id: int):
     if not title:
         flash("Название не может быть пустым", "error")
     else:
-        db.update_script(script_id, title, sort_order, is_active)
-        flash("Скрипт обновлён", "success")
+        try:
+            db.update_script(script_id, title, sort_order, is_active)
+            flash("Скрипт обновлён", "success")
+        except ValueError as exc:
+            flash(str(exc), "error")
     return redirect(url_for("script_editor", script_id=script_id))
 
 
 @app.route("/scripts/<int:script_id>/delete", methods=["POST"])
 @admin_required
+@csrf_protected
 def script_delete(script_id: int):
     db.delete_script(script_id)
     flash("Скрипт удалён", "success")
@@ -1187,34 +1998,64 @@ def script_delete(script_id: int):
     return redirect(url_for("scripts_list"))
 
 
+def _validate_script_link(url: str, text: str) -> tuple[str | None, str | None]:
+    """Validate optional structured FAQ link without interpreting node text as markup."""
+    if not url:
+        if text:
+            raise ValueError("Укажите адрес ссылки или очистите текст кнопки")
+        return None, None
+    safe_url = max_transport.validate_link_url(url)
+    label = text or "Открыть сайт"
+    # Reuse MAX's button limits and return normalized values for persistence.
+    button = max_transport.make_link_button(label, safe_url)
+    return button["url"], button["text"]
+
+
 @app.route("/scripts/<int:script_id>/nodes/add", methods=["POST"])
 @admin_required
+@csrf_protected
 def script_node_add(script_id: int):
     title = request.form.get("title", "").strip()
     is_terminal = request.form.get("is_terminal") == "on"
+    link_url = request.form.get("link_url", "")
+    link_text = request.form.get("link_text", "")
     if not title:
         flash("Текст узла не может быть пустым", "error")
     else:
-        db.add_script_node(script_id, title, is_terminal)
+        try:
+            link_url, link_text = _validate_script_link(link_url, link_text)
+        except ValueError as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("script_editor", script_id=script_id))
+        db.add_script_node(script_id, title, is_terminal, link_url, link_text)
         flash("Узел добавлен", "success")
     return redirect(url_for("script_editor", script_id=script_id))
 
 
 @app.route("/scripts/<int:script_id>/nodes/<int:node_id>/update", methods=["POST"])
 @admin_required
+@csrf_protected
 def script_node_update(script_id: int, node_id: int):
     title = request.form.get("title", "").strip()
     is_terminal = request.form.get("is_terminal") == "on"
+    link_url = request.form.get("link_url", "")
+    link_text = request.form.get("link_text", "")
     if not title:
         flash("Текст узла не может быть пустым", "error")
     else:
-        db.update_script_node(node_id, title, is_terminal)
+        try:
+            link_url, link_text = _validate_script_link(link_url, link_text)
+        except ValueError as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("script_editor", script_id=script_id))
+        db.update_script_node(node_id, title, is_terminal, link_url, link_text)
         flash("Узел сохранён", "success")
     return redirect(url_for("script_editor", script_id=script_id))
 
 
 @app.route("/scripts/<int:script_id>/nodes/<int:node_id>/delete", methods=["POST"])
 @admin_required
+@csrf_protected
 def script_node_delete(script_id: int, node_id: int):
     db.delete_script_node(node_id)
     flash("Узел удалён", "success")
@@ -1223,6 +2064,7 @@ def script_node_delete(script_id: int, node_id: int):
 
 @app.route("/scripts/<int:script_id>/edges/add", methods=["POST"])
 @admin_required
+@csrf_protected
 def script_edge_add(script_id: int):
     try:
         from_node_id = int(request.form.get("from_node_id", ""))
@@ -1231,12 +2073,16 @@ def script_edge_add(script_id: int):
         flash("Выберите оба узла перехода", "error")
         return redirect(url_for("script_editor", script_id=script_id))
 
-    label = request.form.get("label", "").strip()
+    label = request.form.get("label", "")
     if not label:
         flash("Текст кнопки не может быть пустым", "error")
         return redirect(url_for("script_editor", script_id=script_id))
 
-    edge_id, err = db.add_script_edge(script_id, from_node_id, label, to_node_id)
+    try:
+        edge_id, err = db.add_script_edge(script_id, from_node_id, label, to_node_id)
+    except ValueError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("script_editor", script_id=script_id))
     if err:
         flash(err, "error")
     else:
@@ -1246,6 +2092,7 @@ def script_edge_add(script_id: int):
 
 @app.route("/scripts/<int:script_id>/edges/<int:edge_id>/delete", methods=["POST"])
 @admin_required
+@csrf_protected
 def script_edge_delete(script_id: int, edge_id: int):
     db.delete_script_edge(edge_id)
     flash("Переход удалён", "success")

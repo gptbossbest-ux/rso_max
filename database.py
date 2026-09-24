@@ -21,20 +21,24 @@ database.py — уровень доступа к данным, РСО Порта
 import json
 import logging
 import os
+import re
 import sqlite3
-from datetime import datetime, timezone, timedelta
+import unicodedata
+from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
+from zoneinfo import ZoneInfo
+
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from config import (
+    BOOTSTRAP_ADMIN_PASSWORD,
     DB_PATH,
-    TIMEZONE_OFFSET,
+    LOG_BACKUP_COUNT,
     LOG_FILE,
     LOG_LEVEL,
     LOG_MAX_BYTES,
-    LOG_BACKUP_COUNT,
     TICKET_PREFIX,
-    BOOTSTRAP_ADMIN_PASSWORD,
+    TIMEZONE_OFFSET,
 )
 
 # ── Логгер модуля ─────────────────────────────────────────────────────────────
@@ -164,6 +168,23 @@ def init_db() -> None:
             must_change_password INTEGER NOT NULL DEFAULT 0
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS login_rate_limits (
+            ip TEXT PRIMARY KEY,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            window_started_at TEXT NOT NULL,
+            blocked_until TEXT,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_login_rate_limits_updated "
+        "ON login_rate_limits(updated_at)"
+    )
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_login_rate_limits_blocked_until "
+        "ON login_rate_limits(blocked_until)"
+    )
     _ensure_column(c, "users", "session_version", "INTEGER NOT NULL DEFAULT 1")
     _ensure_column(c, "users", "must_change_password", "INTEGER NOT NULL DEFAULT 0")
 
@@ -308,9 +329,13 @@ def init_db() -> None:
             script_id   INTEGER NOT NULL REFERENCES scripts(id),
             title       TEXT NOT NULL,
             image_path  TEXT,
+            link_url    TEXT,
+            link_text   TEXT,
             is_terminal INTEGER DEFAULT 0
         )
     """)
+    _ensure_column(c, "script_nodes", "link_url", "TEXT")
+    _ensure_column(c, "script_nodes", "link_text", "TEXT")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS script_edges (
@@ -321,6 +346,210 @@ def init_db() -> None:
             to_node_id   INTEGER NOT NULL REFERENCES script_nodes(id)
         )
     """)
+
+    # Настройки ИИ-помощника. API-ключа здесь нет: он читается
+    # только из окружения процесса.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ai_settings (
+            id                INTEGER PRIMARY KEY CHECK (id = 1),
+            enabled           INTEGER NOT NULL DEFAULT 0,
+            model             TEXT NOT NULL DEFAULT 'yandexgpt/latest',
+            system_prompt     TEXT NOT NULL,
+            daily_limit       INTEGER NOT NULL DEFAULT 5 CHECK (daily_limit BETWEEN 1 AND 100),
+            temperature       REAL NOT NULL DEFAULT 0.3 CHECK (temperature BETWEEN 0 AND 1),
+            max_output_tokens INTEGER NOT NULL DEFAULT 800 CHECK (max_output_tokens BETWEEN 1 AND 8000)
+        )
+    """)
+    default_ai_prompt = (
+        "Ты — ИИ-помощник РСО по вопросам ЖКХ. Отвечай только по теме ЖКХ, "
+        "кратко и понятно. Не выдумывай тарифы, нормы, адреса или факты. "
+        "Если не уверен в ответе или нужны данные клиента, прямо скажи об этом и "
+        "предложи оформить обращение. Не запрашивай персональные данные."
+    )
+    c.execute(
+        "INSERT OR IGNORE INTO ai_settings (id, system_prompt) VALUES (1, ?)",
+        (default_ai_prompt,),
+    )
+
+    # Это не журнал: ровно одна обезличенная текущая сессия на MAX ID.
+    # При первом доступе в новую дату старая строка заменяется.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ai_daily_sessions (
+            chat_id        INTEGER PRIMARY KEY,
+            session_date   TEXT NOT NULL,
+            question_count INTEGER NOT NULL DEFAULT 0,
+            history_json   TEXT NOT NULL DEFAULT '[]',
+            faq_context    TEXT,
+            updated_at     TEXT NOT NULL
+        )
+    """)
+
+    # Операторские диалоги: настройки, смены, FIFO-очередь и история.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS operator_chat_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            enabled INTEGER NOT NULL DEFAULT 1,
+            require_auth INTEGER NOT NULL DEFAULT 1,
+            heartbeat_timeout_min INTEGER NOT NULL DEFAULT 5,
+            heartbeat_timeout_sec INTEGER NOT NULL DEFAULT 30,
+            reconnect_grace_sec INTEGER NOT NULL DEFAULT 120,
+            max_active_dialogs INTEGER NOT NULL DEFAULT 5,
+            inactivity_timeout_min INTEGER NOT NULL DEFAULT 30,
+            warning_before_min INTEGER NOT NULL DEFAULT 5,
+            retention_days INTEGER NOT NULL DEFAULT 30,
+            report_threshold INTEGER NOT NULL DEFAULT 3,
+            evidence_retention_days INTEGER NOT NULL DEFAULT 30
+        )
+    """)
+    _ensure_column(c, "operator_chat_settings", "heartbeat_timeout_sec", "INTEGER NOT NULL DEFAULT 30")
+    _ensure_column(c, "operator_chat_settings", "reconnect_grace_sec", "INTEGER NOT NULL DEFAULT 120")
+    _ensure_column(c, "operator_chat_settings", "report_threshold", "INTEGER NOT NULL DEFAULT 3")
+    _ensure_column(c, "operator_chat_settings", "evidence_retention_days", "INTEGER NOT NULL DEFAULT 30")
+    c.execute("INSERT OR IGNORE INTO operator_chat_settings (id) VALUES (1)")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS operator_shifts (
+            user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            active INTEGER NOT NULL DEFAULT 0,
+            started_at TEXT,
+            heartbeat_at TEXT,
+            ended_at TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS operator_dialogs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            operator_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            status TEXT NOT NULL CHECK(status IN ('waiting','active','closed','timed_out','cancelled')),
+            queue_seq INTEGER,
+            authenticated INTEGER NOT NULL DEFAULT 0,
+            client_fio TEXT,
+            client_ls TEXT,
+            client_address TEXT,
+            faq_context TEXT,
+            ai_context_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            assigned_at TEXT,
+            last_activity_at TEXT NOT NULL,
+            warned_at TEXT,
+            closed_at TEXT,
+            closed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            rating INTEGER CHECK(rating BETWEEN 1 AND 5),
+            rated_at TEXT
+        )
+    """)
+    _ensure_column(c, "operator_dialogs", "reassignment_pending", "INTEGER NOT NULL DEFAULT 0")
+    c.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_operator_dialog_open_chat
+        ON operator_dialogs(chat_id) WHERE status IN ('waiting','active')
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS ix_operator_dialog_queue
+        ON operator_dialogs(status, queue_seq, created_at)
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS operator_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dialog_id INTEGER NOT NULL REFERENCES operator_dialogs(id) ON DELETE CASCADE,
+            sender TEXT NOT NULL CHECK(sender IN ('client','operator','system')),
+            sender_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            message_type TEXT NOT NULL DEFAULT 'text' CHECK(message_type IN ('text','image')),
+            body TEXT,
+            image_path TEXT,
+            created_at TEXT NOT NULL,
+            read_at TEXT,
+            delivery_status TEXT NOT NULL DEFAULT 'delivered'
+                CHECK(delivery_status IN ('pending','sending','delivered','failed')),
+            delivery_attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            delivered_at TEXT,
+            cleanup_pending INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    _ensure_column(c, "operator_messages", "delivery_status", "TEXT NOT NULL DEFAULT 'delivered'")
+    _ensure_column(c, "operator_messages", "delivery_attempts", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(c, "operator_messages", "last_error", "TEXT")
+    _ensure_column(c, "operator_messages", "delivered_at", "TEXT")
+    _ensure_column(c, "operator_messages", "cleanup_pending", "INTEGER NOT NULL DEFAULT 0")
+    c.execute("CREATE INDEX IF NOT EXISTS ix_operator_messages_dialog ON operator_messages(dialog_id,id)")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS operator_outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_key TEXT UNIQUE NOT NULL,
+            dialog_id INTEGER REFERENCES operator_dialogs(id) ON DELETE CASCADE,
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER REFERENCES operator_messages(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK(kind IN ('text','image','buttons')),
+            body TEXT NOT NULL,
+            image_path TEXT,
+            upload_token TEXT,
+            buttons_json TEXT,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending','sending','delivered','failed')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            next_retry_at TEXT,
+            lease_at TEXT,
+            created_at TEXT NOT NULL,
+            delivered_at TEXT
+        )
+    """)
+    _ensure_column(c, "operator_outbox", "dialog_id", "INTEGER REFERENCES operator_dialogs(id) ON DELETE CASCADE")
+    _ensure_column(c, "operator_outbox", "upload_token", "TEXT")
+    c.execute(
+        """UPDATE operator_outbox SET dialog_id=(
+             SELECT dialog_id FROM operator_messages WHERE id=operator_outbox.message_id
+           ) WHERE dialog_id IS NULL AND message_id IS NOT NULL"""
+    )
+    c.execute("CREATE INDEX IF NOT EXISTS ix_operator_outbox_due ON operator_outbox(status,next_retry_at,id)")
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS operator_client_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dialog_id INTEGER NOT NULL REFERENCES operator_dialogs(id) ON DELETE RESTRICT,
+            operator_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            client_chat_id INTEGER NOT NULL,
+            reason TEXT NOT NULL CHECK(reason IN (
+                'unwanted_image','insults','spam','irrelevant_image','other'
+            )),
+            comment TEXT,
+            image_message_id INTEGER REFERENCES operator_messages(id) ON DELETE SET NULL,
+            evidence_path TEXT,
+            snapshot_json TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending','confirmed','rejected')),
+            created_at TEXT NOT NULL,
+            decided_at TEXT,
+            decided_by INTEGER REFERENCES users(id) ON DELETE SET NULL
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS ix_operator_reports_status ON operator_client_reports(status,created_at,id)")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS operator_chat_blocks (
+            chat_id INTEGER PRIMARY KEY,
+            active INTEGER NOT NULL DEFAULT 1,
+            blocked_at TEXT NOT NULL,
+            blocked_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            unblocked_at TEXT,
+            unblocked_by INTEGER REFERENCES users(id) ON DELETE SET NULL
+        )
+    """)
+
+    # Центральные feature flags главного меню. Данные модулей не удаляются.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS module_settings (
+            module_key TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 1
+        )
+    """)
+    for module_key in (
+        "auth", "appeal", "appeal_status", "readings", "faq", "ai",
+        "receipt", "appointment",
+    ):
+        c.execute(
+            "INSERT OR IGNORE INTO module_settings (module_key, enabled) VALUES (?, 1)",
+            (module_key,),
+        )
     # TODO Этап 10 (табличный редактор скриптов): при сохранении рёбер
     # добавить валидацию на отсутствие циклов в графе (DFS/топологическая сортировка).
     # Цикл в скрипте приведёт к бесконечному навигационному циклу в боте.
@@ -809,7 +1038,8 @@ def get_script_tree(script_id: int) -> dict | None:
         return None
 
     nodes = conn.execute(
-        "SELECT id, title, is_terminal, image_path FROM script_nodes WHERE script_id=?",
+        "SELECT id, title, is_terminal, image_path, link_url, link_text "
+        "FROM script_nodes WHERE script_id=?",
         (script_id,),
     ).fetchall()
 
@@ -888,6 +1118,7 @@ def get_scenarios_for_chat(house_chat_id: int) -> list[sqlite3.Row]:
         FROM chat_scenarios cs
         JOIN chat_scenario_links csl ON csl.scenario_id = cs.id
         WHERE csl.house_chat_id = ? AND cs.is_active = 1
+        ORDER BY cs.id ASC
         """,
         (house_chat_id,),
     ).fetchall()
@@ -1330,11 +1561,150 @@ def update_1c_sync_state(**fields: str | None) -> None:
 
 # ── Лицевые счета и счётчики ──────────────────────────────────────────────────
 
-def get_ls(number: str) -> sqlite3.Row | None:
+_LS_NUMBER_RE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z", re.ASCII)
+_LS_SEARCH_MAX_LENGTH = 100
+
+
+def normalize_lschet_number(number: str) -> str:
+    """Normalize and validate a user-facing account number."""
+    normalized = number.strip()
+    if not normalized:
+        raise ValueError("Введите номер лицевого счёта")
+    if _LS_NUMBER_RE.fullmatch(normalized) is None:
+        raise ValueError(
+            "Номер лицевого счёта должен содержать от 1 до 64 символов: "
+            "латинские буквы, цифры, дефис или подчёркивание"
+        )
+    return normalized
+
+
+def _normalize_optional_lschet_field(
+    value: str | None,
+    *,
+    label: str,
+    max_length: int,
+) -> str | None:
+    normalized = unicodedata.normalize("NFC", value.strip()) if value else ""
+    if not normalized:
+        return None
+    if len(normalized) > max_length:
+        raise ValueError(f"Поле «{label}» не должно превышать {max_length} символов")
+    if any(unicodedata.category(char).startswith("C") for char in normalized):
+        raise ValueError(f"Поле «{label}» содержит недопустимые символы")
+    return normalized
+
+
+def normalize_lschet_search(query: str | None) -> str:
+    """Normalize an account-directory query and cap resource usage."""
+    return (query or "").strip()[:_LS_SEARCH_MAX_LENGTH]
+
+
+def _licschet_search(query: str | None) -> tuple[str, ...]:
+    normalized = normalize_lschet_search(query)
+    if not normalized:
+        return ()
+    escaped = (
+        normalized.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    )
+    pattern = f"%{escaped}%"
+    return (pattern, pattern, pattern)
+
+
+def count_lschet(query: str | None = None) -> int:
+    """Count accounts matching a literal administrative search query."""
+    params = _licschet_search(query)
     conn = get_conn()
-    row = conn.execute("SELECT * FROM licschet WHERE number=?", (number,)).fetchone()
-    conn.close()
-    return row
+    try:
+        if not params:
+            row = conn.execute("SELECT COUNT(*) FROM licschet").fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM licschet WHERE "
+                "number LIKE ? ESCAPE '\\' OR fio LIKE ? ESCAPE '\\' "
+                "OR address LIKE ? ESCAPE '\\'",
+                params,
+            ).fetchone()
+        return int(row[0])
+    finally:
+        conn.close()
+
+
+def list_lschet(
+    query: str | None = None,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[sqlite3.Row]:
+    """Return one bounded page of accounts for the administrative directory."""
+    if limit < 1 or limit > 100:
+        raise ValueError("Размер страницы должен быть от 1 до 100")
+    if offset < 0:
+        raise ValueError("Смещение не может быть отрицательным")
+    params = _licschet_search(query)
+    conn = get_conn()
+    try:
+        if not params:
+            return conn.execute(
+                "SELECT id, number, fio, address FROM licschet "
+                "ORDER BY number LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+        return conn.execute(
+            "SELECT id, number, fio, address FROM licschet WHERE "
+            "number LIKE ? ESCAPE '\\' OR fio LIKE ? ESCAPE '\\' "
+            "OR address LIKE ? ESCAPE '\\' ORDER BY number LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def create_lschet(
+    number: str,
+    fio: str | None = None,
+    address: str | None = None,
+) -> bool:
+    """Insert one account without overwriting an existing account."""
+    normalized = normalize_lschet_number(number)
+    normalized_fio = _normalize_optional_lschet_field(
+        fio,
+        label="ФИО",
+        max_length=256,
+    )
+    normalized_address = _normalize_optional_lschet_field(
+        address,
+        label="Адрес",
+        max_length=512,
+    )
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN")
+        conn.execute(
+            "INSERT INTO licschet (number, fio, address) VALUES (?, ?, ?)",
+            (normalized, normalized_fio, normalized_address),
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        if (
+            getattr(exc, "sqlite_errorname", None) == "SQLITE_CONSTRAINT_UNIQUE"
+            and "licschet.number" in str(exc)
+        ):
+            return False
+        raise
+    finally:
+        conn.close()
+
+def get_ls(number: str) -> sqlite3.Row | None:
+    normalized = normalize_lschet_number(number)
+    conn = get_conn()
+    try:
+        return conn.execute(
+            "SELECT * FROM licschet WHERE number=?", (normalized,)
+        ).fetchone()
+    finally:
+        conn.close()
 
 
 def get_schetchiki(ls: str) -> list[sqlite3.Row]:
@@ -1475,73 +1845,221 @@ def import_from_excel(filepath: str = "Данные_по_ЛС.xlsx") -> None:
         log.error(message)
         raise FileNotFoundError(message) from exc
 
-    conn = get_conn()
-
-    if "ЛС и ФИО" in wb.sheetnames:
-        ws = wb["ЛС и ФИО"]
-        count = 0
-        for i, row in enumerate(ws.iter_rows(values_only=True)):
-            if i == 0:
-                continue
-            number = str(row[0]).strip() if row[0] else None
-            fio = str(row[1]).strip() if row[1] else None
-            address = str(row[2]).strip() if row[2] else None
-            if not number:
-                continue
-            conn.execute(
-                "INSERT OR REPLACE INTO licschet (number, fio, address) VALUES (?, ?, ?)",
-                (number, fio, address),
-            )
-            count += 1
-        conn.commit()
-        log.info("Импортировано лицевых счетов: %d", count)
-
-    if "Счетчики" in wb.sheetnames:
-        ws = wb["Счетчики"]
-        conn.execute("DELETE FROM schetchiki")
-        count = init_count = 0
-
-        for i, row in enumerate(ws.iter_rows(values_only=True)):
-            if i == 0 or not row[0]:
-                continue
-            ls            = str(row[0]).strip()
-            resource_type = str(row[1]).strip() if row[1] else ""
-            meter_number  = str(row[2]).strip() if row[2] else ""
-            meter_type    = str(row[3]).strip() if row[3] else "Однотарифный"
-            initial1      = str(row[4]).strip() if row[4] else "0"
-            initial2      = str(row[5]).strip() if row[5] else "0"
-
-            conn.execute(
-                "INSERT INTO schetchiki "
-                "(ls, resource_type, meter_number, meter_type, initial1, initial2) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (ls, resource_type, meter_number, meter_type, initial1, initial2),
-            )
-            count += 1
-
-            # Начальные показания — только для новых счётчиков (один проход)
-            existing = conn.execute(
-                "SELECT id FROM pokazaniya WHERE ls=? AND meter_number=? LIMIT 1",
-                (ls, meter_number),
-            ).fetchone()
-            if not existing:
-                v2 = initial2 if meter_type == "Двухтарифный" and initial2 else None
-                conn.execute(
-                    "INSERT INTO pokazaniya "
-                    "(chat_id, ls, resource_type, meter_number, value1, value2, created_at, sent_to_1c) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
-                    (0, ls, resource_type, meter_number, initial1, v2, "2000-01-01 00:00"),
+    accounts: list[tuple[str, str | None, str | None]] = []
+    meters: list[tuple[str, str, str, str, str, str]] = []
+    has_accounts_sheet = "ЛС и ФИО" in wb.sheetnames
+    has_meters_sheet = "Счетчики" in wb.sheetnames
+    try:
+        if has_accounts_sheet:
+            for row_number, row in enumerate(
+                wb["ЛС и ФИО"].iter_rows(values_only=True), start=1
+            ):
+                if row_number == 1 or not row[0]:
+                    continue
+                try:
+                    number = normalize_lschet_number(str(row[0]))
+                except ValueError as exc:
+                    raise ValueError(
+                        "Некорректный лицевой счёт на листе «ЛС и ФИО», "
+                        f"строка {row_number}: {exc}"
+                    ) from exc
+                fio = _normalize_optional_lschet_field(
+                    str(row[1]) if row[1] else None,
+                    label="ФИО",
+                    max_length=256,
                 )
-                init_count += 1
+                address = _normalize_optional_lschet_field(
+                    str(row[2]) if row[2] else None,
+                    label="Адрес",
+                    max_length=512,
+                )
+                accounts.append((number, fio, address))
 
+        if has_meters_sheet:
+            for row_number, row in enumerate(
+                wb["Счетчики"].iter_rows(values_only=True), start=1
+            ):
+                if row_number == 1 or not row[0]:
+                    continue
+                try:
+                    ls = normalize_lschet_number(str(row[0]))
+                except ValueError as exc:
+                    raise ValueError(
+                        "Некорректный лицевой счёт на листе «Счетчики», "
+                        f"строка {row_number}: {exc}"
+                    ) from exc
+                meters.append(
+                    (
+                        ls,
+                        str(row[1]).strip() if row[1] else "",
+                        str(row[2]).strip() if row[2] else "",
+                        str(row[3]).strip() if row[3] else "Однотарифный",
+                        str(row[4]).strip() if row[4] else "0",
+                        str(row[5]).strip() if row[5] else "0",
+                    )
+                )
+    finally:
+        close_workbook = getattr(wb, "close", None)
+        if callable(close_workbook):
+            close_workbook()
+
+    conn = get_conn()
+    initial_count = 0
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if has_accounts_sheet:
+            conn.executemany(
+                "INSERT OR REPLACE INTO licschet (number, fio, address) VALUES (?, ?, ?)",
+                accounts,
+            )
+
+        if has_meters_sheet:
+            conn.execute("DELETE FROM schetchiki")
+            for ls, resource_type, meter_number, meter_type, initial1, initial2 in meters:
+                conn.execute(
+                    "INSERT INTO schetchiki "
+                    "(ls, resource_type, meter_number, meter_type, initial1, initial2) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (ls, resource_type, meter_number, meter_type, initial1, initial2),
+                )
+                existing = conn.execute(
+                    "SELECT id FROM pokazaniya WHERE ls=? AND meter_number=? LIMIT 1",
+                    (ls, meter_number),
+                ).fetchone()
+                if not existing:
+                    value2 = initial2 if meter_type == "Двухтарифный" and initial2 else None
+                    conn.execute(
+                        "INSERT INTO pokazaniya "
+                        "(chat_id, ls, resource_type, meter_number, value1, value2, created_at, sent_to_1c) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+                        (0, ls, resource_type, meter_number, initial1, value2,
+                         "2000-01-01 00:00"),
+                    )
+                    initial_count += 1
         conn.commit()
-        log.info("Импортировано счётчиков: %d", count)
-        log.info("Записано начальных показаний: %d", init_count)
+    except Exception:  # noqa: BLE001 - transaction boundary must rollback all errors
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
-    conn.close()
+    if has_accounts_sheet:
+        log.info("Импортировано лицевых счетов: %d", len(accounts))
+    if has_meters_sheet:
+        log.info("Импортировано счётчиков: %d", len(meters))
+        log.info("Записано начальных показаний: %d", initial_count)
+
+
+# ── Защита входа (общая для всех Gunicorn workers) ───────────────────────────
+
+def get_login_block_seconds(ip: str, now: datetime | None = None) -> int:
+    """Return remaining block duration without taking a SQLite write lock."""
+    now = now or datetime.now(timezone.utc)
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT blocked_until FROM login_rate_limits WHERE ip=?", (ip,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row or not row["blocked_until"]:
+        return 0
+    return max(
+        0,
+        int((datetime.fromisoformat(row["blocked_until"]) - now).total_seconds()),
+    )
+
+
+def record_login_failure(
+    ip: str,
+    *,
+    max_attempts: int = 5,
+    window_minutes: int = 15,
+    block_minutes: int = 15,
+    now: datetime | None = None,
+) -> tuple[bool, int]:
+    """Atomically count a failure across all web workers."""
+    now = now or datetime.now(timezone.utc)
+    now_s = now.isoformat(timespec="seconds")
+    window_cutoff = now - timedelta(minutes=window_minutes)
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """DELETE FROM login_rate_limits WHERE ip IN (
+                   SELECT ip FROM login_rate_limits WHERE updated_at<? LIMIT 100
+               )""",
+            ((now - timedelta(days=7)).isoformat(timespec="seconds"),),
+        )
+        row_count = int(conn.execute(
+            "SELECT COUNT(*) n FROM login_rate_limits",
+        ).fetchone()["n"])
+        if row_count >= 10_000:
+            conn.execute(
+                """DELETE FROM login_rate_limits WHERE ip IN (
+                       SELECT ip FROM login_rate_limits ORDER BY updated_at LIMIT 100
+                   )"""
+            )
+        row = conn.execute(
+            "SELECT * FROM login_rate_limits WHERE ip=?", (ip,),
+        ).fetchone()
+        if row and row["blocked_until"]:
+            blocked_until = datetime.fromisoformat(row["blocked_until"])
+            if blocked_until > now:
+                conn.commit()
+                return True, 0
+        within_window = bool(
+            row
+            and datetime.fromisoformat(row["window_started_at"]) > window_cutoff
+        )
+        attempts = (int(row["attempts"]) if within_window else 0) + 1
+        blocked = attempts >= max_attempts
+        window_started = row["window_started_at"] if within_window else now_s
+        blocked_until_s = (
+            (now + timedelta(minutes=block_minutes)).isoformat(timespec="seconds")
+            if blocked else None
+        )
+        conn.execute(
+            """INSERT INTO login_rate_limits
+               (ip,attempts,window_started_at,blocked_until,updated_at)
+               VALUES(?,?,?,?,?) ON CONFLICT(ip) DO UPDATE SET
+               attempts=excluded.attempts,window_started_at=excluded.window_started_at,
+               blocked_until=excluded.blocked_until,updated_at=excluded.updated_at""",
+            (
+                ip, 0 if blocked else attempts, window_started,
+                blocked_until_s, now_s,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return blocked, max(0, max_attempts - attempts)
+
+
+def reset_login_rate_limit(ip: str) -> None:
+    conn = get_conn()
+    try:
+        conn.execute("DELETE FROM login_rate_limits WHERE ip=?", (ip,))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ── Пользователи портала ──────────────────────────────────────────────────────
+
+MAX_PORTAL_USERNAME_LENGTH = 128
+
+
+def _validate_portal_username(username: str) -> str:
+    value = username.strip() if isinstance(username, str) else ""
+    if not value:
+        raise ValueError("Логин не может быть пустым")
+    if len(value) > MAX_PORTAL_USERNAME_LENGTH:
+        raise ValueError(
+            f"Логин должен быть не длиннее {MAX_PORTAL_USERNAME_LENGTH} символов"
+        )
+    return value
+
 
 def get_user(username: str) -> sqlite3.Row | None:
     conn = get_conn()
@@ -1565,6 +2083,10 @@ def get_all_users() -> list[sqlite3.Row]:
 
 
 def create_user(username: str, password: str, name: str, role: str) -> tuple[bool, str]:
+    try:
+        username = _validate_portal_username(username)
+    except ValueError as exc:
+        return False, str(exc)
     conn = get_conn()
     try:
         conn.execute(
@@ -1577,6 +2099,28 @@ def create_user(username: str, password: str, name: str, role: str) -> tuple[boo
     except Exception as exc:
         log.warning("Ошибка создания пользователя %s: %s", username, exc)
         return False, f"Ошибка: {exc}"
+    finally:
+        conn.close()
+
+
+def change_username(user_id: int, username: str) -> tuple[bool, str]:
+    try:
+        username = _validate_portal_username(username)
+    except ValueError as exc:
+        return False, str(exc)
+    conn = get_conn()
+    try:
+        updated = conn.execute(
+            """UPDATE users SET username=?,session_version=session_version+1
+               WHERE id=?""",
+            (username, user_id),
+        )
+        conn.commit()
+        if not updated.rowcount:
+            return False, "Пользователь не найден"
+        return True, "Логин изменён"
+    except sqlite3.IntegrityError:
+        return False, "Такой логин уже существует"
     finally:
         conn.close()
 
@@ -1630,24 +2174,38 @@ def get_bot_user(chat_id: int) -> sqlite3.Row | None:
 
 def upsert_bot_user(
     chat_id: int,
-    ls: str,
+    ls: str | None,
     fio: str | None,
     authorized_1c: bool | None = None,
+    *,
+    clear_fio: bool = False,
 ) -> None:
     conn = get_conn()
     try:
         auth_value = int(bool(authorized_1c)) if authorized_1c is not None else 0
+        fio_value = None if clear_fio else fio
         conn.execute(
             "INSERT INTO bot_users (chat_id, ls, fio, last_seen, authorized_1c) "
             "VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT(chat_id) DO UPDATE SET "
             "ls=excluded.ls, "
-            "fio=CASE WHEN excluded.fio IS NULL OR excluded.fio='' "
-            "THEN bot_users.fio ELSE excluded.fio END, "
+            "fio=CASE WHEN ? THEN NULL "
+            "WHEN excluded.fio IS NOT NULL AND excluded.fio<>'' "
+            "THEN excluded.fio "
+            "WHEN bot_users.ls IS NOT excluded.ls THEN NULL "
+            "ELSE bot_users.fio END, "
             "last_seen=excluded.last_seen, "
             "authorized_1c=CASE WHEN ? IS NULL THEN bot_users.authorized_1c "
             "ELSE excluded.authorized_1c END",
-            (chat_id, ls, fio, msk_now(), auth_value, authorized_1c),
+            (
+                chat_id,
+                ls,
+                fio_value,
+                msk_now(),
+                auth_value,
+                clear_fio,
+                authorized_1c,
+            ),
         )
         conn.commit()
     finally:
@@ -2191,7 +2749,21 @@ def get_appointment(appointment_id: int) -> sqlite3.Row | None:
 
 # -- Напоминания (для APScheduler) --------------------------------------------
 
-def get_appointments_for_reminder_24h() -> list[sqlite3.Row]:
+MOSCOW_TIMEZONE = ZoneInfo("Europe/Moscow")
+
+
+def _as_moscow_time(current_time: datetime | None = None) -> datetime:
+    """Return an aware Moscow datetime while accepting legacy no-arg calls."""
+    if current_time is None:
+        return datetime.now(MOSCOW_TIMEZONE)
+    if current_time.tzinfo is None:
+        return current_time.replace(tzinfo=MOSCOW_TIMEZONE)
+    return current_time.astimezone(MOSCOW_TIMEZONE)
+
+
+def get_appointments_for_reminder_24h(
+    current_time: datetime | None = None,
+) -> list[sqlite3.Row]:
     """
     Возвращает активные записи для напоминания за 24ч (REQ-АВТ-07-06).
 
@@ -2203,7 +2775,7 @@ def get_appointments_for_reminder_24h() -> list[sqlite3.Row]:
         записавшийся на завтра прямо сейчас, получил бы "напоминание за 24ч"
         почти сразу после подтверждения записи — бессмысленно и раздражает.
     """
-    now = datetime.now()
+    now = _as_moscow_time(current_time)
     window_from = (now + timedelta(hours=23)).strftime("%Y-%m-%d %H:%M")
     window_to   = (now + timedelta(hours=25)).strftime("%Y-%m-%d %H:%M")
 
@@ -2220,22 +2792,26 @@ def get_appointments_for_reminder_24h() -> list[sqlite3.Row]:
     return rows
 
 
-def get_appointments_for_reminder_day() -> list[sqlite3.Row]:
+def get_appointments_for_reminder_day(
+    current_time: datetime | None = None,
+) -> list[sqlite3.Row]:
     """
     Возвращает активные записи для напоминания в день приёма в 09:00 (REQ-АВТ-07-07).
-    Условие: slot_date = сегодня И reminded_day=0.
+    Условие: slot_date = сегодня, слот ещё не наступил И reminded_day=0.
     Задача APScheduler запускается ровно в 09:00 по московскому времени.
-    Для приёмов раньше 09:00 — отдельная проверка в задаче (REQ-АВТ-07-09).
+    Прошедшие и текущие слоты исключаются самим запросом (REQ-АВТ-07-09).
     """
-    tz = timezone(timedelta(hours=TIMEZONE_OFFSET))
-    today = datetime.now(tz).strftime("%Y-%m-%d")
+    now = _as_moscow_time(current_time)
+    today = now.strftime("%Y-%m-%d")
+    current_slot = now.strftime("%Y-%m-%d %H:%M")
 
     conn = get_conn()
     rows = conn.execute(
         """SELECT a.*, b.name AS branch_name, b.address AS branch_address
            FROM appointments a JOIN branches b ON b.id = a.branch_id
-           WHERE a.status='active' AND a.reminded_day=0 AND a.slot_date=?""",
-        (today,)
+           WHERE a.status='active' AND a.reminded_day=0 AND a.slot_date=?
+             AND (a.slot_date || ' ' || a.slot_time) > ?""",
+        (today, current_slot)
     ).fetchall()
     conn.close()
     return rows
@@ -2377,7 +2953,14 @@ def get_unlinked_scenarios_for_chat(house_chat_id: int) -> list[sqlite3.Row]:
 # ── Скрипты FAQ — редактирование (портал: раздел «FAQ-скрипты») ──────────────
 # Чтение для бота (get_active_scripts, get_script_tree) уже реализовано выше.
 
+def _validate_faq_button_label(value: str) -> str:
+    from rso_bot.content_validation import validate_button_text
+
+    return validate_button_text(value)
+
+
 def create_script(title: str, sort_order: int = 0) -> int:
+    title = _validate_faq_button_label(title)
     conn = get_conn()
     try:
         row_id = conn.execute(
@@ -2414,6 +2997,7 @@ def get_script(script_id: int) -> sqlite3.Row | None:
 
 
 def update_script(script_id: int, title: str, sort_order: int, is_active: bool) -> None:
+    title = _validate_faq_button_label(title)
     conn = get_conn()
     conn.execute(
         "UPDATE scripts SET title=?, sort_order=?, is_active=? WHERE id=?",
@@ -2455,12 +3039,19 @@ def get_script_edges(script_id: int) -> list[sqlite3.Row]:
     return rows
 
 
-def add_script_node(script_id: int, title: str, is_terminal: bool = False) -> int:
+def add_script_node(
+    script_id: int, title: str, is_terminal: bool = False,
+    link_url: str | None = None, link_text: str | None = None,
+) -> int:
+    from rso_bot.content_validation import validate_optional_link
+
+    link_url, link_text = validate_optional_link(link_url, link_text)
     conn = get_conn()
     try:
         row_id = conn.execute(
-            "INSERT INTO script_nodes (script_id, title, is_terminal) VALUES (?, ?, ?)",
-            (script_id, title, int(is_terminal)),
+            "INSERT INTO script_nodes (script_id,title,is_terminal,link_url,link_text) "
+            "VALUES (?,?,?,?,?)",
+            (script_id, title, int(is_terminal), link_url, link_text),
         ).lastrowid
         conn.commit()
         return row_id
@@ -2468,11 +3059,17 @@ def add_script_node(script_id: int, title: str, is_terminal: bool = False) -> in
         conn.close()
 
 
-def update_script_node(node_id: int, title: str, is_terminal: bool) -> None:
+def update_script_node(
+    node_id: int, title: str, is_terminal: bool,
+    link_url: str | None = None, link_text: str | None = None,
+) -> None:
+    from rso_bot.content_validation import validate_optional_link
+
+    link_url, link_text = validate_optional_link(link_url, link_text)
     conn = get_conn()
     conn.execute(
-        "UPDATE script_nodes SET title=?, is_terminal=? WHERE id=?",
-        (title, int(is_terminal), node_id),
+        "UPDATE script_nodes SET title=?,is_terminal=?,link_url=?,link_text=? WHERE id=?",
+        (title, int(is_terminal), link_url, link_text, node_id),
     )
     conn.commit()
     conn.close()
@@ -2527,6 +3124,7 @@ def add_script_edge(
     Добавляет переход между узлами скрипта с DFS-проверкой циклов.
     Возвращает (edge_id, None) при успехе или (None, сообщение_об_ошибке).
     """
+    label = _validate_faq_button_label(label)
     conn = get_conn()
     try:
         existing = conn.execute(
@@ -2552,3 +3150,265 @@ def delete_script_edge(edge_id: int) -> None:
     conn.execute("DELETE FROM script_edges WHERE id=?", (edge_id,))
     conn.commit()
     conn.close()
+
+
+# ── ИИ-помощник: настройки и однодневные сессии ────────────────────────────────────
+
+def get_ai_settings() -> dict:
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT * FROM ai_settings WHERE id=1").fetchone()
+        if row is None:
+            raise RuntimeError("ai_settings is not initialized")
+        result = dict(row)
+        result["enabled"] = bool(result["enabled"])
+        return result
+    finally:
+        conn.close()
+
+
+def update_ai_settings(
+    *,
+    enabled: bool,
+    model: str,
+    system_prompt: str,
+    daily_limit: int,
+    temperature: float,
+    max_output_tokens: int,
+) -> None:
+    model = model.strip()
+    system_prompt = system_prompt.strip()
+    if not model or len(model) > 256:
+        raise ValueError("Модель должна содержать от 1 до 256 символов")
+    if not system_prompt or len(system_prompt) > 8000:
+        raise ValueError("Системный промпт должен содержать от 1 до 8000 символов")
+    if not 1 <= daily_limit <= 100:
+        raise ValueError("Дневной лимит должен быть от 1 до 100")
+    if not 0 <= temperature <= 1:
+        raise ValueError("Температура должна быть от 0 до 1")
+    if not 1 <= max_output_tokens <= 8000:
+        raise ValueError("Максимум токенов должен быть от 1 до 8000")
+    conn = get_conn()
+    try:
+        conn.execute(
+            """UPDATE ai_settings
+               SET enabled=?, model=?, system_prompt=?, daily_limit=?,
+                   temperature=?, max_output_tokens=? WHERE id=1""",
+            (int(enabled), model, system_prompt, daily_limit, temperature, max_output_tokens),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _server_date() -> str:
+    return datetime.now().astimezone().date().isoformat()
+
+
+def server_local_date() -> str:
+    """Public clock boundary shared by an entire AI request operation."""
+    return _server_date()
+
+
+def _ensure_ai_session_locked(
+    conn: sqlite3.Connection,
+    chat_id: int,
+    session_date: str,
+    updated_at: str,
+) -> sqlite3.Row:
+    """Create or roll over a session inside the caller's write transaction."""
+    row = conn.execute(
+        "SELECT * FROM ai_daily_sessions WHERE chat_id=?", (chat_id,)
+    ).fetchone()
+    if row is None:
+        conn.execute(
+            """INSERT INTO ai_daily_sessions
+               (chat_id, session_date, question_count, history_json, faq_context, updated_at)
+               VALUES (?, ?, 0, '[]', NULL, ?)""",
+            (chat_id, session_date, updated_at),
+        )
+    elif row["session_date"] < session_date:
+        conn.execute(
+            """UPDATE ai_daily_sessions
+               SET session_date=?, question_count=0, history_json='[]',
+                   faq_context=NULL, updated_at=? WHERE chat_id=?""",
+            (session_date, updated_at, chat_id),
+        )
+    return conn.execute(
+        "SELECT * FROM ai_daily_sessions WHERE chat_id=?", (chat_id,)
+    ).fetchone()
+
+
+def get_ai_session(
+    chat_id: int,
+    *,
+    session_date: str | None = None,
+    create_if_missing: bool = True,
+) -> dict:
+    """Return today's sanitized session, replacing any expired daily data."""
+    today = session_date or _server_date()
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM ai_daily_sessions WHERE chat_id=? AND session_date=?",
+            (chat_id, today),
+        ).fetchone()
+        if row is None and create_if_missing:
+            row = _ensure_ai_session_locked(conn, chat_id, today, now)
+        conn.commit()
+        if row is None:
+            return {
+                "chat_id": chat_id,
+                "session_date": today,
+                "question_count": 0,
+                "history": [],
+                "faq_context": None,
+                "updated_at": now,
+            }
+        result = dict(row)
+        try:
+            result["history"] = json.loads(result.pop("history_json"))
+        except (TypeError, ValueError):
+            result["history"] = []
+        return result
+    finally:
+        conn.close()
+
+
+def set_ai_context(chat_id: int, context: str | None, *, session_date: str | None = None) -> None:
+    today = session_date or _server_date()
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _ensure_ai_session_locked(conn, chat_id, today, now)
+        conn.execute(
+            "UPDATE ai_daily_sessions SET faq_context=?, updated_at=? WHERE chat_id=?",
+            (context or None, now, chat_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def reserve_ai_question(
+    chat_id: int,
+    daily_limit: int,
+    *,
+    session_date: str | None = None,
+) -> bool:
+    """Atomically reserve one request from the shared daily allowance."""
+    today = session_date or _server_date()
+    if today != _server_date():
+        return False
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _ensure_ai_session_locked(conn, chat_id, today, now)
+        cursor = conn.execute(
+            """UPDATE ai_daily_sessions
+               SET question_count=question_count+1, updated_at=?
+               WHERE chat_id=? AND session_date=? AND question_count < ?""",
+            (now, chat_id, today, daily_limit),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+    finally:
+        conn.close()
+
+
+def release_ai_question(chat_id: int, *, session_date: str | None = None) -> None:
+    today = session_date or _server_date()
+    if today != _server_date():
+        return
+    conn = get_conn()
+    try:
+        conn.execute(
+            """UPDATE ai_daily_sessions
+               SET question_count=MAX(question_count-1, 0), updated_at=?
+               WHERE chat_id=? AND session_date=?""",
+            (datetime.now().astimezone().isoformat(timespec="seconds"), chat_id, today),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def append_ai_exchange(
+    chat_id: int,
+    question: str,
+    answer: str,
+    *,
+    session_date: str | None = None,
+    max_messages: int = 20,
+) -> None:
+    today = session_date or _server_date()
+    if today != _server_date():
+        return
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT history_json FROM ai_daily_sessions WHERE chat_id=? AND session_date=?",
+            (chat_id, today),
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return
+        try:
+            history = json.loads(row["history_json"])
+            if not isinstance(history, list):
+                history = []
+        except (TypeError, ValueError):
+            history = []
+        history.extend(
+            ({"role": "user", "text": question}, {"role": "assistant", "text": answer})
+        )
+        history = history[-max_messages:]
+        conn.execute(
+            "UPDATE ai_daily_sessions SET history_json=?, updated_at=? WHERE chat_id=?",
+            (
+                json.dumps(history, ensure_ascii=False),
+                now,
+                chat_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_ai_history(chat_id: int, *, session_date: str | None = None) -> None:
+    """Clear context without resetting today's used-question counter."""
+    today = session_date or _server_date()
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _ensure_ai_session_locked(conn, chat_id, today, now)
+        conn.execute(
+            """UPDATE ai_daily_sessions SET history_json='[]', faq_context=NULL, updated_at=?
+               WHERE chat_id=?""",
+            (now, chat_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def cleanup_expired_ai_sessions(*, session_date: str | None = None) -> int:
+    """Delete all temporary AI sessions from earlier server-local dates."""
+    today = session_date or _server_date()
+    conn = get_conn()
+    try:
+        cursor = conn.execute(
+            "DELETE FROM ai_daily_sessions WHERE session_date <> ?", (today,)
+        )
+        conn.commit()
+        return cursor.rowcount
+    finally:
+        conn.close()

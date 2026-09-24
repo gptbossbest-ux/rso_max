@@ -17,8 +17,6 @@ import client_1c
 import database as db
 import sync_1c
 from api import notifier
-from api.routers.integration_1c import request_code, verify_code
-from api.schemas import Integration1CAuthRequest, Integration1CVerifyRequest
 
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
 
@@ -209,46 +207,27 @@ class LocalIntegrationE2ETests(unittest.TestCase):
         self.assertEqual(self.max_requests[0]["authorization"], "audit-max-secret")
         self.assertIn("приняты", self.max_requests[0]["body"]["text"])
 
-    def test_full_auth_two_tariff_reading_and_sync_chain(self) -> None:
+    def test_local_auth_two_tariff_reading_and_sync_chain(self) -> None:
         chat_id = 70002
         ls = "TEST-LS-002"
+        db.create_lschet(ls, "Тестовый пользователь", "Тестовый адрес")
+        db.upsert_1c_meters(
+            ls,
+            [
+                {
+                    "meter_number": "ELECTRICITY-2T",
+                    "resource_type": "Электроэнергия",
+                    "meter_type": "Двухтарифный",
+                }
+            ],
+        )
 
         def one_c(request, body):
-            if request.url.path.endswith("/auth/request-code"):
-                return httpx.Response(
-                    200,
-                    json={"status": "ok", "message": "Код отправлен"},
-                    request=request,
-                )
-            if request.url.path.endswith("/auth/verify-code"):
-                return httpx.Response(
-                    200,
-                    json={
-                        "status": "ok",
-                        "message": "Авторизация выполнена",
-                        "meters": [{
-                            "meter_number": "ELECTRICITY-2T",
-                            "resource_type": "Электроэнергия",
-                            "meter_type": "Двухтарифный",
-                        }],
-                    },
-                    request=request,
-                )
             return httpx.Response(
                 200,
                 json=self._status_result(body, "accepted"),
                 request=request,
             )
-
-        def request_via_api(account: str, user_id: int):
-            return request_code(
-                Integration1CAuthRequest(ls=account, chat_id=user_id)
-            ), None
-
-        def verify_via_api(account: str, user_id: int, code: str):
-            return verify_code(Integration1CVerifyRequest(
-                ls=account, chat_id=user_id, code=code
-            )), None
 
         def callback(payload: str) -> dict:
             return {
@@ -259,32 +238,33 @@ class LocalIntegrationE2ETests(unittest.TestCase):
         with (
             self._transport_context(one_c),
             patch.object(bot, "ENABLE_1C_INTEGRATION", True),
-            patch.object(bot.client_api, "request_1c_auth_code", side_effect=request_via_api),
-            patch.object(bot.client_api, "verify_1c_auth_code", side_effect=verify_via_api),
+            patch.object(bot.client_api, "request_1c_auth_code") as request_code_api,
+            patch.object(bot.client_api, "verify_1c_auth_code") as verify_code_api,
             patch.object(bot, "_ack_callback"),
             patch.object(bot, "_send_raw", return_value=True),
             patch.object(sync_1c, "_generate_batch_id", return_value="batch-full-e2e"),
         ):
             bot._start_1c_auth(chat_id)
-            bot.handle_message({"recipient": {"chat_id": chat_id}, "body": {"text": ls}})
-            bot.handle_message({
-                "recipient": {"chat_id": chat_id}, "body": {"text": "123456"}
-            })
+            bot.handle_message(
+                {"recipient": {"chat_id": chat_id}, "body": {"text": ls}}
+            )
             bot.handle_callback(callback("pokazaniya"))
             bot.handle_callback(callback("meter:0"))
-            bot.handle_message({
-                "recipient": {"chat_id": chat_id}, "body": {"text": "120.5"}
-            })
-            bot.handle_message({
-                "recipient": {"chat_id": chat_id}, "body": {"text": "48.25"}
-            })
+            bot.handle_message(
+                {"recipient": {"chat_id": chat_id}, "body": {"text": "120.5"}}
+            )
+            bot.handle_message(
+                {"recipient": {"chat_id": chat_id}, "body": {"text": "48.25"}}
+            )
             bot.handle_callback(callback("meter_confirm"))
             outcome = sync_1c.sync_1c_job(self.now)
 
         self.assertEqual(outcome, "success")
+        request_code_api.assert_not_called()
+        verify_code_api.assert_not_called()
         self.assertEqual(
             [request["url"].rsplit("/", 2)[-2:] for request in self.one_c_requests],
-            [["auth", "request-code"], ["auth", "verify-code"], ["readings", "sync"]],
+            [["readings", "sync"]],
         )
         user = db.get_bot_user(chat_id)
         self.assertEqual((user["ls"], user["authorized_1c"]), (ls, 1))

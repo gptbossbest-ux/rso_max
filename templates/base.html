@@ -213,6 +213,12 @@
            class="nav-item {% if request.endpoint == 'appointments_list' %}active{% endif %}">
             🗓️ Записи на приём
         </a>
+        {% if user.role == 'operator' %}
+        <a href="{{ url_for('operator_chat_page') }}"
+           class="nav-item {% if request.endpoint and request.endpoint.startswith('operator_') %}active{% endif %}">
+            💬 Диалоги с клиентами
+        </a>
+        {% endif %}
         {% if user.role == 'admin' %}
         <div class="nav-label">Администратор</div>
         <a href="{{ url_for('branches_page') }}"
@@ -227,9 +233,29 @@
            class="nav-item {% if request.endpoint == 'upload_page' %}active{% endif %}">
             📂 Загрузка данных
         </a>
+        <a href="{{ url_for('accounts_page') }}"
+           class="nav-item {% if request.endpoint in ('accounts_page','account_create') %}active{% endif %}">
+            🧾 Лицевые счета
+        </a>
         <a href="{{ url_for('users_page') }}"
            class="nav-item {% if request.endpoint in ('users_page','user_create','user_delete') %}active{% endif %}">
             👥 Пользователи
+        </a>
+        <a href="{{ url_for('ai_settings_page') }}"
+           class="nav-item {% if request.endpoint == 'ai_settings_page' %}active{% endif %}">
+            🤖 ИИ-помощник
+        </a>
+        <a href="{{ url_for('operator_chat_settings_page') }}"
+           class="nav-item {% if request.endpoint == 'operator_chat_settings_page' %}active{% endif %}">
+            🎧 Операторы и меню
+        </a>
+        <a href="{{ url_for('operator_chat_history_page') }}"
+           class="nav-item {% if request.endpoint and request.endpoint.startswith('operator_chat_history') %}active{% endif %}">
+            💬 История диалогов
+        </a>
+        <a href="{{ url_for('operator_reports_page') }}"
+           class="nav-item {% if request.endpoint and request.endpoint.startswith('operator_report') %}active{% endif %}">
+            🚫 Жалобы на клиентов
         </a>
         {% endif %}
         <div class="nav-label">История</div>

@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% block title %}Лицевые счета{% endblock %}
+
+{% block head %}
+<style>
+    .account-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .account-grid .wide { grid-column: 1 / -1; }
+    @media (max-width: 700px) {
+        .account-grid { grid-template-columns: 1fr; }
+        .account-grid .wide { grid-column: auto; }
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Лицевые счета</h1>
+</div>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+        <div class="alert alert-{{ category }}">{{ message }}</div>
+    {% endfor %}
+{% endwith %}
+
+<div class="card">
+    <div class="card-header"><strong>Добавить лицевой счёт</strong></div>
+    <div class="card-body">
+        <form method="POST" action="{{ url_for('account_create') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="account-grid">
+                <div class="form-group">
+                    <label for="account-number">Номер</label>
+                    <input id="account-number" type="text" name="number"
+                           class="form-control" maxlength="64" required>
+                </div>
+                <div class="form-group">
+                    <label for="account-fio">ФИО</label>
+                    <input id="account-fio" type="text" name="fio"
+                           class="form-control" maxlength="256">
+                </div>
+                <div class="form-group wide">
+                    <label for="account-address">Адрес</label>
+                    <input id="account-address" type="text" name="address"
+                           class="form-control" maxlength="512">
+                </div>
+            </div>
+            <button type="submit" class="btn btn-primary">+ Добавить</button>
+        </form>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">
+        <strong>Список лицевых счетов</strong>
+        <span class="badge badge-primary">{{ total }}</span>
+    </div>
+    <div class="card-body">
+        <form method="GET" action="{{ url_for('accounts_page') }}" class="form-inline">
+            <input type="search" name="q" value="{{ query }}" class="form-control"
+                   maxlength="100" placeholder="Номер, ФИО или адрес">
+            <button type="submit" class="btn btn-secondary">Найти</button>
+            {% if query %}
+                <a href="{{ url_for('accounts_page') }}" class="btn btn-outline-secondary">Сбросить</a>
+            {% endif %}
+        </form>
+    </div>
+    <div class="card-body p-0">
+        <table class="table">
+            <thead>
+                <tr><th>Номер</th><th>ФИО</th><th>Адрес</th></tr>
+            </thead>
+            <tbody>
+                {% for account in accounts %}
+                <tr>
+                    <td>{{ account['number'] }}</td>
+                    <td>{{ account['fio'] or '—' }}</td>
+                    <td>{{ account['address'] or '—' }}</td>
+                </tr>
+                {% else %}
+                <tr><td colspan="3" class="text-center text-muted py-5">Лицевые счета ещё не добавлены</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    <div class="card-footer d-flex align-items-center justify-content-between">
+        <span>Страница {{ page }} из {{ total_pages }}</span>
+        <div class="d-flex gap-2">
+            {% if page > 1 %}
+                <a class="btn btn-sm btn-secondary"
+                   href="{{ url_for('accounts_page', q=query, page=page-1) }}">← Назад</a>
+            {% endif %}
+            {% if page < total_pages %}
+                <a class="btn btn-sm btn-secondary"
+                   href="{{ url_for('accounts_page', q=query, page=page+1) }}">Вперёд →</a>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endblock %}
