@@ -181,6 +181,10 @@ def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS ix_login_rate_limits_updated "
         "ON login_rate_limits(updated_at)"
     )
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_login_rate_limits_blocked_until "
+        "ON login_rate_limits(blocked_until)"
+    )
     _ensure_column(c, "users", "session_version", "INTEGER NOT NULL DEFAULT 1")
     _ensure_column(c, "users", "must_change_password", "INTEGER NOT NULL DEFAULT 0")
 
@@ -1949,18 +1953,13 @@ def import_from_excel(filepath: str = "Данные_по_ЛС.xlsx") -> None:
 # ── Защита входа (общая для всех Gunicorn workers) ───────────────────────────
 
 def get_login_block_seconds(ip: str, now: datetime | None = None) -> int:
-    """Return remaining block duration and prune old limiter records."""
+    """Return remaining block duration without taking a SQLite write lock."""
     now = now or datetime.now(timezone.utc)
     conn = get_conn()
     try:
-        conn.execute(
-            "DELETE FROM login_rate_limits WHERE updated_at<?",
-            ((now - timedelta(days=7)).isoformat(timespec="seconds"),),
-        )
         row = conn.execute(
             "SELECT blocked_until FROM login_rate_limits WHERE ip=?", (ip,),
         ).fetchone()
-        conn.commit()
     finally:
         conn.close()
     if not row or not row["blocked_until"]:
@@ -1986,6 +1985,12 @@ def record_login_failure(
     conn = get_conn()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """DELETE FROM login_rate_limits WHERE ip IN (
+                   SELECT ip FROM login_rate_limits WHERE updated_at<? LIMIT 100
+               )""",
+            ((now - timedelta(days=7)).isoformat(timespec="seconds"),),
+        )
         row = conn.execute(
             "SELECT * FROM login_rate_limits WHERE ip=?", (ip,),
         ).fetchone()
@@ -2899,7 +2904,14 @@ def get_unlinked_scenarios_for_chat(house_chat_id: int) -> list[sqlite3.Row]:
 # ── Скрипты FAQ — редактирование (портал: раздел «FAQ-скрипты») ──────────────
 # Чтение для бота (get_active_scripts, get_script_tree) уже реализовано выше.
 
+def _validate_faq_button_label(value: str) -> str:
+    from rso_bot.max_transport import validate_button_text
+
+    return validate_button_text(value)
+
+
 def create_script(title: str, sort_order: int = 0) -> int:
+    title = _validate_faq_button_label(title)
     conn = get_conn()
     try:
         row_id = conn.execute(
@@ -2936,6 +2948,7 @@ def get_script(script_id: int) -> sqlite3.Row | None:
 
 
 def update_script(script_id: int, title: str, sort_order: int, is_active: bool) -> None:
+    title = _validate_faq_button_label(title)
     conn = get_conn()
     conn.execute(
         "UPDATE scripts SET title=?, sort_order=?, is_active=? WHERE id=?",
@@ -3056,6 +3069,7 @@ def add_script_edge(
     Добавляет переход между узлами скрипта с DFS-проверкой циклов.
     Возвращает (edge_id, None) при успехе или (None, сообщение_об_ошибке).
     """
+    label = _validate_faq_button_label(label)
     conn = get_conn()
     try:
         existing = conn.execute(

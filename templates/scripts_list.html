@@ -18,7 +18,7 @@
   <div class="card-body">
     <form method="POST" action="{{ url_for('script_create') }}" class="form-inline">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <input type="text" name="title" class="form-control mr-2"
+      <input type="text" name="title" maxlength="128" class="form-control mr-2"
              style="flex:1;min-width:200px"
              placeholder="Название нового скрипта — например: Вопросы по оплате" required>
       <button type="submit" class="btn btn-primary">＋ Новый скрипт</button>

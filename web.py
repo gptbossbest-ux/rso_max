@@ -153,6 +153,7 @@ _LOGIN_BLOCK_MINUTES = 15
 _LOGIN_WINDOW_MINUTES = 15
 _ACCOUNTS_PAGE_SIZE = 50
 _CSRF_SESSION_KEY = "_csrf_token"
+_DEFAULT_TRUSTED_PROXY_CIDRS = "127.0.0.0/8,::1/128"
 
 
 def _normalize_login_ip(value: str | None) -> str:
@@ -164,6 +165,40 @@ def _normalize_login_ip(value: str | None) -> str:
     if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped:
         parsed = parsed.ipv4_mapped
     return parsed.compressed
+
+
+def _trusted_proxy_networks(value: str | None = None) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    """Parse the explicit immediate-proxy allowlist; invalid entries fail closed."""
+    raw = os.getenv("TRUSTED_PROXY_CIDRS", _DEFAULT_TRUSTED_PROXY_CIDRS) if value is None else value
+    networks = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            log.warning("TRUSTED_PROXY_CIDRS contains an invalid network; forwarded IPs disabled")
+            return ()
+    return tuple(networks)
+
+
+def _client_login_ip(remote_addr: str | None, forwarded_for: str | None) -> str:
+    """Accept exactly one forwarded hop only from an explicitly trusted peer."""
+    remote = _normalize_login_ip(remote_addr)
+    try:
+        peer = ipaddress.ip_address(remote)
+    except ValueError:
+        return remote
+    trusted = any(peer.version == network.version and peer in network for network in _trusted_proxy_networks())
+    if not trusted or not forwarded_for:
+        return remote
+    # Nginx is configured to overwrite, not append, X-Forwarded-For.  Multiple
+    # values are therefore malformed/spoofed and deliberately ignored.
+    if "," in forwarded_for or forwarded_for != forwarded_for.strip():
+        return remote
+    forwarded = _normalize_login_ip(forwarded_for)
+    return remote if forwarded == "unknown" else forwarded
 
 
 def _check_login_block(ip: str) -> str | None:
@@ -304,7 +339,7 @@ def _enrich_appeals(rows) -> list[dict]:
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    ip = _normalize_login_ip(request.remote_addr)
+    ip = _client_login_ip(request.remote_addr, request.headers.get("X-Forwarded-For"))
 
     block_msg = _check_login_block(ip)
     if block_msg:
@@ -1128,6 +1163,11 @@ def operator_close_dialog(dialog_id: int):
         operator_chat.close_dialog(dialog_id, _operator_id())
     except PermissionError:
         abort(404)
+    except operator_chat.UndeliveredMessagesError as exc:
+        return jsonify(
+            ok=False, error=str(exc),
+            undelivered_count=exc.total, undelivered_images=exc.images,
+        ), 409
     except ValueError as exc:
         return jsonify(ok=False, error=str(exc)), 409
     _flush_outbox()
@@ -1820,11 +1860,15 @@ def scripts_list():
 @admin_required
 @csrf_protected
 def script_create():
-    title = request.form.get("title", "").strip()
+    title = request.form.get("title", "")
     if not title:
         flash("Введите название скрипта", "error")
         return redirect(url_for("scripts_list"))
-    sid = db.create_script(title)
+    try:
+        sid = db.create_script(title)
+    except ValueError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("scripts_list"))
     flash(f"Скрипт «{title}» создан", "success")
     return redirect(url_for("script_editor", script_id=sid))
 
@@ -1870,7 +1914,7 @@ def script_editor(script_id: int):
 @admin_required
 @csrf_protected
 def script_update(script_id: int):
-    title = request.form.get("title", "").strip()
+    title = request.form.get("title", "")
     try:
         sort_order = int(request.form.get("sort_order", "0"))
     except ValueError:
@@ -1880,8 +1924,11 @@ def script_update(script_id: int):
     if not title:
         flash("Название не может быть пустым", "error")
     else:
-        db.update_script(script_id, title, sort_order, is_active)
-        flash("Скрипт обновлён", "success")
+        try:
+            db.update_script(script_id, title, sort_order, is_active)
+            flash("Скрипт обновлён", "success")
+        except ValueError as exc:
+            flash(str(exc), "error")
     return redirect(url_for("script_editor", script_id=script_id))
 
 
@@ -1970,12 +2017,16 @@ def script_edge_add(script_id: int):
         flash("Выберите оба узла перехода", "error")
         return redirect(url_for("script_editor", script_id=script_id))
 
-    label = request.form.get("label", "").strip()
+    label = request.form.get("label", "")
     if not label:
         flash("Текст кнопки не может быть пустым", "error")
         return redirect(url_for("script_editor", script_id=script_id))
 
-    edge_id, err = db.add_script_edge(script_id, from_node_id, label, to_node_id)
+    try:
+        edge_id, err = db.add_script_edge(script_id, from_node_id, label, to_node_id)
+    except ValueError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("script_editor", script_id=script_id))
     if err:
         flash(err, "error")
     else:

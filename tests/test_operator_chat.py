@@ -131,10 +131,10 @@ def test_messages_object_auth_close_and_unique_rating(operator_db):
     assert len(operator_chat.list_messages(dialog["id"], owner)) == 3
     with pytest.raises(PermissionError):
         operator_chat.close_dialog(dialog["id"], other)
+    operator_chat.deliver_outbox(lambda _item: (True, None))
     assert operator_chat.close_dialog(dialog["id"], owner) == 6
     outbox = operator_chat.get_outbox_item_for_message(reply["id"])
-    assert outbox["status"] == "failed"
-    assert outbox["last_error"] == "superseded_by_close"
+    assert outbox["status"] == "delivered"
     assert operator_chat.rate_dialog(6, dialog["id"], 5)
     assert not operator_chat.rate_dialog(6, dialog["id"], 1)
     report = next(row for row in operator_chat.rating_report() if row["id"] == owner)
@@ -505,7 +505,7 @@ def test_inbound_jpeg_db_failure_removes_saved_file(monkeypatch):
     root.rmdir()
 
 
-def test_failed_reply_is_superseded_so_close_notification_can_pass(operator_db):
+def test_failed_reply_blocks_manual_close_until_retry_succeeds(operator_db):
     _settings(max_active_dialogs=2)
     owner = _operator("close-order")
     operator_chat.start_shift(owner)
@@ -517,6 +517,11 @@ def test_failed_reply_is_superseded_so_close_notification_can_pass(operator_db):
         lambda _item: (False, "max_http_500"), only_id=outbox["id"],
     )
     assert failed[0]["retryable"] is True
+    with pytest.raises(operator_chat.UndeliveredMessagesError) as blocked:
+        operator_chat.close_dialog(dialog["id"], owner)
+    assert blocked.value.total == 1
+    assert operator_chat.retry_message(message["id"], owner)
+    operator_chat.deliver_outbox(lambda _item: (True, None), only_id=outbox["id"])
     operator_chat.close_dialog(dialog["id"], owner)
     assert not operator_chat.retry_message(message["id"], owner)
     deliveries = []
@@ -1111,6 +1116,13 @@ def test_delete_image_web_route_csrf_and_idor(operator_db, monkeypatch):
     monkeypatch.setattr(web, "OPERATOR_CHAT_IMAGE_DIR", str(root))
     client = web.app.test_client()
     _login_session(client, owner, "delete-web-owner", "operator")
+    blocked = client.post(
+        f"/operator-chat/api/dialogs/{dialog['id']}/close",
+        headers={"X-CSRF-Token": "csrf"},
+    )
+    assert blocked.status_code == 409
+    assert blocked.json["undelivered_count"] == 1
+    assert blocked.json["undelivered_images"] == 1
     assert client.post(f"/operator-chat/api/messages/{message['id']}/delete").status_code == 400
     _login_session(client, other, "delete-web-other", "operator")
     assert client.post(
@@ -1123,6 +1135,10 @@ def test_delete_image_web_route_csrf_and_idor(operator_db, monkeypatch):
         headers={"X-CSRF-Token": "csrf"},
     ).status_code == 200
     assert not image.exists()
+    assert client.post(
+        f"/operator-chat/api/dialogs/{dialog['id']}/close",
+        headers={"X-CSRF-Token": "csrf"},
+    ).status_code == 200
     root.rmdir()
 
 
@@ -1587,6 +1603,7 @@ def test_stale_text_after_close_does_not_reopen_or_append(operator_db, monkeypat
     )
     operator_chat.deliver_outbox(lambda _item: (True, None))
     operator_chat.close_dialog(dialog["id"], owner)
+    operator_chat.deliver_outbox(lambda _item: (True, None))
     state = bot._get_state(315)
     state["state"] = bot.S.OPERATOR_CHAT
     sent = []
@@ -1649,6 +1666,28 @@ def test_faq_link_columns_migrate_and_round_trip(operator_db):
     assert db.get_script_nodes(script_id)[0]["link_url"] == "https://example.test/help"
 
 
+def test_faq_button_labels_validate_on_every_write_and_legacy_data_survives_migration(
+    operator_db,
+):
+    with pytest.raises(ValueError):
+        db.create_script("X\n")
+    script_id = db.create_script("Valid")
+    with pytest.raises(ValueError):
+        db.update_script(script_id, "X" * 129, 0, True)
+    first = db.add_script_node(script_id, "First", False)
+    second = db.add_script_node(script_id, "Second", True)
+    with pytest.raises(ValueError):
+        db.add_script_edge(script_id, first, "Bad\u200b", second)
+    conn = db.get_conn()
+    conn.execute(
+        "INSERT INTO scripts(title,sort_order,is_active) VALUES('legacy' || char(10),99,1)",
+    )
+    conn.commit()
+    conn.close()
+    db.init_db()
+    assert any("legacy" in row["title"] for row in db.get_all_scripts())
+
+
 def test_script_link_validation_rejects_unsafe_url_and_defaults_label():
     with pytest.raises(ValueError):
         web._validate_script_link("javascript:alert(1)", "Плохая ссылка")
@@ -1663,7 +1702,7 @@ def test_script_link_validation_rejects_unsafe_url_and_defaults_label():
         web._validate_script_link(" https://example.test", "Сайт")
 
 
-@pytest.mark.parametrize("transition", ["close", "report", "transfer", "timeout"])
+@pytest.mark.parametrize("transition", ["report", "transfer", "timeout"])
 def test_transition_supersedes_failed_reply_and_unblocks_successor(
     operator_db, monkeypatch, transition,
 ):
@@ -1685,9 +1724,7 @@ def test_transition_supersedes_failed_reply_and_unblocks_successor(
         only_id=outbox["id"],
     )
 
-    if transition == "close":
-        operator_chat.close_dialog(dialog["id"], first, now=base + timedelta(seconds=1))
-    elif transition == "report":
+    if transition == "report":
         operator_chat.create_client_report(
             dialog["id"], first, "spam", "", now=base + timedelta(seconds=1),
         )
@@ -1710,8 +1747,7 @@ def test_transition_supersedes_failed_reply_and_unblocks_successor(
         now=base + timedelta(minutes=32),
     )
     expected_suffix = {
-        "close": ":closed", "report": ":closed",
-        "transfer": ":assigned:2", "timeout": ":timed_out",
+        "report": ":closed", "transfer": ":assigned:2", "timeout": ":timed_out",
     }[transition]
     assert len(delivered) == 1
     assert delivered[0].endswith(expected_suffix)
@@ -1764,7 +1800,97 @@ def test_transition_never_races_live_send(operator_db, transition):
     assert operator_chat.get_open_dialog_for_chat(401)["status"] == "active"
 
 
-def test_terminal_outbox_suppresses_duplicate_for_attachment_and_dead_letter_falls_back(
+@pytest.mark.parametrize("transition", ["close", "report", "transfer", "requeue"])
+def test_live_assignment_event_blocks_every_transition(operator_db, transition):
+    _settings(max_active_dialogs=1, inactivity_timeout_min=30, warning_before_min=5)
+    owner = _operator(f"assignment-live-{transition}")
+    base = datetime(2026, 4, 1, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(owner, now=base)
+    dialog = operator_chat.request_dialog(
+        450, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+    conn = db.get_conn()
+    event = conn.execute(
+        "SELECT id FROM operator_outbox WHERE dialog_id=? ORDER BY id DESC LIMIT 1",
+        (dialog["id"],),
+    ).fetchone()
+    assert event is not None
+    transition_at = base + (
+        timedelta(minutes=6) if transition == "requeue" else timedelta(seconds=1)
+    )
+    conn.execute(
+        "UPDATE operator_outbox SET status='sending',lease_at=? WHERE id=?",
+        (transition_at.isoformat(timespec="seconds"), event["id"]),
+    )
+    conn.commit()
+    conn.close()
+    if transition == "close":
+        with pytest.raises(operator_chat.DeliveryInProgressError):
+            operator_chat.close_dialog(dialog["id"], owner, now=transition_at)
+    elif transition == "report":
+        with pytest.raises(operator_chat.DeliveryInProgressError):
+            operator_chat.create_client_report(
+                dialog["id"], owner, "spam", "", now=transition_at,
+            )
+    elif transition == "transfer":
+        with pytest.raises(operator_chat.DeliveryInProgressError):
+            operator_chat.transfer_all_dialogs(owner, now=transition_at)
+    else:
+        result = operator_chat.process_timeouts(now=transition_at)
+        assert result["requeued"] == []
+    assert operator_chat.get_open_dialog_for_chat(450)["status"] == "active"
+
+
+def test_live_warning_event_defers_timeout_close(operator_db):
+    _settings(max_active_dialogs=1, inactivity_timeout_min=30, warning_before_min=5)
+    owner = _operator("warning-live-timeout")
+    base = datetime(2026, 4, 1, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(owner, now=base)
+    dialog = operator_chat.request_dialog(
+        452, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+    operator_chat.deliver_outbox(lambda _item: (True, None), now=base)
+    operator_chat.heartbeat(owner, now=base + timedelta(minutes=26))
+    operator_chat.process_timeouts(now=base + timedelta(minutes=26))
+    transition_at = base + timedelta(minutes=31)
+    conn = db.get_conn()
+    event = conn.execute(
+        "SELECT id FROM operator_outbox WHERE event_key LIKE ?",
+        (f"dialog:{dialog['id']}:warning:%",),
+    ).fetchone()
+    conn.execute(
+        "UPDATE operator_outbox SET status='sending',lease_at=? WHERE id=?",
+        (transition_at.isoformat(timespec="seconds"), event["id"]),
+    )
+    conn.commit()
+    conn.close()
+    operator_chat.heartbeat(owner, now=transition_at)
+    assert operator_chat.process_timeouts(now=transition_at)["closed"] == []
+    assert operator_chat.get_open_dialog_for_chat(452)["status"] == "active"
+
+
+def test_assignment_send_cas_finishes_before_later_transition(operator_db):
+    _settings(max_active_dialogs=1)
+    owner = _operator("assignment-cas")
+    base = datetime(2026, 4, 2, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(owner, now=base)
+    dialog = operator_chat.request_dialog(
+        451, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+
+    def transition_during_send(_item):
+        with pytest.raises(operator_chat.DeliveryInProgressError):
+            operator_chat.transfer_all_dialogs(owner, now=base + timedelta(seconds=1))
+        return False, "max_http_500"
+
+    result = operator_chat.deliver_outbox(transition_during_send, now=base)
+    assert result[0]["status"] == "failed"
+    assert operator_chat.get_open_dialog_for_chat(451)["status"] == "active"
+    operator_chat.transfer_all_dialogs(owner, now=base + timedelta(seconds=2))
+    assert operator_chat.get_open_dialog_for_chat(451)["status"] == "waiting"
+
+
+def test_terminal_outbox_dead_letter_rearms_and_recovers_exactly_once(
     operator_db, monkeypatch,
 ):
     _settings(max_active_dialogs=1)
@@ -1776,12 +1902,16 @@ def test_terminal_outbox_suppresses_duplicate_for_attachment_and_dead_letter_fal
     state = bot._get_state(402)
     state["state"] = bot.S.OPERATOR_CHAT
     sent = []
-    monkeypatch.setattr(bot, "send_main_menu", lambda *args: sent.append(args))
+    monkeypatch.setattr(
+        bot, "_deliver_operator_outbox",
+        lambda item: (sent.append(item["event_key"]) or False, "max_http_500"),
+    )
     bot.handle_message({
         "recipient": {"chat_id": 402},
         "body": {"attachments": [{"type": "image", "payload": {}}]},
     })
-    assert sent == []
+    assert sent == [f"dialog:{dialog['id']}:closed"]
+    assert state["state"] == bot.S.OPERATOR_CHAT
 
     conn = db.get_conn()
     conn.execute(
@@ -1791,17 +1921,23 @@ def test_terminal_outbox_suppresses_duplicate_for_attachment_and_dead_letter_fal
     )
     conn.commit()
     conn.close()
-    state["state"] = bot.S.OPERATOR_CHAT
+    monkeypatch.setattr(
+        bot, "_deliver_operator_outbox",
+        lambda item: (sent.append(item["event_key"]) or True, None),
+    )
     bot.handle_message({"recipient": {"chat_id": 402}, "body": {"text": "ещё"}})
-    assert sent == [(402, "Диалог с оператором завершён.")]
+    assert sent == [f"dialog:{dialog['id']}:closed"] * 2
+    assert state["state"] == bot.S.MENU
+    bot.handle_message({"recipient": {"chat_id": 402}, "body": {"text": "после"}})
+    assert sent == [f"dialog:{dialog['id']}:closed"] * 2
 
 
-@pytest.mark.parametrize(("status", "attempts", "next_retry"), [
-    ("delivered", 0, None),
-    ("failed", 1, "2099-01-01T00:00:00+00:00"),
+@pytest.mark.parametrize(("status", "attempts", "next_retry", "expected_state"), [
+    ("delivered", 0, None, bot.S.MENU),
+    ("failed", 1, "2099-01-01T00:00:00+00:00", bot.S.OPERATOR_CHAT),
 ])
 def test_delivered_or_retryable_terminal_outbox_owns_client_notice(
-    operator_db, monkeypatch, status, attempts, next_retry,
+    operator_db, monkeypatch, status, attempts, next_retry, expected_state,
 ):
     _settings(max_active_dialogs=1)
     owner = _operator(f"terminal-notice-{status}")
@@ -1825,7 +1961,7 @@ def test_delivered_or_retryable_terminal_outbox_owns_client_notice(
     sent = []
     monkeypatch.setattr(bot, "send_main_menu", lambda *args: sent.append(args))
     bot.handle_message({"recipient": {"chat_id": 403}, "body": {"text": "stale"}})
-    assert state["state"] == bot.S.MENU
+    assert state["state"] == expected_state
     assert sent == []
 
 
@@ -1935,6 +2071,38 @@ def test_login_rate_limit_migration_and_ip_normalization(operator_db):
     assert web._normalize_login_ip("2001:0db8:0:0::1") == "2001:db8::1"
     assert web._normalize_login_ip("::ffff:192.0.2.1") == "192.0.2.1"
     assert web._normalize_login_ip("x" * 10000) == "unknown"
+
+
+def test_login_ip_uses_exactly_one_hop_from_trusted_proxy(monkeypatch):
+    monkeypatch.setenv("TRUSTED_PROXY_CIDRS", "127.0.0.0/8,172.31.44.0/24,::1/128")
+    assert web._client_login_ip("198.51.100.10", "203.0.113.1") == "198.51.100.10"
+    assert web._client_login_ip("172.31.44.5", "203.0.113.1") == "203.0.113.1"
+    assert web._client_login_ip("172.31.44.5", "203.0.113.1, 198.51.100.2") == "172.31.44.5"
+    assert web._client_login_ip("::1", "2001:0db8::7") == "2001:db8::7"
+    assert web._client_login_ip("172.31.44.5", "not-an-ip") == "172.31.44.5"
+
+
+def test_get_login_is_read_only_and_keeps_clients_separate(operator_db, monkeypatch):
+    traces = []
+    original_get_conn = db.get_conn
+
+    def traced_connection():
+        conn = original_get_conn()
+        conn.set_trace_callback(traces.append)
+        return conn
+
+    monkeypatch.setattr(db, "get_conn", traced_connection)
+    client = web.app.test_client()
+    assert client.get("/login", environ_base={"REMOTE_ADDR": "192.0.2.10"}).status_code == 200
+    assert not any(
+        statement.lstrip().upper().startswith(("DELETE", "INSERT", "UPDATE", "BEGIN"))
+        for statement in traces
+    )
+    monkeypatch.setattr(db, "get_conn", original_get_conn)
+    for _ in range(5):
+        db.record_login_failure("192.0.2.10")
+    assert db.get_login_block_seconds("192.0.2.10") > 0
+    assert db.get_login_block_seconds("192.0.2.11") == 0
 
 
 def test_successful_web_login_resets_shared_rate_limit(operator_db):

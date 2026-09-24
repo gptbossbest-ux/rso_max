@@ -41,7 +41,7 @@ def _has_unsafe_text_characters(value: str) -> bool:
     )
 
 
-def _validate_button_text(value: Any) -> str:
+def validate_button_text(value: Any) -> str:
     if not isinstance(value, str):
         raise ValueError("Текст кнопки должен быть строкой")  # noqa: TRY004
     if any(unicodedata.category(character) in {"Cc", "Cf"} for character in value):
@@ -103,8 +103,16 @@ def validate_link_url(value: str) -> str:
 
 def make_link_button(text: str, url: str) -> dict[str, str]:
     """Build the documented MAX inline-keyboard link button."""
-    label = _validate_button_text(text)
+    label = validate_button_text(text)
     return {"type": "link", "text": label, "url": validate_link_url(url)}
+
+
+def make_callback_button(text: str, payload: str) -> dict[str, str]:
+    """Build a validated callback button without interpreting its label."""
+    label = validate_button_text(text)
+    if not isinstance(payload, str) or not payload:
+        raise ValueError("Callback-кнопка должна содержать payload")
+    return {"type": "callback", "text": label, "payload": payload}
 
 
 def validate_inline_keyboard(buttons: Any) -> list[list[dict[str, Any]]]:
@@ -128,7 +136,7 @@ def validate_inline_keyboard(buttons: Any) -> list[list[dict[str, Any]]]:
             if not isinstance(button, dict):
                 raise ValueError("Некорректная кнопка")  # noqa: TRY004
             button_type = button.get("type")
-            _validate_button_text(button.get("text"))
+            validate_button_text(button.get("text"))
             if button_type == "callback":
                 if not isinstance(button.get("payload"), str) or not button["payload"]:
                     raise ValueError("Callback-кнопка должна содержать payload")

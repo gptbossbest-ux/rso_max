@@ -53,6 +53,18 @@ class DeliveryInProgressError(ValueError):
     """The dialog has an operator reply currently crossing the MAX boundary."""
 
 
+class UndeliveredMessagesError(ValueError):
+    """Manual close must not silently discard operator-authored content."""
+
+    def __init__(self, *, total: int, images: int) -> None:
+        self.total = total
+        self.images = images
+        super().__init__(
+            f"Не доставлено сообщений: {total}, из них изображений: {images}. "
+            "Повторите отправку или удалите недоставленные изображения."
+        )
+
+
 def is_allowed_max_image_upload_url(value: Any) -> bool:
     """Validate the documented signed MAX image-upload endpoint without logging it."""
     if not isinstance(value, str) or not value:
@@ -285,8 +297,7 @@ def _supersede_operator_delivery_locked(
     """
     live_send = conn.execute(
         """SELECT 1 FROM operator_outbox o
-           JOIN operator_messages m ON m.id=o.message_id
-           WHERE o.dialog_id=? AND m.sender='operator' AND o.status='sending'
+           WHERE o.dialog_id=? AND o.status='sending'
              AND o.lease_at>? LIMIT 1""",
         (dialog_id, _iso(now - timedelta(minutes=2))),
     ).fetchone()
@@ -586,6 +597,69 @@ def terminal_notification_owned(chat_id: int) -> bool:
     )
 
 
+def ensure_terminal_notification(chat_id: int, now: datetime | None = None) -> dict[str, Any] | None:
+    """Return or durably restore the latest dialog's terminal notification."""
+    now = now or utc_now()
+    with _connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        dialog = conn.execute(
+            """SELECT * FROM operator_dialogs WHERE chat_id=?
+               AND status NOT IN ('waiting','active') ORDER BY id DESC LIMIT 1""",
+            (chat_id,),
+        ).fetchone()
+        if not dialog:
+            return None
+        existing = conn.execute(
+            """SELECT * FROM operator_outbox WHERE dialog_id=? AND kind='buttons'
+               AND message_id IS NULL
+               AND (event_key=? OR event_key=? OR event_key=? OR event_key=?
+                    OR event_key LIKE 'report:%:closed')
+               ORDER BY id DESC LIMIT 1""",
+            (
+                dialog["id"], f"dialog:{dialog['id']}:closed",
+                f"dialog:{dialog['id']}:timed_out",
+                f"dialog:{dialog['id']}:cancelled_by_client",
+                f"dialog:{dialog['id']}:waiting_timeout",
+            ),
+        ).fetchone()
+        if existing:
+            if existing["status"] == "failed" and existing["next_retry_at"] is None:
+                conn.execute(
+                    """UPDATE operator_outbox SET status='pending',attempts=0,last_error=NULL,
+                       next_retry_at=NULL,lease_at=NULL WHERE id=?""",
+                    (existing["id"],),
+                )
+                existing = conn.execute(
+                    "SELECT * FROM operator_outbox WHERE id=?", (existing["id"],),
+                ).fetchone()
+            return dict(existing)
+
+        report = conn.execute(
+            "SELECT id FROM operator_client_reports WHERE dialog_id=? ORDER BY id DESC LIMIT 1",
+            (dialog["id"],),
+        ).fetchone()
+        if report:
+            event_key = f"report:{report['id']}:closed"
+            body, buttons = "Диалог с оператором завершён.", _main_menu_buttons()
+        elif dialog["status"] == "timed_out":
+            event_key = f"dialog:{dialog['id']}:timed_out"
+            body = "Диалог закрыт по бездействию. Оцените работу оператора от 1 до 5."
+            buttons = _rating_buttons(dialog["id"])
+        elif dialog["status"] == "closed":
+            event_key = f"dialog:{dialog['id']}:closed"
+            body = "Оператор завершил диалог. Оцените его работу от 1 до 5."
+            buttons = _rating_buttons(dialog["id"])
+        else:
+            event_key = f"dialog:{dialog['id']}:waiting_timeout"
+            body, buttons = "Диалог с оператором завершён.", _main_menu_buttons()
+        outbox_id = _enqueue_outbox_locked(
+            conn, event_key=event_key, dialog_id=dialog["id"], chat_id=chat_id,
+            kind="buttons", body=body, buttons=buttons, now=now,
+        )
+        row = conn.execute("SELECT * FROM operator_outbox WHERE id=?", (outbox_id,)).fetchone()
+        return dict(row)
+
+
 def add_message(dialog_id: int, sender: str, body: str | None, *, user_id: int | None = None,
                 image_path: str | None = None, now: datetime | None = None) -> dict[str, Any]:
     body = (body or "").strip()
@@ -690,11 +764,25 @@ def close_dialog(dialog_id: int, operator_id: int, now: datetime | None = None) 
         ).fetchone()
         if not row:
             raise PermissionError
-        if not _supersede_operator_delivery_locked(
-            conn, dialog_id, "superseded_by_close", now,
-        ):
+        live_send = conn.execute(
+            """SELECT 1 FROM operator_outbox WHERE dialog_id=? AND status='sending'
+               AND lease_at>? LIMIT 1""",
+            (dialog_id, _iso(now - timedelta(minutes=2))),
+        ).fetchone()
+        if live_send:
             raise DeliveryInProgressError(
                 "Ответ оператора сейчас отправляется. Повторите завершение через несколько секунд"
+            )
+        undelivered = conn.execute(
+            """SELECT COUNT(*) total,
+                      SUM(CASE WHEN image_path IS NOT NULL THEN 1 ELSE 0 END) images
+               FROM operator_messages
+               WHERE dialog_id=? AND sender='operator' AND delivery_status!='delivered'""",
+            (dialog_id,),
+        ).fetchone()
+        if undelivered["total"]:
+            raise UndeliveredMessagesError(
+                total=int(undelivered["total"]), images=int(undelivered["images"] or 0),
             )
         _supersede_dialog_events_locked(conn, dialog_id, "superseded_by_close")
         conn.execute(

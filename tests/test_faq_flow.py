@@ -3,6 +3,7 @@ from __future__ import annotations
 from unittest.mock import Mock
 
 import bot
+from rso_bot import max_transport
 from rso_bot.flows import faq
 
 
@@ -70,12 +71,19 @@ def test_script_list_paginates_without_dropping_actions():
     scripts = [{"id": index, "title": f"Тема {index}"} for index in range(35)]
     deps, _ = _dependencies(scripts=(scripts, None))
     faq.show_scripts_list(42, deps)
-    assert deps.send_buttons.call_count == 2
-    pages = [call.args[2] for call in deps.send_buttons.call_args_list]
-    assert [len(page) for page in pages] == [30, 6]
-    payloads = [button["payload"] for page in pages for row in page for button in row]
-    assert payloads[:-1] == [f"script:{index}" for index in range(35)]
-    assert payloads[-1] == "main_menu"
+    assert deps.send_buttons.call_count == 1
+    first_page = deps.send_buttons.call_args.args[2]
+    assert len(first_page) == 30
+    token = deps.get_state.return_value["faq_scripts_token"]
+    assert first_page[-1][-1]["payload"] == f"faq_scripts_page:{token}:1"
+    faq.show_scripts_page(42, token, 1, deps)
+    second_page = deps.send_buttons.call_args.args[2]
+    payloads = [
+        button["payload"]
+        for rows in (first_page[:-1], second_page[:-1])
+        for row in rows for button in row
+    ]
+    assert payloads == [f"script:{index}" for index in range(35)] + ["main_menu"]
 
 
 def test_open_script_selects_root_and_renders_its_children():
@@ -216,14 +224,62 @@ def test_node_edges_paginate_without_invalid_max_keyboard():
     deps, state = _dependencies()
     edges = [{"label": f"Вариант {index}", "to_node_id": index + 2} for index in range(35)]
     state["script"] = {
-        "nodes": {1: {"id": 1, "title": "Выбор", "is_terminal": False}},
+        "id": 7, "nodes": {1: {"id": 1, "title": "Выбор", "is_terminal": False}},
         "edges_by_from": {1: edges}, "current": 1,
     }
+    state["state"] = "script_node"
     faq.show_script_node(42, deps)
+    assert deps.send_buttons.call_count == 1
+    assert len(deps.send_buttons.call_args.args[2]) == 30
+    faq.show_node_page(42, 7, 1, 1, deps)
     assert deps.send_buttons.call_count == 2
-    pages = [call.args[2] for call in deps.send_buttons.call_args_list]
-    assert [len(page) for page in pages] == [30, 6]
-    assert pages[-1][-1][0]["payload"] == "main_menu"
+    assert len(deps.send_buttons.call_args.args[2]) == 8
+
+
+def test_interactive_pagination_over_sixty_rows_has_no_loss():
+    scripts = [{"id": index, "title": f"Тема {index}"} for index in range(65)]
+    deps, _ = _dependencies(scripts=(scripts, None))
+    faq.show_scripts_list(42, deps)
+    token = deps.get_state.return_value["faq_scripts_token"]
+    faq.show_scripts_page(42, token, 1, deps)
+    faq.show_scripts_page(42, token, 2, deps)
+    assert deps.send_buttons.call_count == 3
+    action_payloads = []
+    for call in deps.send_buttons.call_args_list:
+        keyboard = call.args[2]
+        max_transport.validate_inline_keyboard(keyboard)
+        action_payloads.extend(
+            button["payload"] for row in keyboard for button in row
+            if not button["payload"].startswith("faq_scripts_page:")
+        )
+    assert action_payloads == [f"script:{index}" for index in range(65)] + ["main_menu"]
+
+
+def test_stale_or_invalid_faq_page_fails_safe():
+    deps, state = _dependencies(scripts=([{"id": 1, "title": "A"}] * 61, None))
+    faq.show_scripts_page(42, "stale", 1, deps)
+    deps.send_main_menu.assert_called_once_with(42)
+    state["state"] = "script_list"
+    state["faq_scripts"] = [{"id": index, "title": f"A {index}"} for index in range(61)]
+    state["faq_scripts_token"] = "current"
+    faq.show_scripts_page(42, "current", 99, deps)
+    assert deps.send_message.call_args.args == (42, "Неверная страница FAQ.")
+
+
+def test_invalid_legacy_faq_button_is_skipped_without_crash():
+    deps, _ = _dependencies(
+        scripts=([{"id": 1, "title": "X\n"}, {"id": 2, "title": "Valid"}], None),
+    )
+    deps = faq.FaqDependencies(
+        **{
+            **deps.__dict__,
+            "make_callback": max_transport.make_callback_button,
+        },
+    )
+    faq.show_scripts_list(42, deps)
+    keyboard = deps.send_buttons.call_args.args[2]
+    assert [row[0]["payload"] for row in keyboard] == ["script:2", "main_menu"]
+    deps.logger.warning.assert_called_once()
 
 
 def test_terminal_faq_preserves_traversed_path_for_ai():
@@ -306,3 +362,27 @@ def test_all_bot_faq_wrappers_delegate(monkeypatch):
     assert open_script.call_args.args[:2] == (42, 7)
     assert show_node.call_args.args[:1] == (42,)
     assert navigate.call_args.args[:2] == (42, 8)
+
+
+def test_disabled_faq_rejects_pagination_callback(monkeypatch):
+    monkeypatch.setattr(bot, "_ack_callback", Mock())
+    monkeypatch.setattr(bot.operator_chat, "module_enabled", lambda _key: False)
+    menu = Mock()
+    monkeypatch.setattr(bot, "send_main_menu", menu)
+    bot.handle_callback({
+        "message": {"recipient": {"chat_id": 987654}},
+        "callback": {"callback_id": "cb", "payload": "faq_scripts_page:token:1"},
+    })
+    menu.assert_called_once_with(987654, "Раздел временно недоступен.")
+
+
+def test_main_menu_with_all_modules_disabled_is_plain_text(monkeypatch):
+    monkeypatch.setattr(bot.operator_chat, "get_module_settings", lambda: {})
+    monkeypatch.setattr(bot, "_get_saved_ls", lambda _chat_id: None)
+    text_sender = Mock(return_value=True)
+    buttons_sender = Mock()
+    monkeypatch.setattr(bot, "send_message", text_sender)
+    monkeypatch.setattr(bot, "send_buttons", buttons_sender)
+    assert bot.send_main_menu(12, "Нет доступных разделов") is True
+    text_sender.assert_called_once_with(12, "Нет доступных разделов")
+    buttons_sender.assert_not_called()

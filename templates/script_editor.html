@@ -30,7 +30,7 @@
           class="form-inline" style="gap:14px">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <div style="flex:1;min-width:220px">
-        <input type="text" name="title" class="form-control"
+        <input type="text" name="title" maxlength="128" class="form-control"
                value="{{ script.title }}" required>
       </div>
       <div style="width:110px">
@@ -203,7 +203,7 @@
             </select>
             <input type="text" name="label" class="form-control form-control-sm"
                    style="flex:1;min-width:120px"
-                   placeholder="Текст кнопки" maxlength="64" required>
+                   placeholder="Текст кнопки" maxlength="128" required>
             <select name="to_node_id" class="form-control form-control-sm"
                     style="flex:1;min-width:130px" required>
               <option value="">— В узел —</option>
