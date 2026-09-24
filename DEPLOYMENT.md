@@ -110,10 +110,20 @@ WEB_TIMEOUT=60
 останавливает Gunicorn при старте.
 
 Ограничитель входа принимает адрес клиента только от явно доверенного
-ближайшего reverse proxy. Для Nginx на host оставьте в `.env.runtime`:
+ближайшего reverse proxy. По умолчанию forwarded-заголовки не доверяются:
 
 ```dotenv
-TRUSTED_PROXY_CIDRS=127.0.0.0/8,::1/128
+TRUSTED_PROXY_CIDRS=
+EXPECT_REVERSE_PROXY=true
+```
+
+Перед включением proxy посмотрите фактический `REMOTE_ADDR` в access-log Nginx
+и адрес gateway сети: `docker network inspect <project>_backend`. Добавьте
+конкретный адрес proxy как `/32` (или IPv6 `/128`) отдельно для
+каждого контура. Не предполагайте, что host Nginx виден как loopback:
+
+```dotenv
+TRUSTED_PROXY_CIDRS=172.31.44.5/32
 ```
 
 Nginx должен **перезаписывать** заголовок одним hop, а не добавлять

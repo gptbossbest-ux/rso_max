@@ -2905,7 +2905,7 @@ def get_unlinked_scenarios_for_chat(house_chat_id: int) -> list[sqlite3.Row]:
 # Чтение для бота (get_active_scripts, get_script_tree) уже реализовано выше.
 
 def _validate_faq_button_label(value: str) -> str:
-    from rso_bot.max_transport import validate_button_text
+    from rso_bot.content_validation import validate_button_text
 
     return validate_button_text(value)
 
@@ -2994,6 +2994,9 @@ def add_script_node(
     script_id: int, title: str, is_terminal: bool = False,
     link_url: str | None = None, link_text: str | None = None,
 ) -> int:
+    from rso_bot.content_validation import validate_optional_link
+
+    link_url, link_text = validate_optional_link(link_url, link_text)
     conn = get_conn()
     try:
         row_id = conn.execute(
@@ -3011,6 +3014,9 @@ def update_script_node(
     node_id: int, title: str, is_terminal: bool,
     link_url: str | None = None, link_text: str | None = None,
 ) -> None:
+    from rso_bot.content_validation import validate_optional_link
+
+    link_url, link_text = validate_optional_link(link_url, link_text)
     conn = get_conn()
     conn.execute(
         "UPDATE script_nodes SET title=?,is_terminal=?,link_url=?,link_text=? WHERE id=?",

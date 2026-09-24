@@ -462,10 +462,21 @@ def _show_faq_scripts_page(chat_id: int, arg: str) -> None:
 
 def _show_faq_node_page(chat_id: int, arg: str) -> None:
     parts = arg.split(":")
-    if len(parts) != 3:
+    if len(parts) != 4:
         raise ValueError("invalid FAQ node page")
     faq.show_node_page(
-        chat_id, int(parts[0]), int(parts[1]), int(parts[2]), _faq_dependencies(),
+        chat_id, int(parts[0]), int(parts[1]), parts[2], int(parts[3]),
+        _faq_dependencies(),
+    )
+
+
+def _navigate_faq_bound(chat_id: int, arg: str) -> None:
+    parts = arg.split(":")
+    if len(parts) != 4:
+        raise ValueError("invalid FAQ action")
+    faq.navigate_bound_action(
+        chat_id, int(parts[0]), int(parts[1]), int(parts[2]), parts[3],
+        _faq_dependencies(),
     )
 
 
@@ -1049,9 +1060,10 @@ _CALLBACK_PREFIXES: dict[str, callable] = {
     "reopen":      _cb_reopen_appeal,
     "cat":         lambda chat_id, st, arg: _appeal_set_category(chat_id, arg),
     "script":      lambda chat_id, st, arg: _open_script(chat_id, int(arg)),
-    "script_node": lambda chat_id, st, arg: _navigate_script_node(chat_id, int(arg)),
+    "script_node": lambda chat_id, st, arg: send_message(chat_id, "Эта кнопка FAQ устарела."),
     "faq_scripts_page": lambda chat_id, st, arg: _show_faq_scripts_page(chat_id, arg),
     "faq_node_page": lambda chat_id, st, arg: _show_faq_node_page(chat_id, arg),
+    "faq_go": lambda chat_id, st, arg: _navigate_faq_bound(chat_id, arg),
     "meter":       _cb_select_meter,
     "appt_branch": lambda chat_id, st, arg: _show_date_select(chat_id, int(arg)),
     "appt_date":   _cb_select_date,
@@ -1150,6 +1162,7 @@ _CALLBACK_PREFIX_MODULES = {
     "confirm": "appeal_status", "reopen": "appeal_status", "cat": "appeal",
     "script": "faq", "script_node": "faq", "faq_scripts_page": "faq",
     "faq_node_page": "faq", "meter": "readings",
+    "faq_go": "faq",
     "appt_branch": "appointment", "appt_date": "appointment",
     "appt_time": "appointment", "appt_cancel": "appointment",
 }
@@ -1166,6 +1179,9 @@ def handle_callback(update: dict) -> None:
     payload = update["callback"]["payload"]
 
     _ack_callback(update["callback"]["callback_id"])
+
+    if _reconcile_operator_terminal(chat_id):
+        return
 
     st = _get_state(chat_id)
     _touch(st)
@@ -1296,6 +1312,27 @@ _STATE_EXEMPT = {S.OPERATOR_CHAT}
 _RESET_COMMANDS = ("/start", "/help", "/menu")
 
 
+def _reconcile_operator_terminal(chat_id: int) -> bool:
+    """Consume stale updates until the durable terminal notice is delivered."""
+    state = _get_state(chat_id)
+    if state.get("state") != S.OPERATOR_CHAT or operator_chat.get_open_dialog_for_chat(chat_id):
+        return False
+    terminal = operator_chat.ensure_terminal_notification(chat_id)
+    if terminal and terminal["status"] != "delivered":
+        result = _flush_operator_outbox(terminal["id"])
+        delivered = bool(result and result[0]["status"] == "delivered")
+    elif terminal:
+        delivered = True
+    else:
+        delivered = send_main_menu(
+            chat_id, "Диалог с оператором завершён.",
+        ) is not False
+    if delivered:
+        _clear_flow(state)
+        _touch(state)
+    return True
+
+
 def handle_message(message: dict) -> None:
     chat_id = message["recipient"]["chat_id"]
     text    = (message.get("body") or {}).get("text", "").strip()
@@ -1328,20 +1365,7 @@ def handle_message(message: dict) -> None:
     # dialog state even for attachment-only updates; otherwise the client stays
     # visually trapped in the obsolete operator flow until sending text.
     if current_state == S.OPERATOR_CHAT:
-        state = _get_state(chat_id)
-        terminal = operator_chat.ensure_terminal_notification(chat_id)
-        if terminal and terminal["status"] != "delivered":
-            result = _flush_operator_outbox(terminal["id"])
-            delivered = bool(result and result[0]["status"] == "delivered")
-        elif terminal:
-            delivered = bool(terminal and terminal["status"] == "delivered")
-        else:
-            delivered = send_main_menu(
-                chat_id, "Диалог с оператором завершён.",
-            ) is not False
-        if delivered:
-            _clear_flow(state)
-            _touch(state)
+        _reconcile_operator_terminal(chat_id)
         return
 
     if not text:

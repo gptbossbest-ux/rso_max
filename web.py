@@ -23,6 +23,7 @@ import truststore
 
 truststore.inject_into_ssl()
 
+import hashlib
 import ipaddress
 import json
 import logging
@@ -55,6 +56,7 @@ import client_api
 import database as db
 from config import (
     API,
+    APP_ENV,
     DB_PATH,
     ENABLE_1C_INTEGRATION,
     LOG_BACKUP_COUNT,
@@ -153,7 +155,7 @@ _LOGIN_BLOCK_MINUTES = 15
 _LOGIN_WINDOW_MINUTES = 15
 _ACCOUNTS_PAGE_SIZE = 50
 _CSRF_SESSION_KEY = "_csrf_token"
-_DEFAULT_TRUSTED_PROXY_CIDRS = "127.0.0.0/8,::1/128"
+_DEFAULT_TRUSTED_PROXY_CIDRS = ""
 
 
 def _normalize_login_ip(value: str | None) -> str:
@@ -199,6 +201,28 @@ def _client_login_ip(remote_addr: str | None, forwarded_for: str | None) -> str:
         return remote
     forwarded = _normalize_login_ip(forwarded_for)
     return remote if forwarded == "unknown" else forwarded
+
+
+def _login_limit_key(ip: str, username: str) -> str:
+    """Isolate users behind one gateway without persisting their login name."""
+    identity = username.strip().casefold().encode("utf-8", errors="replace")[:512]
+    digest = hashlib.sha256(identity).hexdigest()[:32]
+    return f"{ip}|{digest}"
+
+
+def _warn_proxy_configuration() -> None:
+    if (
+        APP_ENV == "production"
+        and os.getenv("EXPECT_REVERSE_PROXY", "").lower() in {"1", "true", "yes"}
+        and not os.getenv("TRUSTED_PROXY_CIDRS", "").strip()
+    ):
+        log.warning(
+            "Reverse proxy expected but TRUSTED_PROXY_CIDRS is empty; "
+            "X-Forwarded-For will be ignored"
+        )
+
+
+_warn_proxy_configuration()
 
 
 def _check_login_block(ip: str) -> str | None:
@@ -341,18 +365,18 @@ def _enrich_appeals(rows) -> list[dict]:
 def login():
     ip = _client_login_ip(request.remote_addr, request.headers.get("X-Forwarded-For"))
 
-    block_msg = _check_login_block(ip)
-    if block_msg:
-        flash(block_msg, "error")
-        return render_template("login.html")
-
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
+        limiter_key = _login_limit_key(ip, username)
+        block_msg = _check_login_block(limiter_key)
+        if block_msg:
+            flash(block_msg, "error")
+            return render_template("login.html")
         user = db.get_user(username)
 
         if user and check_password_hash(user["password"], password):
-            _ok_login(ip)
+            _ok_login(limiter_key)
             session.clear()
             session["user"] = {
                 "id":       user["id"],      # нужен для operator_id в API
@@ -367,7 +391,7 @@ def login():
                 return redirect(url_for("change_own_password"))
             return redirect(url_for("index"))
 
-        msg = _fail_login(ip)
+        msg = _fail_login(limiter_key)
         flash(msg, "error")
         log.warning("Неудачный вход: %s  ip=%s", username, ip)
 
@@ -1321,6 +1345,8 @@ def operator_report_decide(report_id: int, decision: str):
     except LookupError:
         abort(404)
     except operator_chat.ReportDecisionConflictError as exc:
+        return jsonify(ok=False, error=str(exc)), 409
+    except operator_chat.DeliveryInProgressError as exc:
         return jsonify(ok=False, error=str(exc)), 409
     except ValueError:
         abort(400)

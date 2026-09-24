@@ -100,14 +100,13 @@ def test_open_script_selects_root_and_renders_its_children():
 
     assert state["state"] == "script_node"
     assert state["script"]["current"] == 10
-    deps.send_buttons.assert_called_once_with(
-        42,
-        "📌 Вопрос",
-        [
-            [{"type": "callback", "text": "Продолжить", "payload": "script_node:20"}],
-            [{"type": "callback", "text": "🏠 Главное меню", "payload": "main_menu"}],
-        ],
-    )
+    rows = deps.send_buttons.call_args.args[2]
+    assert deps.send_buttons.call_args.args[:2] == (42, "📌 Вопрос")
+    assert rows[0][0]["text"] == "Продолжить"
+    assert rows[0][0]["payload"].startswith("faq_go:7:10:20:")
+    assert rows[1] == [{
+        "type": "callback", "text": "🏠 Главное меню", "payload": "main_menu",
+    }]
 
 
 def test_open_script_uses_smallest_root_and_logs_ambiguous_tree():
@@ -225,15 +224,48 @@ def test_node_edges_paginate_without_invalid_max_keyboard():
     edges = [{"label": f"Вариант {index}", "to_node_id": index + 2} for index in range(35)]
     state["script"] = {
         "id": 7, "nodes": {1: {"id": 1, "title": "Выбор", "is_terminal": False}},
-        "edges_by_from": {1: edges}, "current": 1,
+        "edges_by_from": {1: edges}, "current": 1, "render_token": "page-token",
     }
     state["state"] = "script_node"
     faq.show_script_node(42, deps)
     assert deps.send_buttons.call_count == 1
     assert len(deps.send_buttons.call_args.args[2]) == 30
-    faq.show_node_page(42, 7, 1, 1, deps)
+    faq.show_node_page(42, 7, 1, "page-token", 1, deps)
     assert deps.send_buttons.call_count == 2
     assert len(deps.send_buttons.call_args.args[2]) == 8
+
+
+def test_bound_faq_action_rejects_stale_and_non_edge_targets():
+    deps, state = _dependencies()
+    state.update({
+        "state": "script_node",
+        "script": {
+            "id": 7,
+            "render_token": "current-token",
+            "nodes": {
+                1: {"id": 1, "title": "Root", "is_terminal": False},
+                2: {"id": 2, "title": "Child", "is_terminal": False},
+                3: {"id": 3, "title": "Other", "is_terminal": False},
+            },
+            "edges_by_from": {
+                1: [{"label": "Next", "to_node_id": 2}],
+                2: [{"label": "Next again", "to_node_id": 3}],
+            },
+            "current": 1,
+            "path": ["FAQ", "Root"],
+        },
+    })
+    faq.navigate_bound_action(42, 7, 1, 3, "current-token", deps)
+    assert state["script"]["current"] == 1
+    faq.navigate_bound_action(42, 7, 1, 2, "stale-token", deps)
+    assert state["script"]["current"] == 1
+    faq.navigate_bound_action(42, 7, 1, 2, "current-token", deps)
+    assert state["script"]["current"] == 2
+    new_token = state["script"]["render_token"]
+    assert new_token != "current-token"
+    faq.navigate_bound_action(42, 7, 1, 2, "current-token", deps)
+    assert state["script"]["current"] == 2
+    assert state["script"]["render_token"] == new_token
 
 
 def test_interactive_pagination_over_sixty_rows_has_no_loss():

@@ -165,6 +165,7 @@ def open_script(chat_id: int, script_id: int, deps: FaqDependencies) -> None:
     state["state"] = deps.script_node_state
     state["script"] = {
         "id": script_id,
+        "render_token": secrets.token_hex(4),
         "nodes": nodes,
         "edges_by_from": edges_by_from,
         "current": root_id,
@@ -219,26 +220,28 @@ def show_script_node(chat_id: int, deps: FaqDependencies, page: int = 0) -> None
         )
         _send_page(
             chat_id, f"📌 {text}{invitation}", rows, 0,
-            f"faq_node_page:{script.get('id')}:{current_id}", deps,
+            f"faq_node_page:{script.get('id')}:{current_id}:{script.get('render_token')}", deps,
         )
     else:
         rows = list(link_rows)
         for edge in edges:
             button = _safe_callback(
-                deps, edge.get("label"), f"script_node:{edge['to_node_id']}",
+                deps, edge.get("label"),
+                f"faq_go:{script.get('id')}:{current_id}:{edge['to_node_id']}:{script.get('render_token')}",
             )
             if button:
                 rows.append([button])
         rows.append([deps.make_callback("🏠 Главное меню", "main_menu")])
         if not _send_page(
             chat_id, f"📌 {text}", rows, page,
-            f"faq_node_page:{script.get('id')}:{current_id}", deps,
+            f"faq_node_page:{script.get('id')}:{current_id}:{script.get('render_token')}", deps,
         ):
             deps.send_message(chat_id, "Неверная страница FAQ.")
 
 
 def show_node_page(
-    chat_id: int, script_id: int, node_id: int, page: int, deps: FaqDependencies,
+    chat_id: int, script_id: int, node_id: int, token: str, page: int,
+    deps: FaqDependencies,
 ) -> None:
     state = deps.get_state(chat_id)
     script = state.get("script", {})
@@ -246,6 +249,7 @@ def show_node_page(
         state.get("state") != deps.script_node_state
         or script.get("id") != script_id
         or script.get("current") != node_id
+        or not secrets.compare_digest(str(script.get("render_token", "")), token)
     ):
         state["state"] = deps.menu_state
         state.pop("script", None)
@@ -282,5 +286,32 @@ def navigate_script_node(
     if target:
         script.setdefault("path", []).append(target.get("title", ""))
     script["current"] = node_id
+    script["render_token"] = secrets.token_hex(4)
     deps.touch(state)
     show_script_node(chat_id, deps)
+
+
+def navigate_bound_action(
+    chat_id: int,
+    script_id: int,
+    current_id: int,
+    target_id: int,
+    token: str,
+    deps: FaqDependencies,
+) -> None:
+    state = deps.get_state(chat_id)
+    script = state.get("script", {})
+    valid_edge = any(
+        edge.get("to_node_id") == target_id
+        for edge in script.get("edges_by_from", {}).get(current_id, [])
+    )
+    if (
+        state.get("state") != deps.script_node_state
+        or script.get("id") != script_id
+        or script.get("current") != current_id
+        or not secrets.compare_digest(str(script.get("render_token", "")), token)
+        or not valid_edge
+    ):
+        deps.send_message(chat_id, "Эта кнопка FAQ устарела.")
+        return
+    navigate_script_node(chat_id, target_id, deps)

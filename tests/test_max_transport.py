@@ -112,6 +112,16 @@ def test_link_button_rejects_unsafe_urls(url):
         max_transport.make_link_button("Сайт", url)
 
 
+def test_callback_payload_limit_is_enforced_in_builder_and_keyboard():
+    oversized = "я" * 513
+    with pytest.raises(ValueError):
+        max_transport.make_callback_button("Далее", oversized)
+    with pytest.raises(ValueError):
+        max_transport.validate_inline_keyboard([[
+            {"type": "callback", "text": "Далее", "payload": oversized},
+        ]])
+
+
 def test_link_button_matches_max_inline_keyboard_contract():
     button = max_transport.make_link_button(
         "Открыть личный кабинет", "https://example.test/account?q=1",
