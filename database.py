@@ -168,6 +168,23 @@ def init_db() -> None:
             must_change_password INTEGER NOT NULL DEFAULT 0
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS login_rate_limits (
+            ip TEXT PRIMARY KEY,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            window_started_at TEXT NOT NULL,
+            blocked_until TEXT,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_login_rate_limits_updated "
+        "ON login_rate_limits(updated_at)"
+    )
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_login_rate_limits_blocked_until "
+        "ON login_rate_limits(blocked_until)"
+    )
     _ensure_column(c, "users", "session_version", "INTEGER NOT NULL DEFAULT 1")
     _ensure_column(c, "users", "must_change_password", "INTEGER NOT NULL DEFAULT 0")
 
@@ -312,9 +329,13 @@ def init_db() -> None:
             script_id   INTEGER NOT NULL REFERENCES scripts(id),
             title       TEXT NOT NULL,
             image_path  TEXT,
+            link_url    TEXT,
+            link_text   TEXT,
             is_terminal INTEGER DEFAULT 0
         )
     """)
+    _ensure_column(c, "script_nodes", "link_url", "TEXT")
+    _ensure_column(c, "script_nodes", "link_text", "TEXT")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS script_edges (
@@ -1017,7 +1038,8 @@ def get_script_tree(script_id: int) -> dict | None:
         return None
 
     nodes = conn.execute(
-        "SELECT id, title, is_terminal, image_path FROM script_nodes WHERE script_id=?",
+        "SELECT id, title, is_terminal, image_path, link_url, link_text "
+        "FROM script_nodes WHERE script_id=?",
         (script_id,),
     ).fetchall()
 
@@ -1928,7 +1950,116 @@ def import_from_excel(filepath: str = "Данные_по_ЛС.xlsx") -> None:
         log.info("Записано начальных показаний: %d", initial_count)
 
 
+# ── Защита входа (общая для всех Gunicorn workers) ───────────────────────────
+
+def get_login_block_seconds(ip: str, now: datetime | None = None) -> int:
+    """Return remaining block duration without taking a SQLite write lock."""
+    now = now or datetime.now(timezone.utc)
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT blocked_until FROM login_rate_limits WHERE ip=?", (ip,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row or not row["blocked_until"]:
+        return 0
+    return max(
+        0,
+        int((datetime.fromisoformat(row["blocked_until"]) - now).total_seconds()),
+    )
+
+
+def record_login_failure(
+    ip: str,
+    *,
+    max_attempts: int = 5,
+    window_minutes: int = 15,
+    block_minutes: int = 15,
+    now: datetime | None = None,
+) -> tuple[bool, int]:
+    """Atomically count a failure across all web workers."""
+    now = now or datetime.now(timezone.utc)
+    now_s = now.isoformat(timespec="seconds")
+    window_cutoff = now - timedelta(minutes=window_minutes)
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """DELETE FROM login_rate_limits WHERE ip IN (
+                   SELECT ip FROM login_rate_limits WHERE updated_at<? LIMIT 100
+               )""",
+            ((now - timedelta(days=7)).isoformat(timespec="seconds"),),
+        )
+        row_count = int(conn.execute(
+            "SELECT COUNT(*) n FROM login_rate_limits",
+        ).fetchone()["n"])
+        if row_count >= 10_000:
+            conn.execute(
+                """DELETE FROM login_rate_limits WHERE ip IN (
+                       SELECT ip FROM login_rate_limits ORDER BY updated_at LIMIT 100
+                   )"""
+            )
+        row = conn.execute(
+            "SELECT * FROM login_rate_limits WHERE ip=?", (ip,),
+        ).fetchone()
+        if row and row["blocked_until"]:
+            blocked_until = datetime.fromisoformat(row["blocked_until"])
+            if blocked_until > now:
+                conn.commit()
+                return True, 0
+        within_window = bool(
+            row
+            and datetime.fromisoformat(row["window_started_at"]) > window_cutoff
+        )
+        attempts = (int(row["attempts"]) if within_window else 0) + 1
+        blocked = attempts >= max_attempts
+        window_started = row["window_started_at"] if within_window else now_s
+        blocked_until_s = (
+            (now + timedelta(minutes=block_minutes)).isoformat(timespec="seconds")
+            if blocked else None
+        )
+        conn.execute(
+            """INSERT INTO login_rate_limits
+               (ip,attempts,window_started_at,blocked_until,updated_at)
+               VALUES(?,?,?,?,?) ON CONFLICT(ip) DO UPDATE SET
+               attempts=excluded.attempts,window_started_at=excluded.window_started_at,
+               blocked_until=excluded.blocked_until,updated_at=excluded.updated_at""",
+            (
+                ip, 0 if blocked else attempts, window_started,
+                blocked_until_s, now_s,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return blocked, max(0, max_attempts - attempts)
+
+
+def reset_login_rate_limit(ip: str) -> None:
+    conn = get_conn()
+    try:
+        conn.execute("DELETE FROM login_rate_limits WHERE ip=?", (ip,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ── Пользователи портала ──────────────────────────────────────────────────────
+
+MAX_PORTAL_USERNAME_LENGTH = 128
+
+
+def _validate_portal_username(username: str) -> str:
+    value = username.strip() if isinstance(username, str) else ""
+    if not value:
+        raise ValueError("Логин не может быть пустым")
+    if len(value) > MAX_PORTAL_USERNAME_LENGTH:
+        raise ValueError(
+            f"Логин должен быть не длиннее {MAX_PORTAL_USERNAME_LENGTH} символов"
+        )
+    return value
+
 
 def get_user(username: str) -> sqlite3.Row | None:
     conn = get_conn()
@@ -1952,6 +2083,10 @@ def get_all_users() -> list[sqlite3.Row]:
 
 
 def create_user(username: str, password: str, name: str, role: str) -> tuple[bool, str]:
+    try:
+        username = _validate_portal_username(username)
+    except ValueError as exc:
+        return False, str(exc)
     conn = get_conn()
     try:
         conn.execute(
@@ -1964,6 +2099,28 @@ def create_user(username: str, password: str, name: str, role: str) -> tuple[boo
     except Exception as exc:
         log.warning("Ошибка создания пользователя %s: %s", username, exc)
         return False, f"Ошибка: {exc}"
+    finally:
+        conn.close()
+
+
+def change_username(user_id: int, username: str) -> tuple[bool, str]:
+    try:
+        username = _validate_portal_username(username)
+    except ValueError as exc:
+        return False, str(exc)
+    conn = get_conn()
+    try:
+        updated = conn.execute(
+            """UPDATE users SET username=?,session_version=session_version+1
+               WHERE id=?""",
+            (username, user_id),
+        )
+        conn.commit()
+        if not updated.rowcount:
+            return False, "Пользователь не найден"
+        return True, "Логин изменён"
+    except sqlite3.IntegrityError:
+        return False, "Такой логин уже существует"
     finally:
         conn.close()
 
@@ -2796,7 +2953,14 @@ def get_unlinked_scenarios_for_chat(house_chat_id: int) -> list[sqlite3.Row]:
 # ── Скрипты FAQ — редактирование (портал: раздел «FAQ-скрипты») ──────────────
 # Чтение для бота (get_active_scripts, get_script_tree) уже реализовано выше.
 
+def _validate_faq_button_label(value: str) -> str:
+    from rso_bot.content_validation import validate_button_text
+
+    return validate_button_text(value)
+
+
 def create_script(title: str, sort_order: int = 0) -> int:
+    title = _validate_faq_button_label(title)
     conn = get_conn()
     try:
         row_id = conn.execute(
@@ -2833,6 +2997,7 @@ def get_script(script_id: int) -> sqlite3.Row | None:
 
 
 def update_script(script_id: int, title: str, sort_order: int, is_active: bool) -> None:
+    title = _validate_faq_button_label(title)
     conn = get_conn()
     conn.execute(
         "UPDATE scripts SET title=?, sort_order=?, is_active=? WHERE id=?",
@@ -2874,12 +3039,19 @@ def get_script_edges(script_id: int) -> list[sqlite3.Row]:
     return rows
 
 
-def add_script_node(script_id: int, title: str, is_terminal: bool = False) -> int:
+def add_script_node(
+    script_id: int, title: str, is_terminal: bool = False,
+    link_url: str | None = None, link_text: str | None = None,
+) -> int:
+    from rso_bot.content_validation import validate_optional_link
+
+    link_url, link_text = validate_optional_link(link_url, link_text)
     conn = get_conn()
     try:
         row_id = conn.execute(
-            "INSERT INTO script_nodes (script_id, title, is_terminal) VALUES (?, ?, ?)",
-            (script_id, title, int(is_terminal)),
+            "INSERT INTO script_nodes (script_id,title,is_terminal,link_url,link_text) "
+            "VALUES (?,?,?,?,?)",
+            (script_id, title, int(is_terminal), link_url, link_text),
         ).lastrowid
         conn.commit()
         return row_id
@@ -2887,11 +3059,17 @@ def add_script_node(script_id: int, title: str, is_terminal: bool = False) -> in
         conn.close()
 
 
-def update_script_node(node_id: int, title: str, is_terminal: bool) -> None:
+def update_script_node(
+    node_id: int, title: str, is_terminal: bool,
+    link_url: str | None = None, link_text: str | None = None,
+) -> None:
+    from rso_bot.content_validation import validate_optional_link
+
+    link_url, link_text = validate_optional_link(link_url, link_text)
     conn = get_conn()
     conn.execute(
-        "UPDATE script_nodes SET title=?, is_terminal=? WHERE id=?",
-        (title, int(is_terminal), node_id),
+        "UPDATE script_nodes SET title=?,is_terminal=?,link_url=?,link_text=? WHERE id=?",
+        (title, int(is_terminal), link_url, link_text, node_id),
     )
     conn.commit()
     conn.close()
@@ -2946,6 +3124,7 @@ def add_script_edge(
     Добавляет переход между узлами скрипта с DFS-проверкой циклов.
     Возвращает (edge_id, None) при успехе или (None, сообщение_об_ошибке).
     """
+    label = _validate_faq_button_label(label)
     conn = get_conn()
     try:
         existing = conn.execute(

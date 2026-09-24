@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -130,11 +131,10 @@ def test_messages_object_auth_close_and_unique_rating(operator_db):
     assert len(operator_chat.list_messages(dialog["id"], owner)) == 3
     with pytest.raises(PermissionError):
         operator_chat.close_dialog(dialog["id"], other)
-    with pytest.raises(ValueError):
-        operator_chat.close_dialog(dialog["id"], owner)
-    outbox = operator_chat.get_outbox_item_for_message(reply["id"])
-    operator_chat.deliver_outbox(lambda _item: (True, None), only_id=outbox["id"])
+    operator_chat.deliver_outbox(lambda _item: (True, None))
     assert operator_chat.close_dialog(dialog["id"], owner) == 6
+    outbox = operator_chat.get_outbox_item_for_message(reply["id"])
+    assert outbox["status"] == "delivered"
     assert operator_chat.rate_dialog(6, dialog["id"], 5)
     assert not operator_chat.rate_dialog(6, dialog["id"], 1)
     report = next(row for row in operator_chat.rating_report() if row["id"] == owner)
@@ -505,7 +505,7 @@ def test_inbound_jpeg_db_failure_removes_saved_file(monkeypatch):
     root.rmdir()
 
 
-def test_failed_reply_blocks_close_until_manual_retry(operator_db):
+def test_failed_reply_blocks_manual_close_until_retry_succeeds(operator_db):
     _settings(max_active_dialogs=2)
     owner = _operator("close-order")
     operator_chat.start_shift(owner)
@@ -517,13 +517,18 @@ def test_failed_reply_blocks_close_until_manual_retry(operator_db):
         lambda _item: (False, "max_http_500"), only_id=outbox["id"],
     )
     assert failed[0]["retryable"] is True
-    with pytest.raises(ValueError, match="доставьте"):
+    with pytest.raises(operator_chat.UndeliveredMessagesError) as blocked:
         operator_chat.close_dialog(dialog["id"], owner)
+    assert blocked.value.total == 1
     assert operator_chat.retry_message(message["id"], owner)
-    assert operator_chat.deliver_outbox(
-        lambda _item: (True, None), only_id=outbox["id"],
-    )[0]["status"] == "delivered"
+    operator_chat.deliver_outbox(lambda _item: (True, None), only_id=outbox["id"])
     operator_chat.close_dialog(dialog["id"], owner)
+    assert not operator_chat.retry_message(message["id"], owner)
+    deliveries = []
+    operator_chat.deliver_outbox(
+        lambda item: deliveries.append(item["event_key"]) or (True, None),
+    )
+    assert deliveries == [f"dialog:{dialog['id']}:closed"]
 
 
 def test_failed_requeue_blocks_later_assignment_notification(operator_db, monkeypatch):
@@ -680,6 +685,9 @@ def test_outbox_orders_old_close_before_new_dialog_assignment(operator_db):
 def test_operator_composer_matches_server_message_limit():
     template = Path("templates/operator_chat.html").read_text(encoding="utf-8")
     assert 'name="body" type="text" maxlength="3990"' in template
+    assert "function clearCurrent" in template
+    assert "clearCurrent('Диалог завершён.')" in template
+    assert "clearCurrent('Диалоги переданы.')" in template
 
 
 def test_non_retryable_4xx_dead_letters_until_manual_retry(operator_db):
@@ -1108,6 +1116,13 @@ def test_delete_image_web_route_csrf_and_idor(operator_db, monkeypatch):
     monkeypatch.setattr(web, "OPERATOR_CHAT_IMAGE_DIR", str(root))
     client = web.app.test_client()
     _login_session(client, owner, "delete-web-owner", "operator")
+    blocked = client.post(
+        f"/operator-chat/api/dialogs/{dialog['id']}/close",
+        headers={"X-CSRF-Token": "csrf"},
+    )
+    assert blocked.status_code == 409
+    assert blocked.json["undelivered_count"] == 1
+    assert blocked.json["undelivered_images"] == 1
     assert client.post(f"/operator-chat/api/messages/{message['id']}/delete").status_code == 400
     _login_session(client, other, "delete-web-other", "operator")
     assert client.post(
@@ -1120,6 +1135,10 @@ def test_delete_image_web_route_csrf_and_idor(operator_db, monkeypatch):
         headers={"X-CSRF-Token": "csrf"},
     ).status_code == 200
     assert not image.exists()
+    assert client.post(
+        f"/operator-chat/api/dialogs/{dialog['id']}/close",
+        headers={"X-CSRF-Token": "csrf"},
+    ).status_code == 200
     root.rmdir()
 
 
@@ -1355,6 +1374,138 @@ def test_report_conflicts_with_in_flight_operator_reply(operator_db):
     assert "сейчас отправляется" in response.json["error"]
 
 
+@pytest.mark.parametrize("event_kind", ["operator", "assignment", "warning"])
+def test_admin_block_preflights_every_live_delivery_and_retries_stale_lease(
+    operator_db, event_kind,
+):
+    _settings(max_active_dialogs=2, report_threshold=1)
+    owner = _operator(f"admin-block-{event_kind}")
+    admin_name = f"admin-block-{event_kind}-admin"
+    ok, _ = db.create_user(admin_name, "sufficient-password", "Admin", "admin")
+    assert ok
+    admin = db.get_user(admin_name)["id"]
+    base = datetime(2026, 5, 1, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(owner, now=base)
+    old = operator_chat.request_dialog(
+        510, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+    operator_chat.deliver_outbox(lambda _item: (True, None), now=base)
+    report = operator_chat.create_client_report(
+        old["id"], owner, "spam", "", now=base + timedelta(seconds=1),
+    )
+    operator_chat.deliver_outbox(
+        lambda _item: (True, None), now=base + timedelta(seconds=1),
+    )
+    active = operator_chat.request_dialog(
+        510, profile=None, faq_context=None, ai_messages=[],
+        now=base + timedelta(seconds=2),
+    )
+    conn = db.get_conn()
+    assignment_id = conn.execute(
+        "SELECT id FROM operator_outbox WHERE dialog_id=? AND event_key LIKE ?",
+        (active["id"], f"dialog:{active['id']}:assigned:%"),
+    ).fetchone()["id"]
+    operator_chat._enqueue_outbox_locked(
+        conn, event_key=f"dialog:{active['id']}:warning_correction:test",
+        dialog_id=active["id"], chat_id=510, kind="text", body="obsolete",
+        now=base + timedelta(seconds=3),
+    )
+    conn.commit()
+    if event_kind == "operator":
+        conn.execute(
+            "UPDATE operator_outbox SET status='delivered' WHERE id=?",
+            (assignment_id,),
+        )
+        conn.commit()
+        conn.close()
+        message = operator_chat.add_message(
+            active["id"], "operator", "in flight", user_id=owner,
+            now=base + timedelta(seconds=3),
+        )
+        conn = db.get_conn()
+        selector, value = "message_id=?", message["id"]
+    else:
+        selector, value = "id=?", assignment_id
+        if event_kind == "warning":
+            conn.execute(
+                "UPDATE operator_outbox SET event_key=? WHERE id=?",
+                (f"dialog:{active['id']}:warning:{active['last_activity_at']}", assignment_id),
+            )
+    decision_at = base + timedelta(seconds=4)
+    conn.execute(
+        f"UPDATE operator_outbox SET status='sending',lease_at=? WHERE {selector}",
+        (decision_at.isoformat(timespec="seconds"), value),
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(operator_chat.DeliveryInProgressError):
+        operator_chat.decide_client_report(
+            report["id"], admin, "confirmed", now=decision_at,
+        )
+    assert operator_chat.get_client_report(report["id"])["status"] == "pending"
+    assert not operator_chat.is_client_blocked(510)
+    assert operator_chat.get_open_dialog_for_chat(510)["id"] == active["id"]
+
+    conn = db.get_conn()
+    conn.execute(
+        f"UPDATE operator_outbox SET lease_at=? WHERE {selector}",
+        ((decision_at - timedelta(minutes=3)).isoformat(timespec="seconds"), value),
+    )
+    conn.commit()
+    conn.close()
+    result = operator_chat.decide_client_report(
+        report["id"], admin, "confirmed", now=decision_at,
+    )
+    assert result["blocked"] is True
+    assert operator_chat.get_open_dialog_for_chat(510) is None
+    correction = next(
+        row for row in _outbox_rows(active["id"])
+        if "warning_correction" in row["event_key"]
+    )
+    assert correction["last_error"] == "cancelled_by_block"
+
+
+@pytest.mark.parametrize("transition", ["close", "report", "transfer", "requeue", "timeout"])
+def test_pending_warning_correction_is_superseded_by_dialog_transition(
+    operator_db, transition,
+):
+    _settings(max_active_dialogs=1, inactivity_timeout_min=30, warning_before_min=5)
+    owner = _operator(f"correction-{transition}")
+    base = datetime(2026, 7, 1, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(owner, now=base)
+    dialog = operator_chat.request_dialog(
+        540, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+    operator_chat.deliver_outbox(lambda _item: (True, None), now=base)
+    with operator_chat._connection() as conn:
+        operator_chat._enqueue_outbox_locked(
+            conn, event_key=f"dialog:{dialog['id']}:warning_correction:test",
+            dialog_id=dialog["id"], chat_id=540, kind="text", body="obsolete",
+            now=base + timedelta(seconds=1),
+        )
+    if transition == "close":
+        operator_chat.close_dialog(dialog["id"], owner, now=base + timedelta(seconds=2))
+    elif transition == "report":
+        operator_chat.create_client_report(
+            dialog["id"], owner, "spam", "", now=base + timedelta(seconds=2),
+        )
+    elif transition == "transfer":
+        operator_chat.transfer_all_dialogs(owner, now=base + timedelta(seconds=2))
+    elif transition == "requeue":
+        operator_chat.process_timeouts(now=base + timedelta(minutes=6))
+    else:
+        operator_chat.heartbeat(owner, now=base + timedelta(minutes=31))
+        operator_chat.process_timeouts(now=base + timedelta(minutes=31))
+    correction = next(
+        row for row in _outbox_rows(dialog["id"])
+        if "warning_correction" in row["event_key"]
+    )
+    assert correction["status"] == "failed"
+    assert correction["next_retry_at"] is None
+    assert correction["last_error"].startswith(("superseded_", "cancelled_"))
+
+
 @pytest.mark.parametrize("delivery_result", [
     (True, None),
     (False, "max_http_500"),
@@ -1472,3 +1623,1025 @@ def test_blocked_client_stale_operator_flow_is_cleared(operator_db, monkeypatch)
     bot._on_operator_text(212, state, "stale text")
     assert state.get("state") == bot.S.MENU
     assert messages[-1] == (212, "Связь с оператором временно недоступна.")
+
+
+def _outbox_rows(dialog_id: int):
+    conn = db.get_conn()
+    rows = conn.execute(
+        "SELECT * FROM operator_outbox WHERE dialog_id=? ORDER BY id", (dialog_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def test_cancel_waiting_creates_one_durable_terminal_keyboard(operator_db):
+    _settings(max_active_dialogs=1)
+    owner = _operator("cancel-terminal-owner")
+    operator_chat.start_shift(owner)
+    operator_chat.request_dialog(301, profile=None, faq_context=None, ai_messages=[])
+    waiting = operator_chat.request_dialog(302, profile=None, faq_context=None, ai_messages=[])
+    assert waiting["status"] == "waiting"
+
+    assert operator_chat.cancel_waiting(302)
+    assert not operator_chat.cancel_waiting(302)
+    terminal = [
+        item for item in _outbox_rows(waiting["id"])
+        if item["event_key"].endswith(":cancelled_by_client")
+    ]
+    assert len(terminal) == 1
+    assert terminal[0]["kind"] == "buttons"
+    assert json.loads(terminal[0]["buttons_json"])[0][0]["payload"] == "main_menu"
+
+
+@pytest.mark.parametrize("terminal_kind", ["close", "report", "timeout", "queue_timeout"])
+def test_every_terminal_path_has_durable_exit_keyboard(
+    operator_db, terminal_kind,
+):
+    _settings(max_active_dialogs=2, inactivity_timeout_min=30, warning_before_min=5)
+    owner = _operator(f"terminal-{terminal_kind}")
+    base = datetime(2026, 1, 2, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(owner, now=base)
+    dialog = operator_chat.request_dialog(
+        310, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+    operator_chat.deliver_outbox(lambda _item: (True, None), now=base)
+    if terminal_kind == "close":
+        operator_chat.close_dialog(dialog["id"], owner, now=base)
+    elif terminal_kind == "report":
+        operator_chat.create_client_report(
+            dialog["id"], owner, "spam", "", now=base,
+        )
+    elif terminal_kind == "timeout":
+        operator_chat.heartbeat(owner, now=base + timedelta(minutes=31))
+        operator_chat.process_timeouts(now=base + timedelta(minutes=31))
+    else:
+        second = operator_chat.request_dialog(
+            311, profile=None, faq_context=None, ai_messages=[], now=base,
+        )
+        assert second["status"] == "active"
+        waiting = operator_chat.request_dialog(
+            312, profile=None, faq_context=None, ai_messages=[], now=base,
+        )
+        dialog = waiting
+        operator_chat.process_timeouts(now=base + timedelta(minutes=31))
+    terminal = [item for item in _outbox_rows(dialog["id"]) if item["buttons_json"]]
+    assert terminal
+    buttons = json.loads(terminal[-1]["buttons_json"])
+    assert any(button.get("payload") == "main_menu" for row in buttons for button in row)
+
+
+def test_timeout_scheduler_is_idempotent_for_terminal_notification(operator_db):
+    _settings(max_active_dialogs=1, inactivity_timeout_min=30, warning_before_min=5)
+    owner = _operator("timeout-idempotency")
+    base = datetime(2026, 1, 3, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(owner, now=base)
+    dialog = operator_chat.request_dialog(
+        313, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+    operator_chat.deliver_outbox(lambda _item: (True, None), now=base)
+    operator_chat.heartbeat(owner, now=base + timedelta(minutes=31))
+    operator_chat.process_timeouts(now=base + timedelta(minutes=31))
+    operator_chat.process_timeouts(now=base + timedelta(minutes=32))
+    assert sum(
+        item["event_key"] == f"dialog:{dialog['id']}:timed_out"
+        for item in _outbox_rows(dialog["id"])
+    ) == 1
+
+
+def test_attachment_only_update_reconciles_stale_operator_flow(
+    operator_db, monkeypatch,
+):
+    state = bot._get_state(314)
+    state["state"] = bot.S.OPERATOR_CHAT
+    sent = []
+    monkeypatch.setattr(
+        bot, "send_main_menu",
+        lambda chat_id, text=None: sent.append((chat_id, text)),
+    )
+    bot.handle_message({
+        "recipient": {"chat_id": 314},
+        "body": {"attachments": [{"type": "image", "payload": {}}]},
+    })
+    assert state["state"] == bot.S.MENU
+    assert sent == [(314, "Диалог с оператором завершён.")]
+
+
+def test_stale_text_after_close_does_not_reopen_or_append(operator_db, monkeypatch):
+    _settings(max_active_dialogs=1)
+    owner = _operator("stale-text-owner")
+    operator_chat.start_shift(owner)
+    dialog = operator_chat.request_dialog(
+        315, profile=None, faq_context=None, ai_messages=[],
+    )
+    operator_chat.deliver_outbox(lambda _item: (True, None))
+    operator_chat.close_dialog(dialog["id"], owner)
+    operator_chat.deliver_outbox(lambda _item: (True, None))
+    state = bot._get_state(315)
+    state["state"] = bot.S.OPERATOR_CHAT
+    sent = []
+    monkeypatch.setattr(
+        bot, "send_main_menu", lambda chat_id, text=None: sent.append((chat_id, text)),
+    )
+    bot.handle_message({"recipient": {"chat_id": 315}, "body": {"text": "поздний ответ"}})
+    assert state["state"] == bot.S.MENU
+    assert sent == []  # durable terminal outbox owns the visible notification
+    conn = db.get_conn()
+    count = conn.execute(
+        "SELECT COUNT(*) FROM operator_messages WHERE dialog_id=? AND sender='client'",
+        (dialog["id"],),
+    ).fetchone()[0]
+    conn.close()
+    assert count == 0
+
+
+def test_transfer_reassignment_notifies_once_and_stale_cancel_preserves_active_dialog(
+    operator_db, monkeypatch,
+):
+    _settings(max_active_dialogs=2)
+    first, second = _operator("transfer-notify-first"), _operator("transfer-notify-second")
+    now = operator_chat.utc_now()
+    operator_chat.start_shift(first, now=now)
+    monkeypatch.setattr(operator_chat.random, "choice", lambda values: min(values))
+    dialog = operator_chat.request_dialog(
+        316, profile=None, faq_context=None, ai_messages=[], now=now,
+    )
+    operator_chat.deliver_outbox(lambda _item: (True, None), now=now)
+    operator_chat.start_shift(second, now=now)
+    operator_chat.transfer_all_dialogs(first, now=now + timedelta(seconds=1))
+    assert operator_chat.assign_waiting(now=now + timedelta(seconds=1))
+    assert not operator_chat.assign_waiting(now=now + timedelta(seconds=1))
+    rows = _outbox_rows(dialog["id"])
+    reassigned = [row for row in rows if "направили вас к другому" in row["body"]]
+    assert len(reassigned) == 1
+
+    state = bot._get_state(316)
+    state["state"] = bot.S.OPERATOR_CHAT
+    messages = []
+    monkeypatch.setattr(bot, "send_message", lambda chat_id, text: messages.append((chat_id, text)))
+    bot._cancel_operator_wait(316, state)
+    assert operator_chat.get_open_dialog_for_chat(316)["status"] == "active"
+    assert state["state"] == bot.S.OPERATOR_CHAT
+    assert messages == [(316, "Оператор уже подключён к диалогу.")]
+
+
+def test_faq_link_columns_migrate_and_round_trip(operator_db):
+    script_id = db.create_script("FAQ со ссылкой")
+    node_id = db.add_script_node(
+        script_id, "Инструкция", True,
+        "https://example.test/help", "Открыть сайт",
+    )
+    tree = db.get_script_tree(script_id)
+    node = next(item for item in tree["nodes"] if item["id"] == node_id)
+    assert node["link_url"] == "https://example.test/help"
+    assert node["link_text"] == "Открыть сайт"
+    db.init_db()  # additive migration remains idempotent on an existing database
+    assert db.get_script_nodes(script_id)[0]["link_url"] == "https://example.test/help"
+
+
+def test_faq_button_labels_validate_on_every_write_and_legacy_data_survives_migration(
+    operator_db,
+):
+    with pytest.raises(ValueError):
+        db.create_script("X\n")
+    script_id = db.create_script("Valid")
+    with pytest.raises(ValueError):
+        db.update_script(script_id, "X" * 129, 0, True)
+    first = db.add_script_node(script_id, "First", False)
+    second = db.add_script_node(script_id, "Second", True)
+    with pytest.raises(ValueError):
+        db.add_script_node(script_id, "Unsafe", True, "javascript:alert(1)", "Open")
+    with pytest.raises(ValueError):
+        db.update_script_node(first, "First", False, "https://example.test", "Bad\u200b")
+    with pytest.raises(ValueError):
+        db.add_script_edge(script_id, first, "Bad\u200b", second)
+    conn = db.get_conn()
+    conn.execute(
+        "INSERT INTO scripts(title,sort_order,is_active) VALUES('legacy' || char(10),99,1)",
+    )
+    conn.commit()
+    conn.close()
+    db.init_db()
+    assert any("legacy" in row["title"] for row in db.get_all_scripts())
+
+
+def test_script_link_validation_rejects_unsafe_url_and_defaults_label():
+    with pytest.raises(ValueError):
+        web._validate_script_link("javascript:alert(1)", "Плохая ссылка")
+    assert web._validate_script_link("https://example.test/help", "") == (
+        "https://example.test/help", "Открыть сайт",
+    )
+    with pytest.raises(ValueError, match="Укажите адрес"):
+        web._validate_script_link("", "Лишний текст")
+    with pytest.raises(ValueError):
+        web._validate_script_link("https://example.test", "Сайт\n")
+    with pytest.raises(ValueError):
+        web._validate_script_link(" https://example.test", "Сайт")
+
+
+@pytest.mark.parametrize("transition", ["report", "transfer", "timeout"])
+def test_transition_supersedes_failed_reply_and_unblocks_successor(
+    operator_db, monkeypatch, transition,
+):
+    _settings(max_active_dialogs=2, inactivity_timeout_min=30, warning_before_min=5)
+    first, second = _operator(f"supersede-{transition}-1"), _operator(f"supersede-{transition}-2")
+    base = datetime(2026, 2, 1, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(first, now=base)
+    monkeypatch.setattr(operator_chat.random, "choice", lambda values: min(values))
+    dialog = operator_chat.request_dialog(
+        400, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+    operator_chat.deliver_outbox(lambda _item: (True, None), now=base)
+    message = operator_chat.add_message(
+        dialog["id"], "operator", "не доставлено", user_id=first, now=base,
+    )
+    outbox = operator_chat.get_outbox_item_for_message(message["id"])
+    operator_chat.deliver_outbox(
+        lambda _item: (False, "max_http_500"), now=base,
+        only_id=outbox["id"],
+    )
+
+    if transition == "report":
+        operator_chat.create_client_report(
+            dialog["id"], first, "spam", "", now=base + timedelta(seconds=1),
+        )
+    elif transition == "transfer":
+        operator_chat.start_shift(second, now=base + timedelta(seconds=1))
+        operator_chat.transfer_all_dialogs(first, now=base + timedelta(seconds=1))
+        operator_chat.assign_waiting(now=base + timedelta(seconds=1))
+    else:
+        later = base + timedelta(minutes=31)
+        operator_chat.heartbeat(first, now=later)
+        operator_chat.process_timeouts(now=later)
+
+    saved = operator_chat.get_outbox_item_for_message(message["id"])
+    assert saved["status"] == "failed" and saved["next_retry_at"] is None
+    assert not operator_chat.retry_message(message["id"], first)
+    assert not operator_chat.retry_message(message["id"], second)
+    delivered = []
+    operator_chat.deliver_outbox(
+        lambda item: delivered.append(item["event_key"]) or (True, None),
+        now=base + timedelta(minutes=32),
+    )
+    expected_suffix = {
+        "report": ":closed", "transfer": ":assigned:2", "timeout": ":timed_out",
+    }[transition]
+    assert len(delivered) == 1
+    assert delivered[0].endswith(expected_suffix)
+
+
+@pytest.mark.parametrize("transition", ["close", "report", "transfer", "timeout"])
+def test_transition_never_races_live_send(operator_db, transition):
+    _settings(max_active_dialogs=2, inactivity_timeout_min=30, warning_before_min=5)
+    owner = _operator(f"sending-{transition}")
+    base = datetime(2026, 2, 2, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(owner, now=base)
+    dialog = operator_chat.request_dialog(
+        401, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+    operator_chat.deliver_outbox(lambda _item: (True, None), now=base)
+    message = operator_chat.add_message(
+        dialog["id"], "operator", "в полёте", user_id=owner, now=base,
+    )
+    conn = db.get_conn()
+    conn.execute(
+        "UPDATE operator_outbox SET status='sending',lease_at=? WHERE message_id=?",
+        (base.isoformat(timespec="seconds"), message["id"]),
+    )
+    conn.commit()
+    conn.close()
+
+    if transition == "close":
+        with pytest.raises(operator_chat.DeliveryInProgressError):
+            operator_chat.close_dialog(dialog["id"], owner, now=base + timedelta(seconds=1))
+    elif transition == "report":
+        with pytest.raises(operator_chat.DeliveryInProgressError):
+            operator_chat.create_client_report(
+                dialog["id"], owner, "spam", "", now=base + timedelta(seconds=1),
+            )
+    elif transition == "transfer":
+        with pytest.raises(operator_chat.DeliveryInProgressError):
+            operator_chat.transfer_all_dialogs(owner, now=base + timedelta(seconds=1))
+    else:
+        later = base + timedelta(minutes=31)
+        conn = db.get_conn()
+        conn.execute(
+            "UPDATE operator_outbox SET lease_at=? WHERE message_id=?",
+            (later.isoformat(timespec="seconds"), message["id"]),
+        )
+        conn.commit()
+        conn.close()
+        operator_chat.heartbeat(owner, now=later)
+        events = operator_chat.process_timeouts(now=later)
+        assert not events["closed"]
+    assert operator_chat.get_open_dialog_for_chat(401)["status"] == "active"
+
+
+@pytest.mark.parametrize("transition", ["close", "report", "transfer", "requeue"])
+def test_live_assignment_event_blocks_every_transition(operator_db, transition):
+    _settings(max_active_dialogs=1, inactivity_timeout_min=30, warning_before_min=5)
+    owner = _operator(f"assignment-live-{transition}")
+    base = datetime(2026, 4, 1, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(owner, now=base)
+    dialog = operator_chat.request_dialog(
+        450, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+    conn = db.get_conn()
+    event = conn.execute(
+        "SELECT id FROM operator_outbox WHERE dialog_id=? ORDER BY id DESC LIMIT 1",
+        (dialog["id"],),
+    ).fetchone()
+    assert event is not None
+    transition_at = base + (
+        timedelta(minutes=6) if transition == "requeue" else timedelta(seconds=1)
+    )
+    conn.execute(
+        "UPDATE operator_outbox SET status='sending',lease_at=? WHERE id=?",
+        (transition_at.isoformat(timespec="seconds"), event["id"]),
+    )
+    conn.commit()
+    conn.close()
+    if transition == "close":
+        with pytest.raises(operator_chat.DeliveryInProgressError):
+            operator_chat.close_dialog(dialog["id"], owner, now=transition_at)
+    elif transition == "report":
+        with pytest.raises(operator_chat.DeliveryInProgressError):
+            operator_chat.create_client_report(
+                dialog["id"], owner, "spam", "", now=transition_at,
+            )
+    elif transition == "transfer":
+        with pytest.raises(operator_chat.DeliveryInProgressError):
+            operator_chat.transfer_all_dialogs(owner, now=transition_at)
+    else:
+        result = operator_chat.process_timeouts(now=transition_at)
+        assert result["requeued"] == []
+    assert operator_chat.get_open_dialog_for_chat(450)["status"] == "active"
+
+
+def test_live_warning_event_defers_timeout_close(operator_db):
+    _settings(max_active_dialogs=1, inactivity_timeout_min=30, warning_before_min=5)
+    owner = _operator("warning-live-timeout")
+    base = datetime(2026, 4, 1, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(owner, now=base)
+    dialog = operator_chat.request_dialog(
+        452, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+    operator_chat.deliver_outbox(lambda _item: (True, None), now=base)
+    operator_chat.heartbeat(owner, now=base + timedelta(minutes=26))
+    operator_chat.process_timeouts(now=base + timedelta(minutes=26))
+    transition_at = base + timedelta(minutes=31)
+    conn = db.get_conn()
+    event = conn.execute(
+        "SELECT id FROM operator_outbox WHERE event_key LIKE ?",
+        (f"dialog:{dialog['id']}:warning:%",),
+    ).fetchone()
+    conn.execute(
+        "UPDATE operator_outbox SET status='sending',lease_at=? WHERE id=?",
+        (transition_at.isoformat(timespec="seconds"), event["id"]),
+    )
+    conn.commit()
+    conn.close()
+    operator_chat.heartbeat(owner, now=transition_at)
+    assert operator_chat.process_timeouts(now=transition_at)["closed"] == []
+    assert operator_chat.get_open_dialog_for_chat(452)["status"] == "active"
+
+
+@pytest.mark.parametrize("warning_status", ["pending", "failed"])
+def test_client_activity_supersedes_unsent_inactivity_warning(
+    operator_db, warning_status,
+):
+    _settings(max_active_dialogs=1, inactivity_timeout_min=30, warning_before_min=5)
+    owner = _operator(f"warning-activity-{warning_status}")
+    base = datetime(2026, 6, 1, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(owner, now=base)
+    dialog = operator_chat.request_dialog(
+        520, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+    operator_chat.deliver_outbox(lambda _item: (True, None), now=base)
+    operator_chat.heartbeat(owner, now=base + timedelta(minutes=26))
+    operator_chat.process_timeouts(now=base + timedelta(minutes=26))
+    if warning_status == "failed":
+        conn = db.get_conn()
+        conn.execute(
+            "UPDATE operator_outbox SET status='failed',next_retry_at=? WHERE event_key LIKE ?",
+            ((base + timedelta(minutes=27)).isoformat(timespec="seconds"),
+             f"dialog:{dialog['id']}:warning:%"),
+        )
+        conn.commit()
+        conn.close()
+    operator_chat.add_message(
+        dialog["id"], "client", "Я здесь", now=base + timedelta(minutes=27),
+    )
+    rows = _outbox_rows(dialog["id"])
+    warning = next(row for row in rows if ":warning:" in row["event_key"])
+    assert warning["next_retry_at"] is None
+    assert warning["last_error"] == "superseded_by_client_activity"
+    sent = []
+    operator_chat.deliver_outbox(
+        lambda item: (sent.append(item["body"]) or True, None),
+        now=base + timedelta(minutes=28),
+    )
+    assert all("будет закрыт" not in body for body in sent)
+
+
+def test_client_activity_correction_follows_in_flight_warning(operator_db):
+    _settings(max_active_dialogs=1, inactivity_timeout_min=30, warning_before_min=5)
+    owner = _operator("warning-activity-sending")
+    base = datetime(2026, 6, 2, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(owner, now=base)
+    dialog = operator_chat.request_dialog(
+        521, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+    operator_chat.deliver_outbox(lambda _item: (True, None), now=base)
+    operator_chat.heartbeat(owner, now=base + timedelta(minutes=26))
+    operator_chat.process_timeouts(now=base + timedelta(minutes=26))
+    delivered = []
+
+    def client_responds_while_sending(item):
+        delivered.append(item["body"])
+        if ":warning:" in item["event_key"]:
+            operator_chat.add_message(
+                dialog["id"], "client", "Я здесь",
+                now=base + timedelta(minutes=27),
+            )
+        return True, None
+
+    operator_chat.deliver_outbox(
+        client_responds_while_sending, now=base + timedelta(minutes=27),
+    )
+    assert delivered == [
+        "Диалог будет закрыт через 5 мин. без новых сообщений.",
+        "Активность получена. Диалог остаётся открытым.",
+    ]
+
+
+def test_assignment_send_cas_finishes_before_later_transition(operator_db):
+    _settings(max_active_dialogs=1)
+    owner = _operator("assignment-cas")
+    base = datetime(2026, 4, 2, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(owner, now=base)
+    operator_chat.request_dialog(
+        451, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+
+    def transition_during_send(_item):
+        with pytest.raises(operator_chat.DeliveryInProgressError):
+            operator_chat.transfer_all_dialogs(owner, now=base + timedelta(seconds=1))
+        return False, "max_http_500"
+
+    result = operator_chat.deliver_outbox(transition_during_send, now=base)
+    assert result[0]["status"] == "failed"
+    assert operator_chat.get_open_dialog_for_chat(451)["status"] == "active"
+    operator_chat.transfer_all_dialogs(owner, now=base + timedelta(seconds=2))
+    assert operator_chat.get_open_dialog_for_chat(451)["status"] == "waiting"
+
+
+def test_terminal_outbox_dead_letter_rearms_and_recovers_exactly_once(
+    operator_db, monkeypatch,
+):
+    _settings(max_active_dialogs=1)
+    owner = _operator("terminal-owner")
+    operator_chat.start_shift(owner)
+    dialog = operator_chat.request_dialog(402, profile=None, faq_context=None, ai_messages=[])
+    operator_chat.deliver_outbox(lambda _item: (True, None))
+    operator_chat.close_dialog(dialog["id"], owner)
+    state = bot._get_state(402)
+    state["state"] = bot.S.OPERATOR_CHAT
+    sent = []
+    monkeypatch.setattr(
+        bot, "_deliver_operator_outbox",
+        lambda item: (sent.append(item["event_key"]) or False, "max_http_500"),
+    )
+    bot.handle_message({
+        "recipient": {"chat_id": 402},
+        "body": {"attachments": [{"type": "image", "payload": {}}]},
+    })
+    assert sent == [f"dialog:{dialog['id']}:closed"]
+    assert state["state"] == bot.S.OPERATOR_CHAT
+
+    conn = db.get_conn()
+    conn.execute(
+        """UPDATE operator_outbox SET status='failed',attempts=?,next_retry_at=NULL
+           WHERE dialog_id=? AND event_key=?""",
+        (operator_chat.MAX_OUTBOX_ATTEMPTS, dialog["id"], f"dialog:{dialog['id']}:closed"),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(
+        bot, "_deliver_operator_outbox",
+        lambda item: (sent.append(item["event_key"]) or True, None),
+    )
+    bot.handle_message({"recipient": {"chat_id": 402}, "body": {"text": "ещё"}})
+    assert sent == [f"dialog:{dialog['id']}:closed"] * 2
+    assert state["state"] == bot.S.MENU
+    bot.handle_message({"recipient": {"chat_id": 402}, "body": {"text": "после"}})
+    assert sent == [f"dialog:{dialog['id']}:closed"] * 2
+
+
+@pytest.mark.parametrize("payload", ["main_menu", "script:999"])
+def test_stale_callback_rearms_terminal_notice_before_dispatch(
+    operator_db, monkeypatch, payload,
+):
+    _settings(max_active_dialogs=1)
+    owner = _operator(f"terminal-callback-{payload.split(':')[0]}")
+    operator_chat.start_shift(owner)
+    chat_id = 530 if payload == "main_menu" else 531
+    dialog = operator_chat.request_dialog(
+        chat_id, profile=None, faq_context=None, ai_messages=[],
+    )
+    operator_chat.deliver_outbox(lambda _item: (True, None))
+    operator_chat.close_dialog(dialog["id"], owner)
+    conn = db.get_conn()
+    conn.execute(
+        """UPDATE operator_outbox SET status='failed',attempts=?,next_retry_at=NULL
+           WHERE dialog_id=? AND event_key=?""",
+        (operator_chat.MAX_OUTBOX_ATTEMPTS, dialog["id"], f"dialog:{dialog['id']}:closed"),
+    )
+    conn.commit()
+    conn.close()
+    state = bot._get_state(chat_id)
+    state["state"] = bot.S.OPERATOR_CHAT
+    sent = []
+    monkeypatch.setattr(bot, "_ack_callback", lambda _callback_id: None)
+    monkeypatch.setattr(
+        bot, "_deliver_operator_outbox",
+        lambda item: (sent.append(item["event_key"]) or True, None),
+    )
+    bot.handle_callback({
+        "message": {"recipient": {"chat_id": chat_id}},
+        "callback": {"callback_id": "stale", "payload": payload},
+    })
+    assert sent == [f"dialog:{dialog['id']}:closed"]
+    assert state["state"] == bot.S.MENU
+
+
+def test_first_rating_click_dispatches_after_delivered_terminal(operator_db, monkeypatch):
+    _settings(max_active_dialogs=1)
+    owner = _operator("terminal-first-rating")
+    operator_chat.start_shift(owner)
+    dialog = operator_chat.request_dialog(
+        532, profile=None, faq_context=None, ai_messages=[],
+    )
+    operator_chat.deliver_outbox(lambda _item: (True, None))
+    operator_chat.close_dialog(dialog["id"], owner)
+    operator_chat.deliver_outbox(lambda _item: (True, None))
+    state = bot._get_state(532)
+    state["state"] = bot.S.OPERATOR_CHAT
+    menus = []
+    monkeypatch.setattr(bot, "_ack_callback", lambda _callback_id: None)
+    monkeypatch.setattr(
+        bot, "send_main_menu",
+        lambda chat_id, text=None: menus.append((chat_id, text)) or True,
+    )
+    bot.handle_callback({
+        "message": {"recipient": {"chat_id": 532}},
+        "callback": {
+            "callback_id": "rating-first-click",
+            "payload": f"operator_rate:{dialog['id']}-5",
+        },
+    })
+    saved = operator_chat.get_history_dialog(dialog["id"])
+    assert saved["rating"] == 5
+    assert menus == [(532, "Спасибо за оценку!")]
+
+
+@pytest.mark.parametrize(("status", "attempts", "next_retry", "expected_state"), [
+    ("delivered", 0, None, bot.S.MENU),
+    ("failed", 1, "2099-01-01T00:00:00+00:00", bot.S.OPERATOR_CHAT),
+])
+def test_delivered_or_retryable_terminal_outbox_owns_client_notice(
+    operator_db, monkeypatch, status, attempts, next_retry, expected_state,
+):
+    _settings(max_active_dialogs=1)
+    owner = _operator(f"terminal-notice-{status}")
+    operator_chat.start_shift(owner)
+    dialog = operator_chat.request_dialog(403, profile=None, faq_context=None, ai_messages=[])
+    operator_chat.deliver_outbox(lambda _item: (True, None))
+    operator_chat.close_dialog(dialog["id"], owner)
+    conn = db.get_conn()
+    conn.execute(
+        """UPDATE operator_outbox SET status=?,attempts=?,next_retry_at=?
+           WHERE dialog_id=? AND event_key=?""",
+        (
+            status, attempts, next_retry, dialog["id"],
+            f"dialog:{dialog['id']}:closed",
+        ),
+    )
+    conn.commit()
+    conn.close()
+    state = bot._get_state(403)
+    state["state"] = bot.S.OPERATOR_CHAT
+    sent = []
+    monkeypatch.setattr(bot, "send_main_menu", lambda *args: sent.append(args))
+    bot.handle_message({"recipient": {"chat_id": 403}, "body": {"text": "stale"}})
+    assert state["state"] == expected_state
+    assert sent == []
+
+
+def test_faq_editor_all_mutations_require_admin_csrf(operator_db):
+    ok, _ = db.create_user("faq-csrf-admin", "sufficient-password", "Admin", "admin")
+    assert ok
+    admin = db.get_user("faq-csrf-admin")["id"]
+    operator = _operator("faq-csrf-operator")
+    script_id = db.create_script("CSRF baseline")
+    first = db.add_script_node(script_id, "First", False)
+    second = db.add_script_node(script_id, "Second", True)
+    edge_id, error = db.add_script_edge(script_id, first, "Next", second)
+    assert error is None
+
+    requests = [
+        ("/scripts/create", {"title": "Forbidden create"}),
+        (f"/scripts/{script_id}/update", {"title": "Forbidden rename"}),
+        (f"/scripts/{script_id}/delete", {}),
+        (f"/scripts/{script_id}/nodes/add", {"title": "Forbidden node"}),
+        (f"/scripts/{script_id}/nodes/{first}/update", {"title": "Forbidden node update"}),
+        (f"/scripts/{script_id}/nodes/{second}/delete", {}),
+        (
+            f"/scripts/{script_id}/edges/add",
+            {"from_node_id": first, "to_node_id": second, "label": "Forbidden edge"},
+        ),
+        (f"/scripts/{script_id}/edges/{edge_id}/delete", {}),
+    ]
+
+    def snapshot():
+        return (
+            [dict(row) for row in db.get_all_scripts()],
+            [dict(row) for row in db.get_script_nodes(script_id)],
+            [dict(row) for row in db.get_script_edges(script_id)],
+        )
+
+    baseline = snapshot()
+    client = web.app.test_client()
+    _login_session(client, admin, "faq-csrf-admin", "admin")
+    for url, data in requests:
+        assert client.post(url, data=data).status_code == 400
+        assert client.post(url, data={**data, "csrf_token": "wrong"}).status_code == 400
+        assert snapshot() == baseline
+
+    _login_session(client, operator, "faq-csrf-operator", "operator")
+    for url, data in requests:
+        assert client.post(url, data={**data, "csrf_token": "csrf"}).status_code == 302
+        assert snapshot() == baseline
+
+    _login_session(client, admin, "faq-csrf-admin", "admin")
+    response = client.post(
+        f"/scripts/{script_id}/nodes/add",
+        data={"title": "Allowed node", "csrf_token": "csrf"},
+    )
+    assert response.status_code == 302
+    assert any(row["title"] == "Allowed node" for row in db.get_script_nodes(script_id))
+
+
+def test_login_rate_limit_is_shared_atomic_and_resettable(operator_db):
+    ip = "2001:db8::1"
+    base = datetime(2026, 3, 1, 12, tzinfo=timezone.utc)
+    # Sequential calls represent independent Gunicorn workers because no
+    # process-local object carries the state between calls.
+    for expected_left in (4, 3, 2, 1):
+        assert db.record_login_failure(ip, now=base) == (False, expected_left)
+    assert db.record_login_failure(ip, now=base) == (True, 0)
+    assert db.get_login_block_seconds(ip, now=base) == 15 * 60
+    db.reset_login_rate_limit(ip)
+    assert db.get_login_block_seconds(ip, now=base) == 0
+    assert db.record_login_failure(ip, now=base + timedelta(minutes=16)) == (False, 4)
+
+
+def test_login_rate_limit_concurrent_workers_do_not_lose_failures(operator_db):
+    ip = "192.0.2.25"
+    base = datetime(2026, 3, 1, 12, tzinfo=timezone.utc)
+    barrier = threading.Barrier(5)
+    results = []
+    failures = []
+
+    def fail_login():
+        try:
+            barrier.wait()
+            results.append(db.record_login_failure(ip, now=base))
+        except sqlite3.Error as exc:  # pragma: no cover - assertion reports detail
+            failures.append(exc)
+
+    threads = [threading.Thread(target=fail_login) for _ in range(5)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert failures == []
+    assert len(results) == 5
+    assert sum(blocked for blocked, _left in results) == 1
+    assert db.get_login_block_seconds(ip, now=base) == 15 * 60
+
+
+def test_login_rate_limit_migration_and_ip_normalization(operator_db):
+    db.init_db()
+    conn = db.get_conn()
+    columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(login_rate_limits)")
+    }
+    conn.close()
+    assert {
+        "ip", "attempts", "window_started_at", "blocked_until", "updated_at",
+    } <= columns
+    assert web._normalize_login_ip("2001:0db8:0:0::1") == "2001:db8::1"
+    assert web._normalize_login_ip("::ffff:192.0.2.1") == "192.0.2.1"
+    assert web._normalize_login_ip("x" * 10000) == "unknown"
+
+
+def test_login_ip_uses_exactly_one_hop_from_trusted_proxy(monkeypatch):
+    monkeypatch.setenv("TRUSTED_PROXY_CIDRS", "127.0.0.0/8,172.31.44.0/24,::1/128")
+    assert web._client_login_ip("198.51.100.10", "203.0.113.1") == "198.51.100.10"
+    assert web._client_login_ip("172.31.44.5", "203.0.113.1") == "203.0.113.1"
+    assert web._client_login_ip("172.31.44.5", "203.0.113.1, 198.51.100.2") == "172.31.44.5"
+    assert web._client_login_ip("::1", "2001:0db8::7") == "2001:db8::7"
+    assert web._client_login_ip("172.31.44.5", "not-an-ip") == "172.31.44.5"
+
+
+def test_get_login_is_read_only_and_keeps_clients_separate(operator_db, monkeypatch):
+    traces = []
+    original_get_conn = db.get_conn
+
+    def traced_connection():
+        conn = original_get_conn()
+        conn.set_trace_callback(traces.append)
+        return conn
+
+    monkeypatch.setattr(db, "get_conn", traced_connection)
+    client = web.app.test_client()
+    assert client.get("/login", environ_base={"REMOTE_ADDR": "192.0.2.10"}).status_code == 200
+    assert not any(
+        statement.lstrip().upper().startswith(("DELETE", "INSERT", "UPDATE", "BEGIN"))
+        for statement in traces
+    )
+    monkeypatch.setattr(db, "get_conn", original_get_conn)
+    for _ in range(5):
+        db.record_login_failure("192.0.2.10")
+    assert db.get_login_block_seconds("192.0.2.10") > 0
+    assert db.get_login_block_seconds("192.0.2.11") == 0
+
+
+def test_successful_web_login_resets_shared_rate_limit(operator_db):
+    ok, _ = db.create_user(
+        "shared-login", "sufficient-password", "Shared Login", "operator",
+    )
+    assert ok
+    limit_key = web._login_limit_key("127.0.0.1", "shared-login")
+    for _ in range(4):
+        blocked, _left = db.record_login_failure(limit_key)
+        assert not blocked
+    client = web.app.test_client()
+    response = client.post(
+        "/login",
+        data={"username": "shared-login", "password": "sufficient-password"},
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
+    assert response.status_code == 302
+    assert db.get_login_block_seconds(limit_key) == 0
+    conn = db.get_conn()
+    assert conn.execute(
+        "SELECT 1 FROM login_rate_limits WHERE ip=?", (limit_key,),
+    ).fetchone() is None
+    conn.close()
+
+
+def test_login_rate_limit_isolated_by_account_behind_same_proxy(operator_db):
+    ip = "172.30.0.1"
+    first = web._login_limit_key(ip, "first-user")
+    second = web._login_limit_key(ip, "second-user")
+    for _ in range(5):
+        db.record_login_failure(first)
+    assert db.get_login_block_seconds(first) > 0
+    assert db.get_login_block_seconds(second) == 0
+    assert first != second
+
+
+def test_web_login_two_level_limiter_bounds_unknown_names_and_preserves_peer(operator_db):
+    ok, _ = db.create_user("proxy-first", "sufficient-password", "First", "operator")
+    assert ok
+    ok, _ = db.create_user("proxy-second", "sufficient-password", "Second", "operator")
+    assert ok
+    ip = "172.30.0.9"
+    client = web.app.test_client()
+    for _ in range(5):
+        client.post(
+            "/login", data={"username": "proxy-first", "password": "wrong"},
+            environ_base={"REMOTE_ADDR": ip},
+        )
+    response = client.post(
+        "/login",
+        data={"username": "proxy-second", "password": "sufficient-password"},
+        environ_base={"REMOTE_ADDR": ip},
+    )
+    assert response.status_code == 302
+
+    unknown_ip = "172.30.0.10"
+    stranger = web.app.test_client()
+    for index in range(20):
+        stranger.post(
+            "/login", data={"username": f"unknown-{index}", "password": "wrong"},
+            environ_base={"REMOTE_ADDR": unknown_ip},
+        )
+    conn = db.get_conn()
+    keys = conn.execute(
+        "SELECT ip FROM login_rate_limits WHERE ip LIKE ?",
+        (f"{unknown_ip}|%",),
+    ).fetchall()
+    conn.close()
+    assert len(keys) == 2  # one IP sentinel and one shared unknown-account bucket
+    assert db.get_login_block_seconds(web._login_ip_limit_key(unknown_ip)) == 0
+
+
+def test_ip_spray_bucket_has_higher_bounded_threshold(operator_db):
+    key = web._login_ip_limit_key("192.0.2.200")
+    for _ in range(web._MAX_IP_LOGIN_ATTEMPTS - 1):
+        blocked, _ = db.record_login_failure(
+            key, max_attempts=web._MAX_IP_LOGIN_ATTEMPTS,
+        )
+        assert not blocked
+    blocked, _ = db.record_login_failure(
+        key, max_attempts=web._MAX_IP_LOGIN_ATTEMPTS,
+    )
+    assert blocked
+
+
+def test_login_limiter_uses_sqlite_exact_case_sensitive_identity(operator_db):
+    assert db.create_user("CaseUser", "sufficient-password", "Upper", "operator")[0]
+    assert db.create_user("caseuser", "sufficient-password", "Lower", "operator")[0]
+    client = web.app.test_client()
+    ip = "192.0.2.210"
+    for _ in range(5):
+        client.post(
+            "/login", data={"username": "CaseUser", "password": "wrong"},
+            environ_base={"REMOTE_ADDR": ip},
+        )
+    response = client.post(
+        "/login", data={"username": "caseuser", "password": "sufficient-password"},
+        environ_base={"REMOTE_ADDR": ip},
+    )
+    assert response.status_code == 302
+    assert web._login_limit_key(ip, "CaseUser") != web._login_limit_key(ip, "caseuser")
+
+
+def test_username_length_rejected_at_db_and_web_create_and_rename(operator_db):
+    too_long = "u" * 129
+    ok, message = db.create_user(too_long, "sufficient-password", "Long", "operator")
+    assert not ok
+    assert "128" in message
+    target = _operator("rename-target")
+    ok, message = db.change_username(target, too_long)
+    assert not ok
+    assert "128" in message
+    assert db.get_user_by_id(target)["username"] == "rename-target"
+
+    ok, _ = db.create_user("length-admin", "sufficient-password", "Admin", "admin")
+    assert ok
+    admin = db.get_user("length-admin")["id"]
+    client = web.app.test_client()
+    _login_session(client, admin, "length-admin", "admin")
+    assert client.post(
+        "/users/create",
+        data={
+            "username": too_long, "password": "sufficient-password",
+            "name": "Long", "role": "operator", "csrf_token": "csrf",
+        },
+    ).status_code == 302
+    assert db.get_user(too_long) is None
+    assert client.post(
+        f"/users/username/{target}",
+        data={"username": too_long, "csrf_token": "csrf"},
+    ).status_code == 302
+    assert db.get_user_by_id(target)["username"] == "rename-target"
+
+
+def test_legacy_long_exact_username_can_still_login(operator_db):
+    legacy_name = "Legacy" + "x" * 140
+    conn = db.get_conn()
+    conn.execute(
+        "INSERT INTO users(username,password,name,role) VALUES(?,?,?,?)",
+        (
+            legacy_name, db.generate_password_hash("sufficient-password"),
+            "Legacy Long", "operator",
+        ),
+    )
+    conn.commit()
+    conn.close()
+    response = web.app.test_client().post(
+        "/login",
+        data={"username": legacy_name, "password": "sufficient-password"},
+        environ_base={"REMOTE_ADDR": "192.0.2.211"},
+    )
+    assert response.status_code == 302
+
+
+def test_legacy_login_input_boundary_4096_and_4097(operator_db):
+    supported = "S" * 4096
+    unsupported = "U" * 4097
+    conn = db.get_conn()
+    for username in (supported, unsupported):
+        conn.execute(
+            "INSERT INTO users(username,password,name,role) VALUES(?,?,?,?)",
+            (
+                username, db.generate_password_hash("sufficient-password"),
+                "Legacy Boundary", "operator",
+            ),
+        )
+    conn.commit()
+    conn.close()
+    supported_response = web.app.test_client().post(
+        "/login", data={"username": supported, "password": "sufficient-password"},
+        environ_base={"REMOTE_ADDR": "192.0.2.213"},
+    )
+    assert supported_response.status_code == 302
+    unsupported_client = web.app.test_client()
+    unsupported_response = unsupported_client.post(
+        "/login", data={"username": unsupported, "password": "sufficient-password"},
+        environ_base={"REMOTE_ADDR": "192.0.2.214"},
+    )
+    assert unsupported_response.status_code == 200
+    with unsupported_client.session_transaction() as saved:
+        assert "user" not in saved
+
+
+def test_login_failure_response_does_not_disclose_account_existence(operator_db):
+    assert db.create_user("known-login", "sufficient-password", "Known", "operator")[0]
+    client = web.app.test_client()
+    ip = "192.0.2.212"
+    unknown = None
+    for index in range(6):
+        unknown = client.post(
+            "/login", data={"username": f"missing-{index}", "password": "wrong"},
+            environ_base={"REMOTE_ADDR": ip},
+        )
+    known = client.post(
+        "/login", data={"username": "known-login", "password": "wrong"},
+        environ_base={"REMOTE_ADDR": ip},
+    )
+    assert unknown.status_code == known.status_code == 200
+    generic = web._GENERIC_LOGIN_FAILURE.encode()
+    assert generic in unknown.data
+    assert generic in known.data
+    assert b"remaining" not in unknown.data.lower()
+    assert b"remaining" not in known.data.lower()
+
+
+def test_password_hash_runs_before_limiter_for_unknown_and_real_account(
+    operator_db, monkeypatch,
+):
+    assert db.create_user("timing-known", "sufficient-password", "Known", "operator")[0]
+    ip = "192.0.2.215"
+    unknown_key = web._login_limit_key(ip, "")
+    for _ in range(5):
+        db.record_login_failure(unknown_key)
+    real_check = web.check_password_hash
+    events = []
+
+    def checked(encoded, password):
+        events.append(("hash", password))
+        return real_check(encoded, password)
+
+    original_limit = db.get_login_block_seconds
+
+    def limited(key, *args, **kwargs):
+        events.append(("limit", key))
+        return original_limit(key, *args, **kwargs)
+
+    monkeypatch.setattr(web, "check_password_hash", checked)
+    monkeypatch.setattr(db, "get_login_block_seconds", limited)
+    client = web.app.test_client()
+    client.post(
+        "/login", data={"username": "new-missing", "password": "wrong"},
+        environ_base={"REMOTE_ADDR": ip},
+    )
+    assert events[0] == ("hash", "wrong")
+    assert sum(item[0] == "hash" for item in events) == 1
+    events.clear()
+    client.post(
+        "/login", data={"username": "timing-known", "password": "wrong"},
+        environ_base={"REMOTE_ADDR": ip},
+    )
+    assert events[0] == ("hash", "wrong")
+    assert sum(item[0] == "hash" for item in events) == 1
+
+
+def test_all_user_management_posts_require_csrf(operator_db):
+    assert db.create_user("csrf-users-admin", "sufficient-password", "Admin", "admin")[0]
+    admin = db.get_user("csrf-users-admin")["id"]
+    target = _operator("csrf-users-target")
+    client = web.app.test_client()
+    _login_session(client, admin, "csrf-users-admin", "admin")
+    page = client.get("/users")
+    assert page.status_code == 200
+    assert b'name="csrf_token" value="csrf"' in page.data
+    routes = [
+        ("/users/create", {"username": "new-user", "password": "password", "name": "New"}),
+        (f"/users/username/{target}", {"username": "renamed-user"}),
+        (f"/users/delete/{target}", {}),
+        (f"/users/password/{target}", {"password": "new-password"}),
+        (f"/users/role/{target}", {"role": "admin"}),
+    ]
+    for url, data in routes:
+        assert client.post(url, data=data).status_code == 400
+        assert client.post(url, data={**data, "csrf_token": "wrong"}).status_code == 400
+    response = client.post(
+        f"/users/username/{target}",
+        data={"username": "renamed-user", "csrf_token": "csrf"},
+    )
+    assert response.status_code == 302
+    assert db.get_user_by_id(target)["username"] == "renamed-user"

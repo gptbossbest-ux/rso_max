@@ -223,12 +223,17 @@ def send_buttons(
 
 def _cb(label: str, payload: str) -> dict:
     """Вспомогательная функция — создаёт callback-кнопку."""
-    return {"type": "callback", "text": label, "payload": payload}
+    return max_transport.make_callback_button(label, payload)
+
+
+def _link(label: str, url: str) -> dict:
+    """Create a validated MAX link button for structured content."""
+    return max_transport.make_link_button(label, url)
 
 
 # ── Главное меню ──────────────────────────────────────────────────────────────
 
-def send_main_menu(chat_id: int, text: str = "Выберите действие:") -> None:
+def send_main_menu(chat_id: int, text: str = "Выберите действие:") -> bool:
     """
     Главное меню — показывается сразу без авторизации (раздел 6.2 ТЗ).
     ЛС-зависимые функции спрашивают ЛС внутри своего флоу.
@@ -246,7 +251,7 @@ def send_main_menu(chat_id: int, text: str = "Выберите действие:
     rows = [[_cb(label, payload)] for key, label, payload in options if enabled.get(key)]
     if enabled.get("auth") and ENABLE_1C_INTEGRATION and not _get_saved_ls(chat_id):
         rows.insert(0, [_cb("🔐 Авторизоваться", "auth_1c")])
-    send_buttons(chat_id, text, rows)
+    return send_buttons(chat_id, text, rows) if rows else send_message(chat_id, text)
 
 
 # ── Вспомогательные функции ───────────────────────────────────────────────────
@@ -415,6 +420,7 @@ def _faq_dependencies() -> faq.FaqDependencies:
         get_state=_get_state,
         touch=_touch,
         make_callback=_cb,
+        make_link=_link,
         send_message=send_message,
         send_buttons=send_buttons,
         send_main_menu=send_main_menu,
@@ -445,6 +451,33 @@ def _show_script_node(chat_id: int) -> None:
 def _navigate_script_node(chat_id: int, node_id: int) -> None:
     """Compatibility wrapper for moving through the active FAQ tree."""
     faq.navigate_script_node(chat_id, node_id, _faq_dependencies())
+
+
+def _show_faq_scripts_page(chat_id: int, arg: str) -> None:
+    token, separator, page_raw = arg.rpartition(":")
+    if not separator:
+        raise ValueError("invalid FAQ scripts page")
+    faq.show_scripts_page(chat_id, token, int(page_raw), _faq_dependencies())
+
+
+def _show_faq_node_page(chat_id: int, arg: str) -> None:
+    parts = arg.split(":")
+    if len(parts) != 4:
+        raise ValueError("invalid FAQ node page")
+    faq.show_node_page(
+        chat_id, int(parts[0]), int(parts[1]), parts[2], int(parts[3]),
+        _faq_dependencies(),
+    )
+
+
+def _navigate_faq_bound(chat_id: int, arg: str) -> None:
+    parts = arg.split(":")
+    if len(parts) != 4:
+        raise ValueError("invalid FAQ action")
+    faq.navigate_bound_action(
+        chat_id, int(parts[0]), int(parts[1]), int(parts[2]), parts[3],
+        _faq_dependencies(),
+    )
 
 
 # ── ИИ-помощник YandexGPT ────────────────────────────────────────────────────────────────
@@ -534,6 +567,8 @@ def _start_operator_chat(chat_id: int) -> None:
         return
     settings = operator_chat.get_settings()
     if not settings["enabled"] or not operator_chat.has_active_operators():
+        state = _get_state(chat_id)
+        _clear_flow(state)
         rows = []
         if operator_chat.module_enabled("appeal"):
             rows.append([_cb("📝 Оформить обращение", "appeal_start")])
@@ -573,9 +608,14 @@ def _start_operator_chat(chat_id: int) -> None:
 def _cancel_operator_wait(chat_id: int, state: dict) -> None:
     if operator_chat.cancel_waiting(chat_id):
         _clear_flow(state)
-        send_main_menu(chat_id, "Ожидание оператора отменено.")
+        _flush_operator_outbox()
     else:
-        send_message(chat_id, "Ожидание уже завершено.")
+        dialog = operator_chat.get_open_dialog_for_chat(chat_id)
+        if dialog and dialog["status"] == "active":
+            send_message(chat_id, "Оператор уже подключён к диалогу.")
+        else:
+            _clear_flow(state)
+            send_main_menu(chat_id, "Ожидание уже завершено.")
 
 
 def _rate_operator(chat_id: int, dialog_id: int, rating: int) -> None:
@@ -1020,7 +1060,10 @@ _CALLBACK_PREFIXES: dict[str, callable] = {
     "reopen":      _cb_reopen_appeal,
     "cat":         lambda chat_id, st, arg: _appeal_set_category(chat_id, arg),
     "script":      lambda chat_id, st, arg: _open_script(chat_id, int(arg)),
-    "script_node": lambda chat_id, st, arg: _navigate_script_node(chat_id, int(arg)),
+    "script_node": lambda chat_id, st, arg: send_message(chat_id, "Эта кнопка FAQ устарела."),
+    "faq_scripts_page": lambda chat_id, st, arg: _show_faq_scripts_page(chat_id, arg),
+    "faq_node_page": lambda chat_id, st, arg: _show_faq_node_page(chat_id, arg),
+    "faq_go": lambda chat_id, st, arg: _navigate_faq_bound(chat_id, arg),
     "meter":       _cb_select_meter,
     "appt_branch": lambda chat_id, st, arg: _show_date_select(chat_id, int(arg)),
     "appt_date":   _cb_select_date,
@@ -1117,7 +1160,9 @@ _CALLBACK_STATIC_MODULES = {
 _CALLBACK_STATIC_EXEMPT = {"main_menu", "cancel", "operator_start", "operator_cancel"}
 _CALLBACK_PREFIX_MODULES = {
     "confirm": "appeal_status", "reopen": "appeal_status", "cat": "appeal",
-    "script": "faq", "script_node": "faq", "meter": "readings",
+    "script": "faq", "script_node": "faq", "faq_scripts_page": "faq",
+    "faq_node_page": "faq", "meter": "readings",
+    "faq_go": "faq",
     "appt_branch": "appointment", "appt_date": "appointment",
     "appt_time": "appointment", "appt_cancel": "appointment",
 }
@@ -1134,6 +1179,9 @@ def handle_callback(update: dict) -> None:
     payload = update["callback"]["payload"]
 
     _ack_callback(update["callback"]["callback_id"])
+
+    if _reconcile_operator_terminal(chat_id):
+        return
 
     st = _get_state(chat_id)
     _touch(st)
@@ -1264,6 +1312,31 @@ _STATE_EXEMPT = {S.OPERATOR_CHAT}
 _RESET_COMMANDS = ("/start", "/help", "/menu")
 
 
+def _reconcile_operator_terminal(chat_id: int) -> bool:
+    """Reconcile stale flow, consuming only updates used for notice recovery."""
+    state = _get_state(chat_id)
+    if state.get("state") != S.OPERATOR_CHAT or operator_chat.get_open_dialog_for_chat(chat_id):
+        return False
+    terminal = operator_chat.ensure_terminal_notification(chat_id)
+    was_already_delivered = bool(terminal and terminal["status"] == "delivered")
+    if terminal and not was_already_delivered:
+        result = _flush_operator_outbox(terminal["id"])
+        delivered = bool(result and result[0]["status"] == "delivered")
+    elif terminal:
+        delivered = True
+    else:
+        delivered = send_main_menu(
+            chat_id, "Диалог с оператором завершён.",
+        ) is not False
+    if delivered:
+        _clear_flow(state)
+        _touch(state)
+    # A callback can be the first rating click on the just-delivered terminal
+    # keyboard.  Once delivery was already durable, clear stale local state but
+    # let that current callback continue to the rating handler.
+    return not was_already_delivered
+
+
 def handle_message(message: dict) -> None:
     chat_id = message["recipient"]["chat_id"]
     text    = (message.get("body") or {}).get("text", "").strip()
@@ -1289,6 +1362,14 @@ def handle_message(message: dict) -> None:
             _handle_operator_attachments(chat_id, open_dialog, message)
         elif text:
             _on_operator_text(chat_id, _get_state(chat_id), text)
+        return
+
+    # Operator dialogs can be closed asynchronously by the web portal or the
+    # maintenance scheduler.  Reconcile the process-local flow from durable
+    # dialog state even for attachment-only updates; otherwise the client stays
+    # visually trapped in the obsolete operator flow until sending text.
+    if current_state == S.OPERATOR_CHAT:
+        _reconcile_operator_terminal(chat_id)
         return
 
     if not text:

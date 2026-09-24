@@ -23,6 +23,8 @@ import truststore
 
 truststore.inject_into_ssl()
 
+import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -31,7 +33,6 @@ import shutil
 import sqlite3
 import time
 import uuid
-from collections import defaultdict
 from datetime import datetime, timedelta
 from functools import wraps
 from logging.handlers import RotatingFileHandler
@@ -48,12 +49,13 @@ from flask import (
     session,
     url_for,
 )
-from werkzeug.security import check_password_hash
+from werkzeug.security import check_password_hash, generate_password_hash
 
 import client_api
 import database as db
 from config import (
     API,
+    APP_ENV,
     DB_PATH,
     ENABLE_1C_INTEGRATION,
     LOG_BACKUP_COUNT,
@@ -66,7 +68,7 @@ from config import (
     YANDEXGPT_API_KEY,
     YANDEXGPT_FOLDER_ID,
 )
-from rso_bot import operator_chat
+from rso_bot import max_transport, operator_chat
 
 # ── Логгер ────────────────────────────────────────────────────────────────────
 
@@ -147,34 +149,108 @@ CHANNELS = {
 
 # ── Брутфорс-защита логина ────────────────────────────────────────────────────
 
-_login_attempts: dict = defaultdict(lambda: {"attempts": 0, "blocked_until": None})
 _MAX_LOGIN_ATTEMPTS = 5
+_MAX_IP_LOGIN_ATTEMPTS = 50
 _LOGIN_BLOCK_MINUTES = 15
+_LOGIN_WINDOW_MINUTES = 15
+_MAX_LEGACY_LOGIN_NAME_LENGTH = 4096
+_GENERIC_LOGIN_FAILURE = "Неверный логин или пароль. Попробуйте позже."
+_DUMMY_PASSWORD_HASH = generate_password_hash("dummy-password-not-used")
 _ACCOUNTS_PAGE_SIZE = 50
 _CSRF_SESSION_KEY = "_csrf_token"
+_DEFAULT_TRUSTED_PROXY_CIDRS = ""
+
+
+def _normalize_login_ip(value: str | None) -> str:
+    """Canonicalize the trusted WSGI peer address into a bounded DB key."""
+    try:
+        parsed = ipaddress.ip_address((value or "").strip())
+    except ValueError:
+        return "unknown"
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped:
+        parsed = parsed.ipv4_mapped
+    return parsed.compressed
+
+
+def _trusted_proxy_networks(value: str | None = None) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    """Parse the explicit immediate-proxy allowlist; invalid entries fail closed."""
+    raw = os.getenv("TRUSTED_PROXY_CIDRS", _DEFAULT_TRUSTED_PROXY_CIDRS) if value is None else value
+    networks = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            log.warning("TRUSTED_PROXY_CIDRS contains an invalid network; forwarded IPs disabled")
+            return ()
+    return tuple(networks)
+
+
+def _client_login_ip(remote_addr: str | None, forwarded_for: str | None) -> str:
+    """Accept exactly one forwarded hop only from an explicitly trusted peer."""
+    remote = _normalize_login_ip(remote_addr)
+    try:
+        peer = ipaddress.ip_address(remote)
+    except ValueError:
+        return remote
+    trusted = any(peer.version == network.version and peer in network for network in _trusted_proxy_networks())
+    if not trusted or not forwarded_for:
+        return remote
+    # Nginx is configured to overwrite, not append, X-Forwarded-For.  Multiple
+    # values are therefore malformed/spoofed and deliberately ignored.
+    if "," in forwarded_for or forwarded_for != forwarded_for.strip():
+        return remote
+    forwarded = _normalize_login_ip(forwarded_for)
+    return remote if forwarded == "unknown" else forwarded
+
+
+def _login_limit_key(ip: str, username: str) -> str:
+    """Isolate users behind one gateway without persisting their login name."""
+    identity = username.strip().encode("utf-8", errors="replace")
+    digest = hashlib.sha256(identity).hexdigest()[:32]
+    return f"{ip}|{digest}"
+
+
+def _login_ip_limit_key(ip: str) -> str:
+    return f"{ip}|*"
+
+
+def _warn_proxy_configuration() -> None:
+    if (
+        APP_ENV == "production"
+        and os.getenv("EXPECT_REVERSE_PROXY", "").lower() in {"1", "true", "yes"}
+        and not os.getenv("TRUSTED_PROXY_CIDRS", "").strip()
+    ):
+        log.warning(
+            "Reverse proxy expected but TRUSTED_PROXY_CIDRS is empty; "
+            "X-Forwarded-For will be ignored"
+        )
+
+
+_warn_proxy_configuration()
 
 
 def _check_login_block(ip: str) -> str | None:
-    info = _login_attempts[ip]
-    if info["blocked_until"] and datetime.now() < info["blocked_until"]:
-        remaining = int((info["blocked_until"] - datetime.now()).total_seconds() / 60) + 1
-        return f"Слишком много попыток. Попробуйте через {remaining} мин."
+    remaining_seconds = db.get_login_block_seconds(ip)
+    if remaining_seconds:
+        return _GENERIC_LOGIN_FAILURE
     return None
 
 
 def _fail_login(ip: str) -> str:
-    info = _login_attempts[ip]
-    info["attempts"] += 1
-    left = _MAX_LOGIN_ATTEMPTS - info["attempts"]
-    if info["attempts"] >= _MAX_LOGIN_ATTEMPTS:
-        info["blocked_until"] = datetime.now() + timedelta(minutes=_LOGIN_BLOCK_MINUTES)
-        info["attempts"] = 0
-        return f"Превышено число попыток. Вход заблокирован на {_LOGIN_BLOCK_MINUTES} мин."
-    return f"Неверный логин или пароль. Осталось попыток: {left}"
+    db.record_login_failure(
+        ip,
+        max_attempts=_MAX_LOGIN_ATTEMPTS,
+        window_minutes=_LOGIN_WINDOW_MINUTES,
+        block_minutes=_LOGIN_BLOCK_MINUTES,
+    )
+    return _GENERIC_LOGIN_FAILURE
 
 
 def _ok_login(ip: str) -> None:
-    _login_attempts.pop(ip, None)
+    db.reset_login_rate_limit(ip)
 
 
 # ── Декораторы доступа ────────────────────────────────────────────────────────
@@ -291,20 +367,25 @@ def _enrich_appeals(rows) -> list[dict]:
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    ip = request.remote_addr
-
-    block_msg = _check_login_block(ip)
-    if block_msg:
-        flash(block_msg, "error")
-        return render_template("login.html")
+    ip = _client_login_ip(request.remote_addr, request.headers.get("X-Forwarded-For"))
 
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        user = db.get_user(username)
-
-        if user and check_password_hash(user["password"], password):
-            _ok_login(ip)
+        ip_limiter_key = _login_ip_limit_key(ip)
+        lookup_name = username if len(username) <= _MAX_LEGACY_LOGIN_NAME_LENGTH else ""
+        user = db.get_user(lookup_name) if lookup_name else None
+        limiter_key = _login_limit_key(ip, username if user else "")
+        password_ok = check_password_hash(
+            user["password"] if user else _DUMMY_PASSWORD_HASH,
+            password,
+        )
+        block_msg = _check_login_block(ip_limiter_key) or _check_login_block(limiter_key)
+        if block_msg:
+            flash(block_msg, "error")
+            return render_template("login.html")
+        if user and password_ok:
+            _ok_login(limiter_key)
             session.clear()
             session["user"] = {
                 "id":       user["id"],      # нужен для operator_id в API
@@ -314,14 +395,20 @@ def login():
                 "session_version": user["session_version"],
                 "must_change_password": bool(user["must_change_password"]),
             }
-            log.info("Вход: %s  ip=%s", username, ip)
+            log.info("Вход user_id=%s ip=%s", user["id"], ip)
             if user["must_change_password"]:
                 return redirect(url_for("change_own_password"))
             return redirect(url_for("index"))
 
-        msg = _fail_login(ip)
+        db.record_login_failure(
+            ip_limiter_key,
+            max_attempts=_MAX_IP_LOGIN_ATTEMPTS,
+            window_minutes=_LOGIN_WINDOW_MINUTES,
+            block_minutes=_LOGIN_BLOCK_MINUTES,
+        )
+        msg = _fail_login(limiter_key)
         flash(msg, "error")
-        log.warning("Неудачный вход: %s  ip=%s", username, ip)
+        log.warning("Неудачный вход ip=%s", ip)
 
     return render_template("login.html")
 
@@ -711,11 +798,14 @@ def account_create():
 @admin_required
 def users_page():
     users = db.get_all_users()
-    return render_template("users.html", users=users, user=session["user"])
+    return render_template(
+        "users.html", users=users, user=session["user"], csrf_token=_csrf_token(),
+    )
 
 
 @app.route("/users/create", methods=["POST"])
 @admin_required
+@csrf_protected
 def user_create():
     username = request.form.get("username", "").strip()
     password = request.form.get("password", "").strip()
@@ -729,8 +819,18 @@ def user_create():
     return redirect(url_for("users_page"))
 
 
+@app.route("/users/username/<int:user_id>", methods=["POST"])
+@admin_required
+@csrf_protected
+def user_username(user_id: int):
+    ok, msg = db.change_username(user_id, request.form.get("username", ""))
+    flash(msg, "success" if ok else "error")
+    return redirect(url_for("users_page"))
+
+
 @app.route("/users/delete/<int:user_id>", methods=["POST"])
 @admin_required
+@csrf_protected
 def user_delete(user_id: int):
     if user_id == 1:
         flash("Нельзя удалить главного администратора", "error")
@@ -742,6 +842,7 @@ def user_delete(user_id: int):
 
 @app.route("/users/password/<int:user_id>", methods=["POST"])
 @admin_required
+@csrf_protected
 def user_password(user_id: int):
     pw = request.form.get("password", "").strip()
     if len(pw) < 6:
@@ -754,6 +855,7 @@ def user_password(user_id: int):
 
 @app.route("/users/role/<int:user_id>", methods=["POST"])
 @admin_required
+@csrf_protected
 def user_role(user_id: int):
     if user_id == 1:
         flash("Нельзя изменить роль главного администратора", "error")
@@ -788,6 +890,10 @@ def _send_max_text(chat_id: int, text: str) -> tuple[bool, str | None]:
 
 def _send_max_buttons(chat_id: int, text: str, buttons: list[list[dict]]) -> tuple[bool, str | None]:
     import httpx
+    try:
+        max_transport.validate_inline_keyboard(buttons)
+    except ValueError:
+        return False, "invalid_buttons"
     try:
         response = httpx.post(
             f"{API}/messages", headers=_max_headers(), params={"chat_id": chat_id},
@@ -921,7 +1027,10 @@ def operator_shift_end():
 @operator_required
 @csrf_protected
 def operator_transfer_all():
-    dialog_ids = operator_chat.transfer_all_dialogs(_operator_id())
+    try:
+        dialog_ids = operator_chat.transfer_all_dialogs(_operator_id())
+    except operator_chat.DeliveryInProgressError as exc:
+        return jsonify(ok=False, error=str(exc)), 409
     _assign_and_notify()
     return jsonify(ok=True, transferred=len(dialog_ids), dialog_ids=dialog_ids)
 
@@ -1108,6 +1217,11 @@ def operator_close_dialog(dialog_id: int):
         operator_chat.close_dialog(dialog_id, _operator_id())
     except PermissionError:
         abort(404)
+    except operator_chat.UndeliveredMessagesError as exc:
+        return jsonify(
+            ok=False, error=str(exc),
+            undelivered_count=exc.total, undelivered_images=exc.images,
+        ), 409
     except ValueError as exc:
         return jsonify(ok=False, error=str(exc)), 409
     _flush_outbox()
@@ -1261,6 +1375,8 @@ def operator_report_decide(report_id: int, decision: str):
     except LookupError:
         abort(404)
     except operator_chat.ReportDecisionConflictError as exc:
+        return jsonify(ok=False, error=str(exc)), 409
+    except operator_chat.DeliveryInProgressError as exc:
         return jsonify(ok=False, error=str(exc)), 409
     except ValueError:
         abort(400)
@@ -1790,17 +1906,25 @@ def scenario_delete(scenario_id: int):
 @login_required
 def scripts_list():
     scripts = db.get_all_scripts()
-    return render_template("scripts_list.html", scripts=scripts, user=session["user"])
+    return render_template(
+        "scripts_list.html", scripts=scripts, user=session["user"],
+        csrf_token=_csrf_token(),
+    )
 
 
 @app.route("/scripts/create", methods=["POST"])
 @admin_required
+@csrf_protected
 def script_create():
-    title = request.form.get("title", "").strip()
+    title = request.form.get("title", "")
     if not title:
         flash("Введите название скрипта", "error")
         return redirect(url_for("scripts_list"))
-    sid = db.create_script(title)
+    try:
+        sid = db.create_script(title)
+    except ValueError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("scripts_list"))
     flash(f"Скрипт «{title}» создан", "success")
     return redirect(url_for("script_editor", script_id=sid))
 
@@ -1838,13 +1962,15 @@ def script_editor(script_id: int):
         from_counts=from_counts,
         to_counts=to_counts,
         user=session["user"],
+        csrf_token=_csrf_token(),
     )
 
 
 @app.route("/scripts/<int:script_id>/update", methods=["POST"])
 @admin_required
+@csrf_protected
 def script_update(script_id: int):
-    title = request.form.get("title", "").strip()
+    title = request.form.get("title", "")
     try:
         sort_order = int(request.form.get("sort_order", "0"))
     except ValueError:
@@ -1854,13 +1980,17 @@ def script_update(script_id: int):
     if not title:
         flash("Название не может быть пустым", "error")
     else:
-        db.update_script(script_id, title, sort_order, is_active)
-        flash("Скрипт обновлён", "success")
+        try:
+            db.update_script(script_id, title, sort_order, is_active)
+            flash("Скрипт обновлён", "success")
+        except ValueError as exc:
+            flash(str(exc), "error")
     return redirect(url_for("script_editor", script_id=script_id))
 
 
 @app.route("/scripts/<int:script_id>/delete", methods=["POST"])
 @admin_required
+@csrf_protected
 def script_delete(script_id: int):
     db.delete_script(script_id)
     flash("Скрипт удалён", "success")
@@ -1868,34 +1998,64 @@ def script_delete(script_id: int):
     return redirect(url_for("scripts_list"))
 
 
+def _validate_script_link(url: str, text: str) -> tuple[str | None, str | None]:
+    """Validate optional structured FAQ link without interpreting node text as markup."""
+    if not url:
+        if text:
+            raise ValueError("Укажите адрес ссылки или очистите текст кнопки")
+        return None, None
+    safe_url = max_transport.validate_link_url(url)
+    label = text or "Открыть сайт"
+    # Reuse MAX's button limits and return normalized values for persistence.
+    button = max_transport.make_link_button(label, safe_url)
+    return button["url"], button["text"]
+
+
 @app.route("/scripts/<int:script_id>/nodes/add", methods=["POST"])
 @admin_required
+@csrf_protected
 def script_node_add(script_id: int):
     title = request.form.get("title", "").strip()
     is_terminal = request.form.get("is_terminal") == "on"
+    link_url = request.form.get("link_url", "")
+    link_text = request.form.get("link_text", "")
     if not title:
         flash("Текст узла не может быть пустым", "error")
     else:
-        db.add_script_node(script_id, title, is_terminal)
+        try:
+            link_url, link_text = _validate_script_link(link_url, link_text)
+        except ValueError as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("script_editor", script_id=script_id))
+        db.add_script_node(script_id, title, is_terminal, link_url, link_text)
         flash("Узел добавлен", "success")
     return redirect(url_for("script_editor", script_id=script_id))
 
 
 @app.route("/scripts/<int:script_id>/nodes/<int:node_id>/update", methods=["POST"])
 @admin_required
+@csrf_protected
 def script_node_update(script_id: int, node_id: int):
     title = request.form.get("title", "").strip()
     is_terminal = request.form.get("is_terminal") == "on"
+    link_url = request.form.get("link_url", "")
+    link_text = request.form.get("link_text", "")
     if not title:
         flash("Текст узла не может быть пустым", "error")
     else:
-        db.update_script_node(node_id, title, is_terminal)
+        try:
+            link_url, link_text = _validate_script_link(link_url, link_text)
+        except ValueError as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("script_editor", script_id=script_id))
+        db.update_script_node(node_id, title, is_terminal, link_url, link_text)
         flash("Узел сохранён", "success")
     return redirect(url_for("script_editor", script_id=script_id))
 
 
 @app.route("/scripts/<int:script_id>/nodes/<int:node_id>/delete", methods=["POST"])
 @admin_required
+@csrf_protected
 def script_node_delete(script_id: int, node_id: int):
     db.delete_script_node(node_id)
     flash("Узел удалён", "success")
@@ -1904,6 +2064,7 @@ def script_node_delete(script_id: int, node_id: int):
 
 @app.route("/scripts/<int:script_id>/edges/add", methods=["POST"])
 @admin_required
+@csrf_protected
 def script_edge_add(script_id: int):
     try:
         from_node_id = int(request.form.get("from_node_id", ""))
@@ -1912,12 +2073,16 @@ def script_edge_add(script_id: int):
         flash("Выберите оба узла перехода", "error")
         return redirect(url_for("script_editor", script_id=script_id))
 
-    label = request.form.get("label", "").strip()
+    label = request.form.get("label", "")
     if not label:
         flash("Текст кнопки не может быть пустым", "error")
         return redirect(url_for("script_editor", script_id=script_id))
 
-    edge_id, err = db.add_script_edge(script_id, from_node_id, label, to_node_id)
+    try:
+        edge_id, err = db.add_script_edge(script_id, from_node_id, label, to_node_id)
+    except ValueError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("script_editor", script_id=script_id))
     if err:
         flash(err, "error")
     else:
@@ -1927,6 +2092,7 @@ def script_edge_add(script_id: int):
 
 @app.route("/scripts/<int:script_id>/edges/<int:edge_id>/delete", methods=["POST"])
 @admin_required
+@csrf_protected
 def script_edge_delete(script_id: int, edge_id: int):
     db.delete_script_edge(edge_id)
     flash("Переход удалён", "success")

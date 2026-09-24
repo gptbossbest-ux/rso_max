@@ -59,7 +59,7 @@ services:
 
   web:
     <<: *app
-    command: gunicorn --bind 0.0.0.0:5000 --workers 1 --threads 4 --timeout 60 web:app
+    command: ["gunicorn", "-c", "gunicorn.conf.py", "web:app"]
     environment:
       <<: *runtime-environment
       FASTAPI_BASE_URL: http://api:8000

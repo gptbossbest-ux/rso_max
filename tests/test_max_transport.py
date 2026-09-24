@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
+import pytest
+
 import bot
 from rso_bot import max_transport
 
@@ -93,6 +95,86 @@ def test_send_buttons_builds_inline_keyboard_without_changing_buttons():
         },
     )
     assert buttons[0][0]["payload"] == "yes"
+
+
+@pytest.mark.parametrize("url", [
+    "javascript:alert(1)", "data:text/plain,x", "file:///etc/passwd",
+    "https://user:password@example.test/path", "//example.test/path",
+    "https://example.test:444/path", "https://example.test/" + "x" * 2048,
+    "https://example.test/path\nnext",
+    "https://example.test/path\\next", "https://bad_host.test/path",
+    "https://example.test./path", "https://exa\u200bmple.test/path",
+    "http://example.test:443/path",
+    "https://example.test:80/path", "https://example.test/%0aheader",
+])
+def test_link_button_rejects_unsafe_urls(url):
+    with pytest.raises(ValueError):
+        max_transport.make_link_button("Сайт", url)
+
+
+def test_callback_payload_limit_is_enforced_in_builder_and_keyboard():
+    oversized = "я" * 513
+    with pytest.raises(ValueError):
+        max_transport.make_callback_button("Далее", oversized)
+    with pytest.raises(ValueError):
+        max_transport.validate_inline_keyboard([[
+            {"type": "callback", "text": "Далее", "payload": oversized},
+        ]])
+
+
+def test_link_button_matches_max_inline_keyboard_contract():
+    button = max_transport.make_link_button(
+        "Открыть личный кабинет", "https://example.test/account?q=1",
+    )
+    assert button == {
+        "type": "link", "text": "Открыть личный кабинет",
+        "url": "https://example.test/account?q=1",
+    }
+    sender = Mock(return_value=True)
+    max_transport.send_buttons(7, "Текст [не становится](разметкой)", [[button]], sender=sender)
+    payload = sender.call_args.args[1]
+    assert payload["text"] == "Текст [не становится](разметкой)"
+    assert "format" not in payload
+    assert payload["attachments"][0]["payload"]["buttons"] == [[button]]
+
+
+def test_link_button_normalizes_idna_and_rejects_label_format_controls():
+    assert max_transport.make_link_button(
+        "Сайт", "https://пример.рф/помощь",
+    )["url"] == "https://xn--e1afmkfd.xn--p1ai/помощь"
+    assert max_transport.validate_link_url("HTTPS://EXAMPLE.TEST/path") == (
+        "https://example.test/path"
+    )
+    with pytest.raises(ValueError):
+        max_transport.make_link_button("Са\u200bйт", "https://example.test")
+    with pytest.raises(ValueError):
+        max_transport.make_link_button("Сайт\n", "https://example.test")
+    with pytest.raises(ValueError):
+        max_transport.make_link_button("Сайт", " https://example.test")
+
+
+def _callback(index=0):
+    return {"type": "callback", "text": f"Кнопка {index}", "payload": f"p:{index}"}
+
+
+def test_keyboard_accepts_official_boundaries():
+    rows = [[_callback(row * 7 + item) for item in range(7)] for row in range(30)]
+    assert max_transport.validate_inline_keyboard(rows) is rows
+
+
+@pytest.mark.parametrize("buttons", [
+    [[_callback()]] * 31,
+    [[_callback(index) for index in range(8)]],
+    [[
+        max_transport.make_link_button("Ссылка", "https://example.test"),
+        _callback(1), _callback(2), _callback(3),
+    ]],
+    [[{"type": "callback", "text": "X", "payload": ""}]],
+    [[{"type": "unknown", "text": "X"}]],
+])
+def test_keyboard_rejects_limit_and_contract_violations(buttons):
+    with pytest.raises(ValueError):
+        max_transport.validate_inline_keyboard(buttons)
 
 
 def test_ack_callback_posts_expected_answer():
