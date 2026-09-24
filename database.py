@@ -2047,6 +2047,20 @@ def reset_login_rate_limit(ip: str) -> None:
 
 # ── Пользователи портала ──────────────────────────────────────────────────────
 
+MAX_PORTAL_USERNAME_LENGTH = 128
+
+
+def _validate_portal_username(username: str) -> str:
+    value = username.strip() if isinstance(username, str) else ""
+    if not value:
+        raise ValueError("Логин не может быть пустым")
+    if len(value) > MAX_PORTAL_USERNAME_LENGTH:
+        raise ValueError(
+            f"Логин должен быть не длиннее {MAX_PORTAL_USERNAME_LENGTH} символов"
+        )
+    return value
+
+
 def get_user(username: str) -> sqlite3.Row | None:
     conn = get_conn()
     row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
@@ -2069,6 +2083,10 @@ def get_all_users() -> list[sqlite3.Row]:
 
 
 def create_user(username: str, password: str, name: str, role: str) -> tuple[bool, str]:
+    try:
+        username = _validate_portal_username(username)
+    except ValueError as exc:
+        return False, str(exc)
     conn = get_conn()
     try:
         conn.execute(
@@ -2081,6 +2099,28 @@ def create_user(username: str, password: str, name: str, role: str) -> tuple[boo
     except Exception as exc:
         log.warning("Ошибка создания пользователя %s: %s", username, exc)
         return False, f"Ошибка: {exc}"
+    finally:
+        conn.close()
+
+
+def change_username(user_id: int, username: str) -> tuple[bool, str]:
+    try:
+        username = _validate_portal_username(username)
+    except ValueError as exc:
+        return False, str(exc)
+    conn = get_conn()
+    try:
+        updated = conn.execute(
+            """UPDATE users SET username=?,session_version=session_version+1
+               WHERE id=?""",
+            (username, user_id),
+        )
+        conn.commit()
+        if not updated.rowcount:
+            return False, "Пользователь не найден"
+        return True, "Логин изменён"
+    except sqlite3.IntegrityError:
+        return False, "Такой логин уже существует"
     finally:
         conn.close()
 

@@ -32,7 +32,7 @@
             <div class="create-grid">
                 <div class="form-group">
                     <label>Логин</label>
-                    <input type="text" name="username" class="form-control" placeholder="ivanov" required>
+                    <input type="text" name="username" maxlength="128" class="form-control" placeholder="ivanov" required>
                 </div>
                 <div class="form-group">
                     <label>Пароль</label>
@@ -87,6 +87,10 @@
                     </td>
                     <td>
                         <div class="actions-cell">
+                            <form method="POST" action="{{ url_for('user_username', user_id=u['id']) }}" class="inline-form">
+                                <input type="text" name="username" maxlength="128" value="{{ u['username'] }}" required>
+                                <button type="submit" class="btn btn-sm btn-success">Сменить логин</button>
+                            </form>
                             <form method="POST" action="{{ url_for('user_password', user_id=u['id']) }}" class="inline-form">
                                 <input type="password" name="password" placeholder="Новый пароль">
                                 <button type="submit" class="btn btn-sm btn-success">Сменить пароль</button>

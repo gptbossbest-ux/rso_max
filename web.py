@@ -27,7 +27,6 @@ import hashlib
 import ipaddress
 import json
 import logging
-import math
 import os
 import secrets
 import shutil
@@ -50,7 +49,7 @@ from flask import (
     session,
     url_for,
 )
-from werkzeug.security import check_password_hash
+from werkzeug.security import check_password_hash, generate_password_hash
 
 import client_api
 import database as db
@@ -154,7 +153,9 @@ _MAX_LOGIN_ATTEMPTS = 5
 _MAX_IP_LOGIN_ATTEMPTS = 50
 _LOGIN_BLOCK_MINUTES = 15
 _LOGIN_WINDOW_MINUTES = 15
-_MAX_LOGIN_NAME_LENGTH = 128
+_MAX_LEGACY_LOGIN_NAME_LENGTH = 4096
+_GENERIC_LOGIN_FAILURE = "Неверный логин или пароль. Попробуйте позже."
+_DUMMY_PASSWORD_HASH = generate_password_hash("dummy-password-not-used")
 _ACCOUNTS_PAGE_SIZE = 50
 _CSRF_SESSION_KEY = "_csrf_token"
 _DEFAULT_TRUSTED_PROXY_CIDRS = ""
@@ -207,7 +208,7 @@ def _client_login_ip(remote_addr: str | None, forwarded_for: str | None) -> str:
 
 def _login_limit_key(ip: str, username: str) -> str:
     """Isolate users behind one gateway without persisting their login name."""
-    identity = username.strip().casefold().encode("utf-8", errors="replace")[:512]
+    identity = username.strip().encode("utf-8", errors="replace")
     digest = hashlib.sha256(identity).hexdigest()[:32]
     return f"{ip}|{digest}"
 
@@ -234,21 +235,18 @@ _warn_proxy_configuration()
 def _check_login_block(ip: str) -> str | None:
     remaining_seconds = db.get_login_block_seconds(ip)
     if remaining_seconds:
-        remaining = max(1, math.ceil(remaining_seconds / 60))
-        return f"Слишком много попыток. Попробуйте через {remaining} мин."
+        return _GENERIC_LOGIN_FAILURE
     return None
 
 
 def _fail_login(ip: str) -> str:
-    blocked, left = db.record_login_failure(
+    db.record_login_failure(
         ip,
         max_attempts=_MAX_LOGIN_ATTEMPTS,
         window_minutes=_LOGIN_WINDOW_MINUTES,
         block_minutes=_LOGIN_BLOCK_MINUTES,
     )
-    if blocked:
-        return f"Превышено число попыток. Вход заблокирован на {_LOGIN_BLOCK_MINUTES} мин."
-    return f"Неверный логин или пароль. Осталось попыток: {left}"
+    return _GENERIC_LOGIN_FAILURE
 
 
 def _ok_login(ip: str) -> None:
@@ -375,16 +373,19 @@ def login():
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
         ip_limiter_key = _login_ip_limit_key(ip)
-        if len(username) > _MAX_LOGIN_NAME_LENGTH:
-            username = ""
-        user = db.get_user(username) if username else None
+        lookup_name = username if len(username) <= _MAX_LEGACY_LOGIN_NAME_LENGTH else ""
+        user = db.get_user(lookup_name) if lookup_name else None
         limiter_key = _login_limit_key(ip, username if user else "")
         block_msg = _check_login_block(ip_limiter_key) or _check_login_block(limiter_key)
         if block_msg:
             flash(block_msg, "error")
             return render_template("login.html")
 
-        if user and check_password_hash(user["password"], password):
+        password_ok = check_password_hash(
+            user["password"] if user else _DUMMY_PASSWORD_HASH,
+            password,
+        )
+        if user and password_ok:
             _ok_login(limiter_key)
             session.clear()
             session["user"] = {
@@ -400,18 +401,13 @@ def login():
                 return redirect(url_for("change_own_password"))
             return redirect(url_for("index"))
 
-        ip_blocked, _ = db.record_login_failure(
+        db.record_login_failure(
             ip_limiter_key,
             max_attempts=_MAX_IP_LOGIN_ATTEMPTS,
             window_minutes=_LOGIN_WINDOW_MINUTES,
             block_minutes=_LOGIN_BLOCK_MINUTES,
         )
         msg = _fail_login(limiter_key)
-        if ip_blocked:
-            msg = (
-                "Превышено число попыток с этого адреса. "
-                f"Вход заблокирован на {_LOGIN_BLOCK_MINUTES} мин."
-            )
         flash(msg, "error")
         log.warning("Неудачный вход: %s  ip=%s", username, ip)
 
@@ -818,6 +814,14 @@ def user_create():
     else:
         ok, msg = db.create_user(username, password, name, role)
         flash(msg, "success" if ok else "error")
+    return redirect(url_for("users_page"))
+
+
+@app.route("/users/username/<int:user_id>", methods=["POST"])
+@admin_required
+def user_username(user_id: int):
+    ok, msg = db.change_username(user_id, request.form.get("username", ""))
+    flash(msg, "success" if ok else "error")
     return redirect(url_for("users_page"))
 
 

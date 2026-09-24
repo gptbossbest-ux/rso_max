@@ -2459,3 +2459,93 @@ def test_ip_spray_bucket_has_higher_bounded_threshold(operator_db):
         key, max_attempts=web._MAX_IP_LOGIN_ATTEMPTS,
     )
     assert blocked
+
+
+def test_login_limiter_uses_sqlite_exact_case_sensitive_identity(operator_db):
+    assert db.create_user("CaseUser", "sufficient-password", "Upper", "operator")[0]
+    assert db.create_user("caseuser", "sufficient-password", "Lower", "operator")[0]
+    client = web.app.test_client()
+    ip = "192.0.2.210"
+    for _ in range(5):
+        client.post(
+            "/login", data={"username": "CaseUser", "password": "wrong"},
+            environ_base={"REMOTE_ADDR": ip},
+        )
+    response = client.post(
+        "/login", data={"username": "caseuser", "password": "sufficient-password"},
+        environ_base={"REMOTE_ADDR": ip},
+    )
+    assert response.status_code == 302
+    assert web._login_limit_key(ip, "CaseUser") != web._login_limit_key(ip, "caseuser")
+
+
+def test_username_length_rejected_at_db_and_web_create_and_rename(operator_db):
+    too_long = "u" * 129
+    ok, message = db.create_user(too_long, "sufficient-password", "Long", "operator")
+    assert not ok
+    assert "128" in message
+    target = _operator("rename-target")
+    ok, message = db.change_username(target, too_long)
+    assert not ok
+    assert "128" in message
+    assert db.get_user_by_id(target)["username"] == "rename-target"
+
+    ok, _ = db.create_user("length-admin", "sufficient-password", "Admin", "admin")
+    assert ok
+    admin = db.get_user("length-admin")["id"]
+    client = web.app.test_client()
+    _login_session(client, admin, "length-admin", "admin")
+    assert client.post(
+        "/users/create",
+        data={
+            "username": too_long, "password": "sufficient-password",
+            "name": "Long", "role": "operator",
+        },
+    ).status_code == 302
+    assert db.get_user(too_long) is None
+    assert client.post(
+        f"/users/username/{target}", data={"username": too_long},
+    ).status_code == 302
+    assert db.get_user_by_id(target)["username"] == "rename-target"
+
+
+def test_legacy_long_exact_username_can_still_login(operator_db):
+    legacy_name = "Legacy" + "x" * 140
+    conn = db.get_conn()
+    conn.execute(
+        "INSERT INTO users(username,password,name,role) VALUES(?,?,?,?)",
+        (
+            legacy_name, db.generate_password_hash("sufficient-password"),
+            "Legacy Long", "operator",
+        ),
+    )
+    conn.commit()
+    conn.close()
+    response = web.app.test_client().post(
+        "/login",
+        data={"username": legacy_name, "password": "sufficient-password"},
+        environ_base={"REMOTE_ADDR": "192.0.2.211"},
+    )
+    assert response.status_code == 302
+
+
+def test_login_failure_response_does_not_disclose_account_existence(operator_db):
+    assert db.create_user("known-login", "sufficient-password", "Known", "operator")[0]
+    client = web.app.test_client()
+    ip = "192.0.2.212"
+    unknown = None
+    for index in range(6):
+        unknown = client.post(
+            "/login", data={"username": f"missing-{index}", "password": "wrong"},
+            environ_base={"REMOTE_ADDR": ip},
+        )
+    known = client.post(
+        "/login", data={"username": "known-login", "password": "wrong"},
+        environ_base={"REMOTE_ADDR": ip},
+    )
+    assert unknown.status_code == known.status_code == 200
+    generic = web._GENERIC_LOGIN_FAILURE.encode()
+    assert generic in unknown.data
+    assert generic in known.data
+    assert b"remaining" not in unknown.data.lower()
+    assert b"remaining" not in known.data.lower()
