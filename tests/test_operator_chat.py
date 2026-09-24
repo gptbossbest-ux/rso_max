@@ -2499,12 +2499,13 @@ def test_username_length_rejected_at_db_and_web_create_and_rename(operator_db):
         "/users/create",
         data={
             "username": too_long, "password": "sufficient-password",
-            "name": "Long", "role": "operator",
+            "name": "Long", "role": "operator", "csrf_token": "csrf",
         },
     ).status_code == 302
     assert db.get_user(too_long) is None
     assert client.post(
-        f"/users/username/{target}", data={"username": too_long},
+        f"/users/username/{target}",
+        data={"username": too_long, "csrf_token": "csrf"},
     ).status_code == 302
     assert db.get_user_by_id(target)["username"] == "rename-target"
 
@@ -2529,6 +2530,35 @@ def test_legacy_long_exact_username_can_still_login(operator_db):
     assert response.status_code == 302
 
 
+def test_legacy_login_input_boundary_4096_and_4097(operator_db):
+    supported = "S" * 4096
+    unsupported = "U" * 4097
+    conn = db.get_conn()
+    for username in (supported, unsupported):
+        conn.execute(
+            "INSERT INTO users(username,password,name,role) VALUES(?,?,?,?)",
+            (
+                username, db.generate_password_hash("sufficient-password"),
+                "Legacy Boundary", "operator",
+            ),
+        )
+    conn.commit()
+    conn.close()
+    supported_response = web.app.test_client().post(
+        "/login", data={"username": supported, "password": "sufficient-password"},
+        environ_base={"REMOTE_ADDR": "192.0.2.213"},
+    )
+    assert supported_response.status_code == 302
+    unsupported_client = web.app.test_client()
+    unsupported_response = unsupported_client.post(
+        "/login", data={"username": unsupported, "password": "sufficient-password"},
+        environ_base={"REMOTE_ADDR": "192.0.2.214"},
+    )
+    assert unsupported_response.status_code == 200
+    with unsupported_client.session_transaction() as saved:
+        assert "user" not in saved
+
+
 def test_login_failure_response_does_not_disclose_account_existence(operator_db):
     assert db.create_user("known-login", "sufficient-password", "Known", "operator")[0]
     client = web.app.test_client()
@@ -2549,3 +2579,69 @@ def test_login_failure_response_does_not_disclose_account_existence(operator_db)
     assert generic in known.data
     assert b"remaining" not in unknown.data.lower()
     assert b"remaining" not in known.data.lower()
+
+
+def test_password_hash_runs_before_limiter_for_unknown_and_real_account(
+    operator_db, monkeypatch,
+):
+    assert db.create_user("timing-known", "sufficient-password", "Known", "operator")[0]
+    ip = "192.0.2.215"
+    unknown_key = web._login_limit_key(ip, "")
+    for _ in range(5):
+        db.record_login_failure(unknown_key)
+    real_check = web.check_password_hash
+    events = []
+
+    def checked(encoded, password):
+        events.append(("hash", password))
+        return real_check(encoded, password)
+
+    original_limit = db.get_login_block_seconds
+
+    def limited(key, *args, **kwargs):
+        events.append(("limit", key))
+        return original_limit(key, *args, **kwargs)
+
+    monkeypatch.setattr(web, "check_password_hash", checked)
+    monkeypatch.setattr(db, "get_login_block_seconds", limited)
+    client = web.app.test_client()
+    client.post(
+        "/login", data={"username": "new-missing", "password": "wrong"},
+        environ_base={"REMOTE_ADDR": ip},
+    )
+    assert events[0] == ("hash", "wrong")
+    assert sum(item[0] == "hash" for item in events) == 1
+    events.clear()
+    client.post(
+        "/login", data={"username": "timing-known", "password": "wrong"},
+        environ_base={"REMOTE_ADDR": ip},
+    )
+    assert events[0] == ("hash", "wrong")
+    assert sum(item[0] == "hash" for item in events) == 1
+
+
+def test_all_user_management_posts_require_csrf(operator_db):
+    assert db.create_user("csrf-users-admin", "sufficient-password", "Admin", "admin")[0]
+    admin = db.get_user("csrf-users-admin")["id"]
+    target = _operator("csrf-users-target")
+    client = web.app.test_client()
+    _login_session(client, admin, "csrf-users-admin", "admin")
+    page = client.get("/users")
+    assert page.status_code == 200
+    assert b'name="csrf_token" value="csrf"' in page.data
+    routes = [
+        ("/users/create", {"username": "new-user", "password": "password", "name": "New"}),
+        (f"/users/username/{target}", {"username": "renamed-user"}),
+        (f"/users/delete/{target}", {}),
+        (f"/users/password/{target}", {"password": "new-password"}),
+        (f"/users/role/{target}", {"role": "admin"}),
+    ]
+    for url, data in routes:
+        assert client.post(url, data=data).status_code == 400
+        assert client.post(url, data={**data, "csrf_token": "wrong"}).status_code == 400
+    response = client.post(
+        f"/users/username/{target}",
+        data={"username": "renamed-user", "csrf_token": "csrf"},
+    )
+    assert response.status_code == 302
+    assert db.get_user_by_id(target)["username"] == "renamed-user"

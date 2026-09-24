@@ -376,15 +376,14 @@ def login():
         lookup_name = username if len(username) <= _MAX_LEGACY_LOGIN_NAME_LENGTH else ""
         user = db.get_user(lookup_name) if lookup_name else None
         limiter_key = _login_limit_key(ip, username if user else "")
-        block_msg = _check_login_block(ip_limiter_key) or _check_login_block(limiter_key)
-        if block_msg:
-            flash(block_msg, "error")
-            return render_template("login.html")
-
         password_ok = check_password_hash(
             user["password"] if user else _DUMMY_PASSWORD_HASH,
             password,
         )
+        block_msg = _check_login_block(ip_limiter_key) or _check_login_block(limiter_key)
+        if block_msg:
+            flash(block_msg, "error")
+            return render_template("login.html")
         if user and password_ok:
             _ok_login(limiter_key)
             session.clear()
@@ -396,7 +395,7 @@ def login():
                 "session_version": user["session_version"],
                 "must_change_password": bool(user["must_change_password"]),
             }
-            log.info("Вход: %s  ip=%s", username, ip)
+            log.info("Вход user_id=%s ip=%s", user["id"], ip)
             if user["must_change_password"]:
                 return redirect(url_for("change_own_password"))
             return redirect(url_for("index"))
@@ -409,7 +408,7 @@ def login():
         )
         msg = _fail_login(limiter_key)
         flash(msg, "error")
-        log.warning("Неудачный вход: %s  ip=%s", username, ip)
+        log.warning("Неудачный вход ip=%s", ip)
 
     return render_template("login.html")
 
@@ -799,11 +798,14 @@ def account_create():
 @admin_required
 def users_page():
     users = db.get_all_users()
-    return render_template("users.html", users=users, user=session["user"])
+    return render_template(
+        "users.html", users=users, user=session["user"], csrf_token=_csrf_token(),
+    )
 
 
 @app.route("/users/create", methods=["POST"])
 @admin_required
+@csrf_protected
 def user_create():
     username = request.form.get("username", "").strip()
     password = request.form.get("password", "").strip()
@@ -819,6 +821,7 @@ def user_create():
 
 @app.route("/users/username/<int:user_id>", methods=["POST"])
 @admin_required
+@csrf_protected
 def user_username(user_id: int):
     ok, msg = db.change_username(user_id, request.form.get("username", ""))
     flash(msg, "success" if ok else "error")
@@ -827,6 +830,7 @@ def user_username(user_id: int):
 
 @app.route("/users/delete/<int:user_id>", methods=["POST"])
 @admin_required
+@csrf_protected
 def user_delete(user_id: int):
     if user_id == 1:
         flash("Нельзя удалить главного администратора", "error")
@@ -838,6 +842,7 @@ def user_delete(user_id: int):
 
 @app.route("/users/password/<int:user_id>", methods=["POST"])
 @admin_required
+@csrf_protected
 def user_password(user_id: int):
     pw = request.form.get("password", "").strip()
     if len(pw) < 6:
@@ -850,6 +855,7 @@ def user_password(user_id: int):
 
 @app.route("/users/role/<int:user_id>", methods=["POST"])
 @admin_required
+@csrf_protected
 def user_role(user_id: int):
     if user_id == 1:
         flash("Нельзя изменить роль главного администратора", "error")
