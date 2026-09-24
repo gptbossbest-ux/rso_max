@@ -35,5 +35,18 @@ def test_gunicorn_invalid_values_fail_fast(monkeypatch, name, value):
 def test_compose_uses_config_file_and_keeps_api_single_worker():
     compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
     assert 'command: ["gunicorn", "-c", "gunicorn.conf.py", "web:app"]' in compose
-    assert "WEB_WORKERS: ${WEB_WORKERS:-2}" in compose
+    assert "WEB_WORKERS:" not in compose
+    assert "WEB_THREADS:" not in compose
+    assert "WEB_TIMEOUT:" not in compose
+    assert "${APP_RUNTIME_ENV_FILE:-.env.runtime}" in compose
+    assert compose.index("${APP_ENV_FILE:-.env}") < compose.index(
+        "${APP_RUNTIME_ENV_FILE:-.env.runtime}",
+    )
     assert "uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 1" in compose
+
+
+def test_runtime_env_values_win_without_root_compose_interpolation(monkeypatch):
+    settings = _load(
+        monkeypatch, WEB_WORKERS=3, WEB_THREADS=6, WEB_TIMEOUT=90,
+    )
+    assert (settings["workers"], settings["threads"], settings["timeout"]) == (3, 6, 90)

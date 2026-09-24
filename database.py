@@ -168,6 +168,19 @@ def init_db() -> None:
             must_change_password INTEGER NOT NULL DEFAULT 0
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS login_rate_limits (
+            ip TEXT PRIMARY KEY,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            window_started_at TEXT NOT NULL,
+            blocked_until TEXT,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_login_rate_limits_updated "
+        "ON login_rate_limits(updated_at)"
+    )
     _ensure_column(c, "users", "session_version", "INTEGER NOT NULL DEFAULT 1")
     _ensure_column(c, "users", "must_change_password", "INTEGER NOT NULL DEFAULT 0")
 
@@ -1931,6 +1944,91 @@ def import_from_excel(filepath: str = "Данные_по_ЛС.xlsx") -> None:
     if has_meters_sheet:
         log.info("Импортировано счётчиков: %d", len(meters))
         log.info("Записано начальных показаний: %d", initial_count)
+
+
+# ── Защита входа (общая для всех Gunicorn workers) ───────────────────────────
+
+def get_login_block_seconds(ip: str, now: datetime | None = None) -> int:
+    """Return remaining block duration and prune old limiter records."""
+    now = now or datetime.now(timezone.utc)
+    conn = get_conn()
+    try:
+        conn.execute(
+            "DELETE FROM login_rate_limits WHERE updated_at<?",
+            ((now - timedelta(days=7)).isoformat(timespec="seconds"),),
+        )
+        row = conn.execute(
+            "SELECT blocked_until FROM login_rate_limits WHERE ip=?", (ip,),
+        ).fetchone()
+        conn.commit()
+    finally:
+        conn.close()
+    if not row or not row["blocked_until"]:
+        return 0
+    return max(
+        0,
+        int((datetime.fromisoformat(row["blocked_until"]) - now).total_seconds()),
+    )
+
+
+def record_login_failure(
+    ip: str,
+    *,
+    max_attempts: int = 5,
+    window_minutes: int = 15,
+    block_minutes: int = 15,
+    now: datetime | None = None,
+) -> tuple[bool, int]:
+    """Atomically count a failure across all web workers."""
+    now = now or datetime.now(timezone.utc)
+    now_s = now.isoformat(timespec="seconds")
+    window_cutoff = now - timedelta(minutes=window_minutes)
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM login_rate_limits WHERE ip=?", (ip,),
+        ).fetchone()
+        if row and row["blocked_until"]:
+            blocked_until = datetime.fromisoformat(row["blocked_until"])
+            if blocked_until > now:
+                conn.commit()
+                return True, 0
+        within_window = bool(
+            row
+            and datetime.fromisoformat(row["window_started_at"]) > window_cutoff
+        )
+        attempts = (int(row["attempts"]) if within_window else 0) + 1
+        blocked = attempts >= max_attempts
+        window_started = row["window_started_at"] if within_window else now_s
+        blocked_until_s = (
+            (now + timedelta(minutes=block_minutes)).isoformat(timespec="seconds")
+            if blocked else None
+        )
+        conn.execute(
+            """INSERT INTO login_rate_limits
+               (ip,attempts,window_started_at,blocked_until,updated_at)
+               VALUES(?,?,?,?,?) ON CONFLICT(ip) DO UPDATE SET
+               attempts=excluded.attempts,window_started_at=excluded.window_started_at,
+               blocked_until=excluded.blocked_until,updated_at=excluded.updated_at""",
+            (
+                ip, 0 if blocked else attempts, window_started,
+                blocked_until_s, now_s,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return blocked, max(0, max_attempts - attempts)
+
+
+def reset_login_rate_limit(ip: str) -> None:
+    conn = get_conn()
+    try:
+        conn.execute("DELETE FROM login_rate_limits WHERE ip=?", (ip,))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ── Пользователи портала ──────────────────────────────────────────────────────

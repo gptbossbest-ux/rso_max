@@ -66,6 +66,18 @@ def test_show_scripts_list_preserves_empty_and_error_responses():
     failed.send_main_menu.assert_called_once_with(43)
 
 
+def test_script_list_paginates_without_dropping_actions():
+    scripts = [{"id": index, "title": f"Тема {index}"} for index in range(35)]
+    deps, _ = _dependencies(scripts=(scripts, None))
+    faq.show_scripts_list(42, deps)
+    assert deps.send_buttons.call_count == 2
+    pages = [call.args[2] for call in deps.send_buttons.call_args_list]
+    assert [len(page) for page in pages] == [30, 6]
+    payloads = [button["payload"] for page in pages for row in page for button in row]
+    assert payloads[:-1] == [f"script:{index}" for index in range(35)]
+    assert payloads[-1] == "main_menu"
+
+
 def test_open_script_selects_root_and_renders_its_children():
     tree = {
         "nodes": [
@@ -198,6 +210,20 @@ def test_navigate_can_move_to_child_and_back_to_parent():
     faq.navigate_script_node(42, 1, deps)
     assert state["script"]["current"] == 1
     assert deps.send_buttons.call_args.args[1] == "📌 Родитель"
+
+
+def test_node_edges_paginate_without_invalid_max_keyboard():
+    deps, state = _dependencies()
+    edges = [{"label": f"Вариант {index}", "to_node_id": index + 2} for index in range(35)]
+    state["script"] = {
+        "nodes": {1: {"id": 1, "title": "Выбор", "is_terminal": False}},
+        "edges_by_from": {1: edges}, "current": 1,
+    }
+    faq.show_script_node(42, deps)
+    assert deps.send_buttons.call_count == 2
+    pages = [call.args[2] for call in deps.send_buttons.call_args_list]
+    assert [len(page) for page in pages] == [30, 6]
+    assert pages[-1][-1][0]["payload"] == "main_menu"
 
 
 def test_terminal_faq_preserves_traversed_path_for_ai():

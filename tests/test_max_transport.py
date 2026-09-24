@@ -102,6 +102,10 @@ def test_send_buttons_builds_inline_keyboard_without_changing_buttons():
     "https://user:password@example.test/path", "//example.test/path",
     "https://example.test:444/path", "https://example.test/" + "x" * 2048,
     "https://example.test/path\nnext",
+    "https://example.test/path\\next", "https://bad_host.test/path",
+    "https://example.test./path", "https://exa\u200bmple.test/path",
+    "http://example.test:443/path",
+    "https://example.test:80/path", "https://example.test/%0aheader",
 ])
 def test_link_button_rejects_unsafe_urls(url):
     with pytest.raises(ValueError):
@@ -122,6 +126,45 @@ def test_link_button_matches_max_inline_keyboard_contract():
     assert payload["text"] == "Текст [не становится](разметкой)"
     assert "format" not in payload
     assert payload["attachments"][0]["payload"]["buttons"] == [[button]]
+
+
+def test_link_button_normalizes_idna_and_rejects_label_format_controls():
+    assert max_transport.make_link_button(
+        "Сайт", "https://пример.рф/помощь",
+    )["url"] == "https://xn--e1afmkfd.xn--p1ai/помощь"
+    assert max_transport.validate_link_url("HTTPS://EXAMPLE.TEST/path") == (
+        "https://example.test/path"
+    )
+    with pytest.raises(ValueError):
+        max_transport.make_link_button("Са\u200bйт", "https://example.test")
+    with pytest.raises(ValueError):
+        max_transport.make_link_button("Сайт\n", "https://example.test")
+    with pytest.raises(ValueError):
+        max_transport.make_link_button("Сайт", " https://example.test")
+
+
+def _callback(index=0):
+    return {"type": "callback", "text": f"Кнопка {index}", "payload": f"p:{index}"}
+
+
+def test_keyboard_accepts_official_boundaries():
+    rows = [[_callback(row * 7 + item) for item in range(7)] for row in range(30)]
+    assert max_transport.validate_inline_keyboard(rows) is rows
+
+
+@pytest.mark.parametrize("buttons", [
+    [[_callback()]] * 31,
+    [[_callback(index) for index in range(8)]],
+    [[
+        max_transport.make_link_button("Ссылка", "https://example.test"),
+        _callback(1), _callback(2), _callback(3),
+    ]],
+    [[{"type": "callback", "text": "X", "payload": ""}]],
+    [[{"type": "unknown", "text": "X"}]],
+])
+def test_keyboard_rejects_limit_and_contract_violations(buttons):
+    with pytest.raises(ValueError):
+        max_transport.validate_inline_keyboard(buttons)
 
 
 def test_ack_callback_posts_expected_answer():

@@ -23,15 +23,16 @@ import truststore
 
 truststore.inject_into_ssl()
 
+import ipaddress
 import json
 import logging
+import math
 import os
 import secrets
 import shutil
 import sqlite3
 import time
 import uuid
-from collections import defaultdict
 from datetime import datetime, timedelta
 from functools import wraps
 from logging.handlers import RotatingFileHandler
@@ -147,34 +148,46 @@ CHANNELS = {
 
 # ── Брутфорс-защита логина ────────────────────────────────────────────────────
 
-_login_attempts: dict = defaultdict(lambda: {"attempts": 0, "blocked_until": None})
 _MAX_LOGIN_ATTEMPTS = 5
 _LOGIN_BLOCK_MINUTES = 15
+_LOGIN_WINDOW_MINUTES = 15
 _ACCOUNTS_PAGE_SIZE = 50
 _CSRF_SESSION_KEY = "_csrf_token"
 
 
+def _normalize_login_ip(value: str | None) -> str:
+    """Canonicalize the trusted WSGI peer address into a bounded DB key."""
+    try:
+        parsed = ipaddress.ip_address((value or "").strip())
+    except ValueError:
+        return "unknown"
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped:
+        parsed = parsed.ipv4_mapped
+    return parsed.compressed
+
+
 def _check_login_block(ip: str) -> str | None:
-    info = _login_attempts[ip]
-    if info["blocked_until"] and datetime.now() < info["blocked_until"]:
-        remaining = int((info["blocked_until"] - datetime.now()).total_seconds() / 60) + 1
+    remaining_seconds = db.get_login_block_seconds(ip)
+    if remaining_seconds:
+        remaining = max(1, math.ceil(remaining_seconds / 60))
         return f"Слишком много попыток. Попробуйте через {remaining} мин."
     return None
 
 
 def _fail_login(ip: str) -> str:
-    info = _login_attempts[ip]
-    info["attempts"] += 1
-    left = _MAX_LOGIN_ATTEMPTS - info["attempts"]
-    if info["attempts"] >= _MAX_LOGIN_ATTEMPTS:
-        info["blocked_until"] = datetime.now() + timedelta(minutes=_LOGIN_BLOCK_MINUTES)
-        info["attempts"] = 0
+    blocked, left = db.record_login_failure(
+        ip,
+        max_attempts=_MAX_LOGIN_ATTEMPTS,
+        window_minutes=_LOGIN_WINDOW_MINUTES,
+        block_minutes=_LOGIN_BLOCK_MINUTES,
+    )
+    if blocked:
         return f"Превышено число попыток. Вход заблокирован на {_LOGIN_BLOCK_MINUTES} мин."
     return f"Неверный логин или пароль. Осталось попыток: {left}"
 
 
 def _ok_login(ip: str) -> None:
-    _login_attempts.pop(ip, None)
+    db.reset_login_rate_limit(ip)
 
 
 # ── Декораторы доступа ────────────────────────────────────────────────────────
@@ -291,7 +304,7 @@ def _enrich_appeals(rows) -> list[dict]:
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    ip = request.remote_addr
+    ip = _normalize_login_ip(request.remote_addr)
 
     block_msg = _check_login_block(ip)
     if block_msg:
@@ -789,6 +802,10 @@ def _send_max_text(chat_id: int, text: str) -> tuple[bool, str | None]:
 def _send_max_buttons(chat_id: int, text: str, buttons: list[list[dict]]) -> tuple[bool, str | None]:
     import httpx
     try:
+        max_transport.validate_inline_keyboard(buttons)
+    except ValueError:
+        return False, "invalid_buttons"
+    try:
         response = httpx.post(
             f"{API}/messages", headers=_max_headers(), params={"chat_id": chat_id},
             json={"text": text, "attachments": [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]},
@@ -921,7 +938,10 @@ def operator_shift_end():
 @operator_required
 @csrf_protected
 def operator_transfer_all():
-    dialog_ids = operator_chat.transfer_all_dialogs(_operator_id())
+    try:
+        dialog_ids = operator_chat.transfer_all_dialogs(_operator_id())
+    except operator_chat.DeliveryInProgressError as exc:
+        return jsonify(ok=False, error=str(exc)), 409
     _assign_and_notify()
     return jsonify(ok=True, transferred=len(dialog_ids), dialog_ids=dialog_ids)
 
@@ -1790,11 +1810,15 @@ def scenario_delete(scenario_id: int):
 @login_required
 def scripts_list():
     scripts = db.get_all_scripts()
-    return render_template("scripts_list.html", scripts=scripts, user=session["user"])
+    return render_template(
+        "scripts_list.html", scripts=scripts, user=session["user"],
+        csrf_token=_csrf_token(),
+    )
 
 
 @app.route("/scripts/create", methods=["POST"])
 @admin_required
+@csrf_protected
 def script_create():
     title = request.form.get("title", "").strip()
     if not title:
@@ -1838,11 +1862,13 @@ def script_editor(script_id: int):
         from_counts=from_counts,
         to_counts=to_counts,
         user=session["user"],
+        csrf_token=_csrf_token(),
     )
 
 
 @app.route("/scripts/<int:script_id>/update", methods=["POST"])
 @admin_required
+@csrf_protected
 def script_update(script_id: int):
     title = request.form.get("title", "").strip()
     try:
@@ -1861,6 +1887,7 @@ def script_update(script_id: int):
 
 @app.route("/scripts/<int:script_id>/delete", methods=["POST"])
 @admin_required
+@csrf_protected
 def script_delete(script_id: int):
     db.delete_script(script_id)
     flash("Скрипт удалён", "success")
@@ -1883,11 +1910,12 @@ def _validate_script_link(url: str, text: str) -> tuple[str | None, str | None]:
 
 @app.route("/scripts/<int:script_id>/nodes/add", methods=["POST"])
 @admin_required
+@csrf_protected
 def script_node_add(script_id: int):
     title = request.form.get("title", "").strip()
     is_terminal = request.form.get("is_terminal") == "on"
-    link_url = request.form.get("link_url", "").strip()
-    link_text = request.form.get("link_text", "").strip()
+    link_url = request.form.get("link_url", "")
+    link_text = request.form.get("link_text", "")
     if not title:
         flash("Текст узла не может быть пустым", "error")
     else:
@@ -1903,11 +1931,12 @@ def script_node_add(script_id: int):
 
 @app.route("/scripts/<int:script_id>/nodes/<int:node_id>/update", methods=["POST"])
 @admin_required
+@csrf_protected
 def script_node_update(script_id: int, node_id: int):
     title = request.form.get("title", "").strip()
     is_terminal = request.form.get("is_terminal") == "on"
-    link_url = request.form.get("link_url", "").strip()
-    link_text = request.form.get("link_text", "").strip()
+    link_url = request.form.get("link_url", "")
+    link_text = request.form.get("link_text", "")
     if not title:
         flash("Текст узла не может быть пустым", "error")
     else:
@@ -1923,6 +1952,7 @@ def script_node_update(script_id: int, node_id: int):
 
 @app.route("/scripts/<int:script_id>/nodes/<int:node_id>/delete", methods=["POST"])
 @admin_required
+@csrf_protected
 def script_node_delete(script_id: int, node_id: int):
     db.delete_script_node(node_id)
     flash("Узел удалён", "success")
@@ -1931,6 +1961,7 @@ def script_node_delete(script_id: int, node_id: int):
 
 @app.route("/scripts/<int:script_id>/edges/add", methods=["POST"])
 @admin_required
+@csrf_protected
 def script_edge_add(script_id: int):
     try:
         from_node_id = int(request.form.get("from_node_id", ""))
@@ -1954,6 +1985,7 @@ def script_edge_add(script_id: int):
 
 @app.route("/scripts/<int:script_id>/edges/<int:edge_id>/delete", methods=["POST"])
 @admin_required
+@csrf_protected
 def script_edge_delete(script_id: int, edge_id: int):
     db.delete_script_edge(edge_id)
     flash("Переход удалён", "success")

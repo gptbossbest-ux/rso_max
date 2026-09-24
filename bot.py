@@ -1312,7 +1312,8 @@ def handle_message(message: dict) -> None:
         state = _get_state(chat_id)
         _clear_flow(state)
         _touch(state)
-        send_main_menu(chat_id, "Диалог с оператором завершён.")
+        if not operator_chat.terminal_notification_owned(chat_id):
+            send_main_menu(chat_id, "Диалог с оператором завершён.")
         return
 
     if not text:

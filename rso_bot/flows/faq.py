@@ -38,6 +38,16 @@ class FaqDependencies:
     ai_available: Callable[[], bool] = lambda: True
 
 
+def _send_keyboard_pages(
+    chat_id: int, text: str, rows: list[list[Button]], deps: FaqDependencies,
+) -> None:
+    """Preserve every FAQ action while respecting MAX's 30-row limit."""
+    for offset in range(0, len(rows), 30):
+        page = rows[offset:offset + 30]
+        page_text = text if offset == 0 else "📚 Продолжение вариантов:"
+        deps.send_buttons(chat_id, page_text, page)
+
+
 def show_scripts_list(chat_id: int, deps: FaqDependencies) -> None:
     """Load active FAQ scripts and display them as callback buttons."""
     scripts, err = deps.list_scripts()
@@ -58,7 +68,7 @@ def show_scripts_list(chat_id: int, deps: FaqDependencies) -> None:
         for script in scripts
     ]
     rows.append([deps.make_callback("🏠 Главное меню", "main_menu")])
-    deps.send_buttons(chat_id, "📚 Выберите тему:", rows)
+    _send_keyboard_pages(chat_id, "📚 Выберите тему:", rows, deps)
 
 
 def open_script(chat_id: int, script_id: int, deps: FaqDependencies) -> None:
@@ -133,21 +143,20 @@ def show_script_node(chat_id: int, deps: FaqDependencies) -> None:
             "вы можете обратиться к ИИ-помощнику."
             if deps.ai_available() else ""
         )
-        deps.send_buttons(
-            chat_id,
-            f"📌 {text}{invitation}",
+        rows = (
             link_rows
             + ([[deps.make_callback("🤖 Спросить у ИИ-помощника", "ai_from_faq")]] if deps.ai_available() else [])
             + ([[deps.make_callback("🎧 Связаться с оператором", "operator_start")]] if deps.operator_available() else [])
-            + [[deps.make_callback("🏠 Главное меню", "main_menu")]],
+            + [[deps.make_callback("🏠 Главное меню", "main_menu")]]
         )
+        _send_keyboard_pages(chat_id, f"📌 {text}{invitation}", rows, deps)
     else:
         rows = link_rows + [
             [deps.make_callback(edge["label"], f"script_node:{edge['to_node_id']}")]
             for edge in edges
         ]
         rows.append([deps.make_callback("🏠 Главное меню", "main_menu")])
-        deps.send_buttons(chat_id, f"📌 {text}", rows)
+        _send_keyboard_pages(chat_id, f"📌 {text}", rows, deps)
 
 
 def navigate_script_node(
