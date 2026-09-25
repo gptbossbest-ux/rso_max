@@ -40,6 +40,7 @@ done
 
 app_uid="${APP_UID:-$(id -u)}"
 app_gid="${APP_GID:-$(id -g)}"
+vcs_ref="${VCS_REF:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
 if [[ "$app_uid" == "0" || "$app_gid" == "0" ]]; then
   echo "Run deploy as the non-root owner of runtime files or set non-zero APP_UID/APP_GID." >&2
   exit 1
@@ -53,6 +54,7 @@ dc() {
   DEPLOY_APP_ENV="$deploy_app_env" \
   APP_UID="$app_uid" \
   APP_GID="$app_gid" \
+  VCS_REF="$vcs_ref" \
     docker compose --project-name "$project" "$@"
 }
 

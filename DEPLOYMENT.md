@@ -56,8 +56,8 @@ chmod 600 .env.test .env.test.runtime .env .env.prod.runtime
 ./scripts/deploy.sh test
 ```
 
-Выполните health-check, smoke-тесты и приёмку. `prod` запускается только после
-успешной приёмки `test` **того же SHA**:
+Выполните health-check, smoke-тесты и приёмку. Затем продвиньте изменения из
+`Main_test` в `main`; `prod` запускается только из SHA `main`, прошедшего Full CI:
 
 ```bash
 ./scripts/deploy.sh prod
@@ -162,8 +162,10 @@ curl --fail http://127.0.0.1:5001/healthz
 curl --fail http://127.0.0.1:5000/healthz
 ```
 
-Обязательный порядок нового релиза — `test`, приёмка и только затем `prod` того
-же SHA — описан в разделе [«Обновление только из `main`»](#обновление-только-из-main-сначала-test-затем-prod) ниже.
+Автоматический Fast-контур получает точный проверенный SHA из `Main_test`, а
+Full-контур — точный проверенный SHA из `main`. Продвижение выполняется PR из
+`Main_test` в `main`, поэтому production никогда не разворачивается из тестовой
+ветки напрямую.
 
 ### Read-only smoke test
 
@@ -205,6 +207,13 @@ journalctl -u rso-max-smoke-test.service --since today
 
 Prod-контур намеренно не входит в область этого smoke-monitoring.
 
+Для проверки непосредственно во время автоматического релиза используется
+`scripts/release-smoke.sh fast|full`. В режиме `fast` он проверяет только
+`rso-max-test`, порт `5001` и `runtime/test`; в режиме `full` — только
+`rso-max-prod`, порт `5000` и `runtime/prod`. Full дополнительно выполняет
+read-only `PRAGMA integrity_check` и более длинный замер restart count. Скрипт не
+отправляет MAX-сообщения и не вызывает 1С.
+
 ## Резервная копия SQLite
 
 ```bash
@@ -218,14 +227,134 @@ Prod-контур намеренно не входит в область это�
 итоговое имя. Копии старше 30 дней удаляются. Для автоматического запуска
 добавьте отдельные задания cron для `backup.sh test` и `backup.sh prod`.
 
-## Обновление только из `main`: сначала `test`, затем `prod`
+## Автоматические Fast и Full развёртывания
 
-Получите актуальный `main` и зафиксируйте полный SHA кандидата. Не используйте
-плавающую ссылку `latest`: один и тот же принятый SHA должен пройти оба контура.
+Серверные timers опрашивают GitHub каждые пять минут. GitHub не подключается к
+серверу, SSH-ключи в Actions не используются:
+
+- `fast` отслеживает **точное, регистрозависимое** имя `Main_test`, требует
+  успешный завершённый push-run точного workflow `.github/workflows/ci.yml`
+  именно для текущего SHA и обновляет
+  только Compose-проект `rso-max-test`;
+- `full` отслеживает `main`, требует тот же exact workflow run и обновляет
+  только `rso-max-prod`;
+- оба режима используют один lock, поэтому не выполняются одновременно;
+- успешно применённый SHA записывается атомарно. Повторный poll становится
+  no-op;
+- после build/identity bot и web останавливаются, а старый API создаёт проверенный
+  SQLite backup без конкурирующих writers; затем останавливается API. При ошибке,
+  current symlink и контейнеры автоматически возвращаются на предыдущий SHA;
+- smoke запускается только после состояния Docker `healthy` у всех трёх
+  контейнеров. Ожидание учитывает start period бота.
+
+При rollback неуспешная БД вместе с WAL/SHM сохраняется в закрытом каталоге
+`runtime/<stack>/backups/failed-*`, проверенный pre-cutover backup возвращается
+атомарно, stale WAL/SHM удаляются, и только затем запускается старый image.
+Изменения пользователей между cutover и rollback могут потребовать ручной
+сверки с сохранённой failed-БД. systemd оставляет до 1000 секунд после TERM для
+rollback; `TimeoutStartSec`/`TimeoutStopSec` больше внутреннего deploy timeout.
+
+Код релиза извлекается через `git archive` из exact SHA. Плавающие checkout,
+локальные изменения, symlink/submodule из Git и непрошедший CI отклоняются.
+Каждый image имеет отдельный тег контура и SHA.
+
+Runtime и секреты должны быть подготовлены до установки:
+
+```text
+/srv/bot-sandbox/config/test/.env.test
+/srv/bot-sandbox/config/test/.env.test.runtime
+/srv/bot-sandbox/config/prod/.env
+/srv/bot-sandbox/config/prod/.env.prod.runtime
+/srv/bot-sandbox/state/test/data/database.sqlite
+/srv/bot-sandbox/state/prod/data/database.sqlite
+```
+
+Env-файлы имеют режим `0600`, принадлежат `botadmin` и никогда не копируются в
+Git/release/image. Для первого включения нужны существующие immutable release,
+чьи `runtime/test` и `runtime/prod` разрешаются соответственно в
+`/srv/bot-sandbox/state/test` и `/srv/bot-sandbox/state/prod`. Legacy production
+runtime переносится в maintenance window с остановленными prod-контейнерами и
+проверенным backup; installer намеренно не перемещает живую БД.
+
+### Подготовка legacy production
+
+Изменённый вручную `/srv/bot-sandbox/projects/rso_max` нельзя использовать как
+baseline. В отдельное окно обслуживания подготовьте чистый immutable release из
+exact SHA `main`, содержащий новые healthchecks и deployment scripts. Затем:
+
+1. Запишите production container IDs/image IDs/restart counts и полный SHA.
+2. Выполните из legacy-каталога `./scripts/backup.sh prod`, дождитесь проверки
+   целостности и сохраните выведенный путь backup.
+3. Остановите только `rso-max-prod`: `bot`, `web`, `api`. Test не останавливайте.
+4. Убедитесь, что `/srv/bot-sandbox/state/prod` отсутствует. Только при
+   остановленном prod атомарно переместите весь `runtime/prod` в `state/prod`;
+   работающий `database.sqlite` копировать нельзя.
+5. Создайте в legacy и immutable release ссылку `runtime/prod` на state-каталог,
+   проверьте владельца `botadmin`, права и SQLite `PRAGMA integrity_check` через
+   read-only URI.
+6. Пересоздайте только `rso-max-prod` из baseline image, дождитесь `healthy` у
+   всех трёх сервисов и выполните `release-smoke.sh full`. При сбое верните
+   runtime и старые контейнеры по заранее записанному плану.
+
+Только после этого release и `/state/prod` подходят для installer. Installer не
+останавливает контейнеры и не перемещает данные автоматически.
+
+Установка по умолчанию только размещает root-owned scripts/units и записывает
+baseline SHA обоих уже работающих контуров — timers остаются выключенными:
 
 ```bash
-git fetch origin main
-RELEASE_SHA="$(git rev-parse --verify origin/main^{commit})"
+sudo ./scripts/install-auto-deploy-systemd.sh \
+  gptbossbest-ux/rso_max \
+  /srv/bot-sandbox/releases/TEST_BASELINE TEST_FULL_SHA TEST_BOT_ID TEST_BOT_USERNAME \
+  /srv/bot-sandbox/releases/PROD_BASELINE PROD_FULL_SHA PROD_BOT_ID PROD_BOT_USERNAME
+```
+
+Перед включением убедитесь, что heads `Main_test` и `main` всё ещё равны этим
+baseline SHA и имеют зелёный gate. Повторите ту же команду с `--enable`:
+
+```bash
+sudo ./scripts/install-auto-deploy-systemd.sh \
+  gptbossbest-ux/rso_max \
+  /srv/bot-sandbox/releases/TEST_BASELINE TEST_FULL_SHA TEST_BOT_ID TEST_BOT_USERNAME \
+  /srv/bot-sandbox/releases/PROD_BASELINE PROD_FULL_SHA PROD_BOT_ID PROD_BOT_USERNAME \
+  --enable
+```
+
+Installer сам перепроверяет exact branch heads и CI перед активацией, поэтому
+активация с baseline не вызывает немедленное повторное развёртывание. Для
+приватного репозитория или повышенного API rate limit добавьте fine-grained
+read-only token в `/etc/rso-max-deploy/github.conf`; файл root-owned `0600` и его
+содержимое не выводится. Публичный GitHub API работает без токена.
+При HTTP 403/429 poll завершается без deploy и повторяется timer; read-only token
+рекомендуется для стабильного rate limit, но не обязателен для public repository.
+
+Bot ID и username — публичные значения MAX `/me`, не токены. Installer требует
+разные test/prod identities и закрепляет их в закрытой server config. Перед
+каждым изменением контейнеров deploy сверяет выбранный env с закреплённой
+identity. Ошибочная копия env или смена бота останавливает deploy; токены не
+передаются аргументами и не выводятся.
+
+Installer принимает только чистые git worktree baselines с exact HEAD, требует
+один image у api/web/bot и OCI label `org.opencontainers.image.revision`, равный
+baseline SHA. До записи applied SHA выполняются Fast и Full smoke. Для
+существующей непустой БД `BOOTSTRAP_ADMIN_PASSWORD` обязан быть пустым.
+
+```bash
+systemctl status rso-max-auto-deploy-fast.timer
+systemctl status rso-max-auto-deploy-full.timer
+journalctl -u rso-max-auto-deploy-fast.service --since today
+journalctl -u rso-max-auto-deploy-full.service --since today
+```
+
+## Ручное обновление и откат
+
+Ручной аварийный процесс также использует exact SHA и строго один контур. Для
+test кандидат берётся из `Main_test`, для prod — только из `main`. Не используйте
+плавающую ссылку `latest`.
+
+```bash
+git fetch origin Main_test
+RELEASE_SHA="$(git rev-parse --verify origin/Main_test^{commit})"
 printf 'Release candidate: %s\n' "$RELEASE_SHA"
 
 ./scripts/backup.sh test
@@ -234,15 +363,17 @@ git switch --detach "$RELEASE_SHA"
 curl --fail http://127.0.0.1:5001/healthz
 ```
 
-После health-check выполните smoke-тесты и приёмку в `test`. Если кандидат не
-принят, не продвигайте его в `prod`: исправление оформляется новым commit в
-`main`, после чего процесс начинается заново с новым SHA.
+После приёмки Fast SHA продвигается Pull Request из `Main_test` в `main` и снова
+проходит полный CI. Production получает новый SHA merge-коммита из `main`, а не
+SHA ветки `Main_test`.
 
-Только после успешной приёмки сделайте резервную копию production непосредственно
-перед его обновлением и разверните **тот же** SHA:
+Только после успешного Full CI создайте production backup и разверните exact SHA
+из `main`:
 
 ```bash
-test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+git fetch origin main
+RELEASE_SHA="$(git rev-parse --verify origin/main^{commit})"
+git switch --detach "$RELEASE_SHA"
 ./scripts/backup.sh prod
 ./scripts/deploy.sh prod
 curl --fail http://127.0.0.1:5000/healthz

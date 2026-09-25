@@ -1,0 +1,12 @@
+[Unit]
+Description=Poll Main_test for an approved Fast deployment
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Persistent=true
+Unit=rso-max-auto-deploy-fast.service
+
+[Install]
+WantedBy=timers.target

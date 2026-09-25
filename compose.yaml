@@ -4,6 +4,7 @@ x-app: &app
     args:
       APP_UID: ${APP_UID:-1000}
       APP_GID: ${APP_GID:-1000}
+      VCS_REF: ${VCS_REF:-unknown}
   image: ${IMAGE_NAME:-rso-max:local}
   env_file:
     - ${APP_ENV_FILE:-.env}

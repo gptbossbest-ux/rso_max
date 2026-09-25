@@ -2,6 +2,9 @@ FROM python:3.12-slim
 
 ARG APP_UID=1000
 ARG APP_GID=1000
+ARG VCS_REF=unknown
+
+LABEL org.opencontainers.image.revision="$VCS_REF"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

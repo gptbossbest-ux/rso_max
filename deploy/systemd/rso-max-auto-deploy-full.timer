@@ -1,0 +1,12 @@
+[Unit]
+Description=Poll main for an approved Full deployment
+
+[Timer]
+OnBootSec=4min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Persistent=true
+Unit=rso-max-auto-deploy-full.service
+
+[Install]
+WantedBy=timers.target
